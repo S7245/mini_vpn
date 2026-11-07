@@ -17,8 +17,8 @@ const NEW_TEST_LEAF_LINE_LIMIT: usize = 800;
 // lowers its recorded value in the same promoted change; remove it once it
 // reaches the new-file limit.
 const GRANDFATHERED_PRODUCTION_LINES: &[(&str, usize)] = &[
-    ("src/client_tun.rs", 10_561),
-    ("src/harness.rs", 4_099),
+    ("src/client_tun.rs", 8_664),
+    ("src/harness.rs", 3_792),
     ("src/owned_upstream/client_controller.rs", 8_577),
     ("src/owned_upstream/leg.rs", 2_699),
     ("src/owned_upstream/leg_io.rs", 7_937),
@@ -43,15 +43,14 @@ const GRANDFATHERED_PRODUCTION_LINES: &[(&str, usize)] = &[
     ("src/resumable/protocol.rs", 1_992),
     ("src/resumable/session.rs", 5_364),
     ("src/resumable/tcp.rs", 1_770),
-    ("src/tcp_downlink_pump.rs", 1_839),
-    ("src/tuic.rs", 4_690),
+    ("src/tuic.rs", 4_003),
 ];
 
 // Exact too-many-arguments allowance debt at the governance cutover. This
 // inventory spans all governed Rust and is shrink-only; a new allowance must
 // not be normalized by adding it.
 const GRANDFATHERED_TOO_MANY_ARGUMENTS: &[(&str, usize)] = &[
-    ("src/client_tun.rs", 18),
+    ("src/client_tun.rs", 15),
     ("src/owned_upstream/quinn_client_root.rs", 1),
     ("src/owned_upstream/quinn_leg_actor.rs", 6),
     ("src/owned_upstream/standby.rs", 1),
@@ -65,7 +64,7 @@ const GRANDFATHERED_TOO_MANY_ARGUMENTS: &[(&str, usize)] = &[
 // 300-line new-file limit; test leaves have an 800-line limit. This inventory
 // is shrink-only and must move down with every behavior-preserving split.
 const GRANDFATHERED_TEST_LINES: &[(&str, usize)] = &[
-    ("src/client_tun/tests/mod.rs", 12_886),
+    ("src/client_tun/tests/mod.rs", 12_569),
     ("src/owned_upstream/owner_output_drain/tests/mod.rs", 986),
     (
         "src/owned_upstream/owner_session_controller/tests/attached_recovery.rs",
@@ -75,7 +74,7 @@ const GRANDFATHERED_TEST_LINES: &[(&str, usize)] = &[
         "src/owned_upstream/owner_session_controller/tests/mod.rs",
         1_355,
     ),
-    ("src/owned_upstream/quinn_leg_actor/tests/mod.rs", 15_814),
+    ("src/owned_upstream/quinn_leg_actor/tests/mod.rs", 15_812),
     (
         "src/owned_upstream/quinn_leg_actor/tests/r7_client_b_control_dispatch.rs",
         1_345,
@@ -90,7 +89,7 @@ const GRANDFATHERED_TEST_LINES: &[(&str, usize)] = &[
     ),
     (
         "src/owned_upstream/quinn_leg_actor/tests/r7_owner_b_freshness.rs",
-        1_576,
+        1_522,
     ),
     (
         "src/owned_upstream/quinn_leg_composition/owner/continuation/tests/mod.rs",
@@ -105,7 +104,7 @@ const GRANDFATHERED_TEST_LINES: &[(&str, usize)] = &[
     ),
     ("src/quic_path_probe.rs", 1_235),
     ("src/resumable/protocol/tests/mod.rs", 436),
-    ("src/tuic/tests/mod.rs", 5_285),
+    ("src/tuic/tests/mod.rs", 4_945),
     ("tests/knife16_owned_leg_provenance.rs", 2_454),
     ("tests/knife16_resumable_protocol.rs", 1_444),
 ];

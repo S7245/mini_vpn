@@ -266,7 +266,7 @@ async fn budget_case(
     })
     .await;
     owner.request_stop();
-    let (global_tx, _global_rx) = mpsc::channel(4);
+    let (global_tx, _global_rx) = crate::client_tun::relay_channel::channel(4);
     let (owned_action_tx, _owned_rx) = mpsc::channel(4);
     let metrics = Metrics::default();
     let mut first_stop = None;

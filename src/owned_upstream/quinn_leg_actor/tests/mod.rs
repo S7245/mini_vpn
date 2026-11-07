@@ -7258,11 +7258,9 @@ async fn real_terminal_bound_a_prequeued_probe_drains_before_b_ack_recovery() {
     let readiness_before_loss = composition.current_actor_readiness_epoch_for_test();
     let physical_cleanup = composition.arm_current_post_terminal_cleanup_block_for_test();
 
-    server_a.request_cancel();
-    let server_a_joined = tokio::time::timeout(TEST_TIMEOUT, server_a.join())
-        .await
-        .expect("server A close remains bounded")
-        .expect("server A closes structurally");
+    let (server_a_joined, server_a_terminal) =
+        ordered_write_cancel::cancel_and_settle_blocked_write(&mut server_a).await;
+    drop(server_a_terminal);
     assert_eq!(server_a_joined.owned_messages(), 0);
     assert_eq!(server_a_joined.owned_bytes(), 0);
     let observed = tokio::time::timeout(

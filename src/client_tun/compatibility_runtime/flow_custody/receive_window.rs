@@ -40,7 +40,7 @@ impl PublicationProbe {
 pub(super) const WINDOW_BYTES: usize = 65_536;
 
 #[derive(Debug)]
-pub(super) struct ReceiveWindow {
+pub(in crate::client_tun) struct ReceiveWindow {
     tx: watch::Sender<Option<usize>>,
     reader: Option<ReaderWindow>,
     admitted: usize,
@@ -53,7 +53,7 @@ pub(super) struct ReceiveWindow {
 }
 
 #[derive(Debug)]
-pub(super) struct ReaderWindow {
+pub(in crate::client_tun) struct ReaderWindow {
     rx: Option<watch::Receiver<Option<usize>>>,
     read: usize,
     ceiling: usize,
@@ -64,7 +64,7 @@ pub(super) struct ReaderWindow {
 }
 
 impl ReceiveWindow {
-    pub(super) fn new() -> Self {
+    pub(in crate::client_tun) fn new() -> Self {
         let (tx, rx) = watch::channel(Some(WINDOW_BYTES));
         #[cfg(test)]
         let probe = std::sync::Arc::new(PublicationProbe::default());
@@ -96,7 +96,7 @@ impl ReceiveWindow {
             .store(bytes, std::sync::atomic::Ordering::Release);
     }
 
-    pub(super) fn take_reader(&mut self) -> Option<ReaderWindow> {
+    pub(in crate::client_tun) fn take_reader(&mut self) -> Option<ReaderWindow> {
         self.reader.take()
     }
 
@@ -130,7 +130,16 @@ impl ReceiveWindow {
         }
     }
 
-    pub(super) fn admit(&mut self, before: usize, after: usize, n: usize) {
+    pub(super) fn can_admit(&self, pending: usize, limit: usize) -> bool {
+        !self.failed()
+            && limit <= pending
+            && self
+                .admitted
+                .checked_add(limit)
+                .is_some_and(|n| n <= self.issued)
+    }
+
+    pub(in crate::client_tun) fn admit(&mut self, before: usize, after: usize, n: usize) {
         if self.failed() {
             return;
         }
@@ -148,7 +157,12 @@ impl ReceiveWindow {
         }
     }
 
-    pub(super) fn audit_storage(&mut self, transferred: usize, pending: usize, abandoned: usize) {
+    pub(in crate::client_tun) fn audit_storage(
+        &mut self,
+        transferred: usize,
+        pending: usize,
+        abandoned: usize,
+    ) {
         if self
             .admitted
             .checked_add(pending)
@@ -169,7 +183,7 @@ impl ReceiveWindow {
         }
     }
 
-    pub(super) fn publish(&mut self) {
+    pub(in crate::client_tun) fn publish(&mut self) {
         if self.failed() {
             return;
         }
@@ -206,7 +220,7 @@ impl ReaderWindow {
             .store(bytes, std::sync::atomic::Ordering::Release);
     }
 
-    pub(super) fn remaining(&mut self) -> Option<usize> {
+    pub(in crate::client_tun) fn remaining(&mut self) -> Option<usize> {
         let Some(next) = *self.rx.as_mut()?.borrow_and_update() else {
             self.stopped = true;
             return Some(0);
@@ -222,7 +236,7 @@ impl ReaderWindow {
         Some(next - self.read)
     }
 
-    pub(super) fn debit(&mut self, n: usize) -> bool {
+    pub(in crate::client_tun) fn debit(&mut self, n: usize) -> bool {
         let next = self.read.checked_add(n);
         if self.failed || next.is_none_or(|next| next > self.ceiling) {
             self.failed = true;
@@ -234,7 +248,7 @@ impl ReaderWindow {
         true
     }
 
-    pub(super) async fn changed(&mut self) -> bool {
+    pub(in crate::client_tun) async fn changed(&mut self) -> bool {
         match &mut self.rx {
             Some(rx) => rx.changed().await.is_ok(),
             None => false,
@@ -257,15 +271,16 @@ impl ReaderWindow {
         }
     }
 
-    pub(super) fn stopped(&self) -> bool {
+    pub(in crate::client_tun) fn stopped(&self) -> bool {
         self.stopped
     }
-    pub(super) fn read(&self) -> usize {
+    pub(in crate::client_tun) fn read(&self) -> usize {
         self.read
     }
-    pub(super) fn failed(&self) -> bool {
+    pub(in crate::client_tun) fn failed(&self) -> bool {
         self.failed
     }
+    pub(super) fn receiver_retired(&self) -> bool { self.rx.is_none() }
     pub(super) fn take_receiver(&mut self) -> Option<watch::Receiver<Option<usize>>> {
         self.rx.take()
     }

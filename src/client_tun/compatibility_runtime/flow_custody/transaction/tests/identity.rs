@@ -14,6 +14,44 @@ fn setup() -> (Arc<SessionControl>, OpenDispatch, Arc<NeverOpen>) {
 }
 
 #[tokio::test]
+async fn stale_close_identity_quarantines_without_changing_current_flow() {
+    let (_client, mut server) = receiving_pair().await;
+    let (owner, dispatch, upstream) = setup();
+    let handle = server.handle;
+    let mut ctx = SocketCtx::new(10000);
+    let mut pool = FakeIpPool::new();
+    dispatch.begin_turn().await;
+    dispatch.admit_flow(
+        upstream,
+        FlowAdmission {
+            handle,
+            socket: server.sockets.get_mut::<TcpSocket>(handle),
+            ctx: &mut ctx,
+            fake_pool: &mut pool,
+            fake_ip: None,
+            target: TargetAddr::IpPort("10.0.0.2:10000".parse().unwrap()),
+            now: 0,
+        },
+    );
+    let (id, stage) = {
+        let opens = owner.opens();
+        let OpenPhase::Flow(flow) = &opens.slots.iter().flatten().next().unwrap().phase else {
+            panic!("actual admitted flow");
+        };
+        (flow.id, flow.stage)
+    };
+    assert!(dispatch.request_flow_close(handle, id.epoch.wrapping_add(1), Some(id), None, None,));
+    assert!(owner.ledger().quarantined);
+    let opens = owner.opens();
+    let OpenPhase::Flow(flow) = &opens.slots.iter().flatten().next().unwrap().phase else {
+        panic!("same flow retained");
+    };
+    assert_eq!(flow.id, id);
+    assert_eq!(flow.stage, stage);
+    assert!(flow.roles.is_none());
+}
+
+#[tokio::test]
 async fn identity_exhaustion_retains_fault_before_recv_without_inventing_flow() {
     for (epoch, generation_exhausted) in [(u64::MAX, false), (u64::MAX - 1, false), (0, true)] {
         let (_client, mut server) = receiving_pair().await;

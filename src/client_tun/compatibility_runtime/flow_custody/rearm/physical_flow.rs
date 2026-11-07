@@ -11,6 +11,14 @@ use super::super::receive_window::ReceiveWindow;
 use super::super::supervision::FlowRoles;
 use super::super::transaction::{FlowIdentity, FlowStage};
 use crate::fake_ip::CheckedFakeIpLease;
+use crate::shared::errors::{FailurePhase, RetainedFailure};
+
+mod d16;
+mod launch;
+pub(in crate::client_tun::compatibility_runtime::flow_custody) mod cold;
+mod native;
+mod permit;
+mod receipt;
 
 #[derive(Debug)]
 pub(in crate::client_tun) struct FlowMirror {
@@ -30,6 +38,23 @@ pub(in crate::client_tun) struct FlowMirror {
     pub(super) reset: Option<LocalReset>,
     receipt: Option<FlowPhysicalReceipt>,
     window: Option<ReceiveWindow>,
+    permit_queue: Option<permit::Binding>,
+    d16_queue: Option<d16::Binding>,
+    native_backing: Option<bytes::BackingMeter>,
+    native_stock: Option<crate::tcp_downlink_pump::StockKey>,
+}
+impl FlowMirror {
+    pub(in crate::client_tun::compatibility_runtime::flow_custody) fn producer_admission_matches(ctx: &SocketCtx, id: FlowIdentity) -> bool {
+        ctx.conn_epoch == id.epoch && ctx.flow_mirror.as_ref().is_some_and(|mirror| mirror.id == id && !mirror.producer_stopped)
+    }
+    pub(in crate::client_tun::compatibility_runtime::flow_custody) fn producer_return_matches(ctx: &SocketCtx, id: FlowIdentity) -> bool {
+        Self::producer_admission_matches(ctx, id) && ctx.uplink_tx.is_none() && ctx.relay_read_credit_tx.is_none()
+    }
+    pub(in crate::client_tun::compatibility_runtime::flow_custody) fn commit_producer_return(ctx: &mut SocketCtx, id: FlowIdentity) -> bool {
+        if !Self::producer_return_matches(ctx, id) { return false; }
+        if let Some(mirror) = &mut ctx.flow_mirror { mirror.producer_stopped = true; }
+        true
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -42,10 +67,16 @@ pub(in crate::client_tun::compatibility_runtime::flow_custody) struct FlowPhysic
     discarded: (usize, usize),
     discarded_escrow: usize,
     discarded_downlink: usize,
+    discarded_inflight: usize,
     discarded_uplink: usize,
     discarded_socket_rx: usize,
     discarded_socket_tx: usize,
+    #[cfg(all(test, feature = "harness"))]
+    permit_reset: Option<PermitResetObservation>,
     fake_release: Option<crate::fake_ip::FakeIpLeaseReceipt>,
+    d16: Option<d16::Receipt>,
+    native_pump: Option<crate::upstream::NativePumpReceipt>,
+    native_direct_received: Option<usize>,
 }
 impl FlowPhysicalReceipt {
     pub(in crate::client_tun::compatibility_runtime::flow_custody) fn data_disposition(
@@ -58,39 +89,6 @@ impl FlowPhysicalReceipt {
             self.discarded.1,
             self.discarded_downlink,
         )
-    }
-    pub(in crate::client_tun::compatibility_runtime::flow_custody) fn matches_flow(
-        self,
-        flow: &super::super::transaction::FlowTransaction,
-    ) -> bool {
-        let published = flow.roles.as_ref().and_then(FlowRoles::published);
-        let (messages, bytes) = published.map_or((0, 0), |value| (value.messages, value.bytes));
-        let fake_matches = match (flow.fake_ip, self.fake_release) {
-            (None, None) => true,
-            (Some(acquired), Some(released)) => {
-                acquired.ip == released.ip
-                    && acquired.incarnation == released.incarnation
-                    && acquired.acquisition == released.acquisition
-                    && released.after.checked_add(1) == Some(released.before)
-            }
-            _ => false,
-        };
-        self.id == flow.id
-            && flow.id.epoch.checked_add(1) == Some(self.next_epoch)
-            && self.data_messages == messages
-            && self.data_bytes == bytes
-            && self.transferred.0.checked_add(self.discarded.0) == Some(self.data_messages)
-            && self.transferred.1.checked_add(self.discarded.1) == Some(self.data_bytes)
-            && self.discarded_escrow == flow.escrow_bytes
-            && flow.escrow_bytes == flow.escrow.len()
-            && self.discarded_uplink == 0
-            && self.discarded_downlink <= self.transferred.1
-            && fake_matches
-            && self
-                .discarded_downlink
-                .checked_add(self.discarded_socket_rx)
-                .and_then(|n| n.checked_add(self.discarded_socket_tx))
-                .is_some()
     }
     pub(in crate::client_tun::compatibility_runtime::flow_custody) fn identity(
         self,
@@ -110,7 +108,7 @@ impl FlowMirror {
         }
     }
     pub(super) fn matches_epoch(&self, epoch: u64) -> bool {
-        self.receipt.map_or(epoch == self.id.epoch, |receipt| {
+        self.receipt.as_ref().map_or(epoch == self.id.epoch, |receipt| {
             receipt.id == self.id
                 && self.id.epoch.checked_add(1) == Some(receipt.next_epoch)
                 && epoch == receipt.next_epoch
@@ -133,6 +131,27 @@ impl FlowMirror {
             .is_some_and(|slot| self.matches_slot(slot))
     }
 
+    pub(in crate::client_tun) fn preflight_pending_admission(
+        &mut self,
+        epoch: u64,
+        pending: usize,
+        limit: usize,
+        generic: bool,
+    ) -> bool {
+        let generic = generic || self.egress_bound();
+        if self.quarantined
+            || !self.matches_epoch(epoch)
+            || self
+                .window
+                .as_ref()
+                .is_some_and(|w| !generic || !w.can_admit(pending, limit))
+        {
+            self.quarantined = true;
+            return false;
+        }
+        true
+    }
+
     pub(in crate::client_tun) fn admit_pending(
         &mut self,
         before: usize,
@@ -140,6 +159,7 @@ impl FlowMirror {
         n: usize,
         generic: bool,
     ) {
+        let generic = generic || self.egress_bound();
         if let Some(window) = &mut self.window {
             if generic {
                 window.admit(before, after, n);
@@ -154,7 +174,17 @@ impl FlowMirror {
             return;
         }
         if let Some(window) = &mut self.window {
-            window.audit_storage(self.transferred.1, pending, self.abandoned_pending);
+            let transferred = self.transferred.1.checked_add(
+                self.d16_queue
+                    .as_ref()
+                    .map_or(0, |binding| binding.transferred_bytes),
+            );
+            match transferred {
+                Some(transferred) => {
+                    window.audit_storage(transferred, pending, self.abandoned_pending)
+                }
+                None => window.fail("D16 transfer accounting overflow"),
+            }
             window.publish();
         }
     }
@@ -206,12 +236,15 @@ impl FlowMirror {
     pub(in crate::client_tun) fn accept_data(
         ctx: &mut SocketCtx,
         payload: &[u8],
-        permit: Option<DownstreamBytePermit>,
-    ) {
-        ctx.append_downlink_pending_with_permit(payload, permit);
+        permit: &mut Option<DownstreamBytePermit>,
+    ) -> bool {
+        if !ctx.append_downlink_pending_with_permit(payload, permit) {
+            return false;
+        }
         if let Some(mirror) = &mut ctx.flow_mirror {
             mirror.record_disposition(payload.len(), false);
         }
+        true
     }
 
     pub(in crate::client_tun) fn discard_data(&mut self, bytes: usize) {
@@ -280,19 +313,44 @@ impl OpenDispatch {
         {
             return;
         }
-        let Some(id) = self.reserve_flow(upstream, target, handle, ctx.conn_epoch) else {
-            return;
-        };
+        let Some(id) = self.reserve_flow(upstream, target, handle, ctx.conn_epoch) else { return; };
+        let Some(owner) = &self.owner else { return; };
+        let mut preparation_error = None;
+        let mut prepared = if let Some(meter) = owner.app_meter.as_ref().filter(|m| m.budget_limit().is_some()) {
+            let copied = match socket.peek(MAX_UPLINK_BUFFER) {
+                Ok(bytes) => {
+                    #[cfg(test)]
+                    if let Some(error) = tests::cold::initial_copy_refusal(owner, id) {
+                        Err(error)
+                    } else { crate::client_tun::uplink::Payload::copy_native(bytes, meter) }
+                    #[cfg(not(test))]
+                    crate::client_tun::uplink::Payload::copy_native(bytes, meter)
+                },
+                Err(_) => { let _ = self.rollback_unreceived(id); return; }
+            };
+            match copied {
+                Ok(value) => Some(value),
+                Err(bytes::MeteredCopyError::BudgetFull) => { let _ = self.rollback_unreceived(id); return; }
+                Err(error) => { preparation_error = Some(error); None }
+            }
+        } else { None };
+        let parent_deadline = crate::shared::errors::QuietFailureSink::deadline_quiet(&**owner)
+            .map(tokio::time::Instant::into_std);
+        // The actual source is the typed value. This temporary diagnostic carrier
+        // is created and destroyed outside opens; the original cause stays in F.
+        let preparation_fact = preparation_error.filter(|error| *error != bytes::MeteredCopyError::Quarantined).map(|error| {
+            RetainedFailure::from_io(
+                super::super::transaction::open_origin(id.index, id.epoch, FailurePhase::TcpOpen),
+                crate::client_tun::uplink::admission_error(error),
+            )
+        });
         // resolve_target used this same exclusive pool borrow without an await.
         // An acquire error is an integrity failure, not retryable W pressure.
-        let acquired = fake_ip
-            .map(|ip| fake_pool.acquire_checked(ip, now))
-            .transpose();
+        let acquired = if preparation_error.is_some() { Ok(None) } else {
+            fake_ip.map(|ip| fake_pool.acquire_checked(ip, now)).transpose()
+        };
         let failure = acquired.as_ref().err().copied();
         let lease = acquired.ok().flatten();
-        let Some(owner) = &self.owner else {
-            return;
-        };
         let mut opens = owner.opens();
         let Some(flow) = opens.flow_mut(id) else {
             owner.ledger().quarantined = true;
@@ -318,6 +376,9 @@ impl OpenDispatch {
             reset: None,
             receipt: None,
             window: None,
+            permit_queue: None,
+            d16_queue: None,
+            native_backing: None, native_stock: None,
         });
         flow.physical = true;
         ctx.conn_epoch = id.epoch;
@@ -336,9 +397,43 @@ impl OpenDispatch {
             ));
             return;
         }
+        if let Some(error) = preparation_error {
+            if error == bytes::MeteredCopyError::Quarantined {
+                flow.stage = FlowStage::Quarantined;
+                drop(opens);
+                owner.quarantine_quiet();
+                let deadline = crate::shared::errors::QuietFailureSink::deadline_quiet(&**owner)
+                    .map(tokio::time::Instant::into_std);
+                let mut opens = owner.opens();
+                if !opens.slots.get(id.index).and_then(Option::as_ref).is_some_and(|slot| slot.matches_physical(id)) {
+                    return; // Already quiet/Q; a stale physical row cannot be updated.
+                }
+                if let Some(flow) = opens.flow_mut(id) {
+                    if let Some(deadline) = deadline {
+                        flow.stop_deadline = Some(flow.stop_deadline.map_or(deadline, |old| old.min(deadline)));
+                    }
+                }
+                return;
+            }
+            flow.close(("native_uplink", "escrow_admission_failed"));
+            if let Some(parent) = parent_deadline {
+                flow.stop_deadline = Some(flow.stop_deadline.map_or(parent, |old| old.min(parent)));
+            }
+            if let Some(fact) = preparation_fact {
+                owner.record(fact);
+                flow.rejection = Some(super::super::transaction::FlowRejection::ReportedNativeUplink(error));
+            }
+            drop(opens);
+            return;
+        }
         let result = socket.recv(|bytes| {
             let len = bytes.len().min(flow.reserved);
-            flow.escrow.extend_from_slice(&bytes[..len]);
+            if let Some(value) = prepared.take() {
+                // No await or socket mutation occurred since the exact peek.
+                flow.escrow = value;
+            } else if let crate::client_tun::uplink::Payload::Legacy(value) = &mut flow.escrow {
+                value.extend_from_slice(&bytes[..len]);
+            }
             flow.escrow_bytes = flow.escrow.len();
             (len, ())
         });
@@ -365,7 +460,7 @@ impl OpenDispatch {
             Ok(result) => {
                 if let Some(owner) = &self.owner {
                     if let Some(flow) = owner.opens().flow_mut(id) {
-                        if flow.stage == FlowStage::Quarantined {
+                        if flow.stage == FlowStage::Quarantined && flow.panic.is_none() {
                             if let Some(roles) = &mut flow.roles {
                                 roles.stop();
                             }
@@ -375,16 +470,14 @@ impl OpenDispatch {
                 result
             }
             Err(panic) => {
+                let mut panic = Some(panic);
                 if let Some(owner) = &self.owner {
                     if let Some(flow) = owner.opens().flow_mut(id) {
-                        flow.panic = Some(panic);
-                        flow.stage = FlowStage::Quarantined;
-                        if let Some(roles) = &mut flow.roles {
-                            roles.stop();
-                        }
+                        if let Some(payload) = panic.take() { flow.retain_unwind(payload); }
                     }
-                    owner.ledger().quarantined = true;
+                    owner.note_flow_unwind(id);
                 }
+                std::mem::forget(panic); // Lost identity retains its original captured Box as unknown custody.
                 false
             }
         }
@@ -431,22 +524,60 @@ impl OpenDispatch {
         let Some(flow) = opens.flow_mut(id) else {
             return false;
         };
+        if flow.preparing || flow.roles.as_ref().is_some_and(FlowRoles::disposition_in_flight) { return false; }
+        if flow.panic.is_some() && owner.app_meter.as_ref().is_some_and(|meter| meter.budget_limit().is_some()) {
+            return false; // Hard opaque work is permanently closed; original fatal turns still JOIN.
+        }
         let Some(ctx) = completion.socket_ctxs.get_mut(&id.handle) else {
             flow.stage = FlowStage::Quarantined;
             owner.ledger().quarantined = true;
             return false;
         };
-        // Generic has no protocol-owned/native permits to discard. Reject any
-        // unexpected physical authority instead of invoking its unknown Drop.
+        if flow.panic.is_some() && flow.roles.is_none()
+            && (ctx.uplink_tx.is_some() || ctx.relay_read_credit_tx.is_some()
+                || ctx.flow_mirror.as_ref().is_some_and(|mirror| mirror.window.is_some())) {
+            drop(opens); owner.quarantine_quiet(); return false;
+        }
+        let native_selected = flow.roles.as_ref().is_some_and(FlowRoles::is_native)
+            || matches!(
+                flow.carrier,
+                Some(OpenedOwnedTcp::Legacy(OpenedTcpRelay::Native(_)))
+            );
+        let d16_selected = flow.roles.as_ref().is_some_and(FlowRoles::is_d16)
+            || matches!(
+                flow.carrier,
+                Some(OpenedOwnedTcp::Legacy(OpenedTcpRelay::NativeByteOwned(_)))
+            )
+            || (flow.stage == FlowStage::Ready
+                && self.relay_policy().tuic_native_override()
+                    == crate::upstream::TuicNativeOverride::D16DirectOrdered);
+        let ordered = if d16_selected {
+            true
+        } else if native_selected {
+            flow.roles.as_ref().and_then(FlowRoles::permit_mode)
+                == Some(DownstreamPermitReleaseMode::OnEgressDrain)
+                || (flow.roles.is_none()
+                    && self.relay_policy().native_engine()
+                        == crate::upstream::NativeTcpRelayEngine::PermitPump)
+        } else {
+            self.relay_policy().generic_engine() == TcpRelayEngine::OrderedEgressPermitPump
+        };
+        // Protocol/native authority remains forbidden. Ordered custody is bound
+        // bidirectionally to the same four-role queue before any mutation.
         if ctx.local_reset.is_some()
             || ctx.resumable_uplink.is_some()
             || ctx.resumable_sink.is_some()
             || ctx.resumable_half_close.is_some()
             || ctx.resumable_terminal.is_some()
             || ctx.resumable_action_bridge.is_some()
-            || ctx.d16_downlink_queue.is_some()
-            || !ctx.downlink_pending_permits.is_empty()
-            || !ctx.downlink_inflight_permits.is_empty()
+            || (ctx.d16_downlink_queue.is_some() && !d16_selected)
+            || (flow.stage == FlowStage::Ready
+                && !FlowMirror::validate_ordered_custody(ctx, flow.roles.as_ref(), flow.published))
+            || (!ordered
+                && (!ctx.downlink_inflight_permits.is_empty()
+                    || ctx.downlink_delay_permit_release_until_egress))
+            || (ordered
+                && !FlowMirror::validate_ordered_custody(ctx, flow.roles.as_ref(), flow.published))
         {
             flow.stage = FlowStage::Quarantined;
             owner.ledger().quarantined = true;
@@ -457,13 +588,19 @@ impl OpenDispatch {
             owner.ledger().quarantined = true;
             return false;
         };
-        if mirror.id != id || !mirror.matches_epoch(ctx.conn_epoch) {
+        if mirror.id != id
+            || !mirror.matches_epoch(ctx.conn_epoch)
+            || !mirror.permit_binding_matches(flow.roles.as_ref())
+            || !mirror
+                .pending_permits_match(ctx.downlink_pending.len(), &ctx.downlink_pending_permits)
+        {
             flow.stage = FlowStage::Quarantined;
             owner.ledger().quarantined = true;
             return false;
         }
+        let window_transferred = mirror.window_transferred_bytes();
         if let Some(window) = &mut mirror.window {
-            let pending = mirror.receipt.map_or_else(
+            let pending = mirror.receipt.as_ref().map_or_else(
                 || {
                     ctx.downlink_pending
                         .len()
@@ -472,7 +609,10 @@ impl OpenDispatch {
                 |receipt| Some(receipt.discarded_downlink),
             );
             match pending {
-                Some(pending) => window.audit_storage(mirror.transferred.1, pending, 0),
+                Some(pending) => match window_transferred {
+                    Some(transferred) => window.audit_storage(transferred, pending, 0),
+                    None => window.fail("D16 transfer accounting overflow"),
+                },
                 None => window.fail("receive-window pending overflow"),
             }
             if let Some(error) = window.take_error() {
@@ -493,12 +633,42 @@ impl OpenDispatch {
         {
             flow.stage = FlowStage::Quarantined;
         }
+        // D72/D75: a hard Native reader terminal (EOF or read failure/RESET)
+        // arrives on the monitor/signal path and can overtake DATA the dispatcher
+        // already queued in the relay lane. Keep the producers (so
+        // relay_allows_remote_payload) until the mirror has begun every published
+        // DATA message, the exact witness Rearming uses below. Bounded by the 15s
+        // close deadline (drive → Quarantined); stop bypasses.
+        if flow.stage == FlowStage::Closing
+            && !flow.producer_stopped
+            && matches!(flow.close_reason, ("remote_to_local", "remote_eof" | "remote_read_failed"))
+            && !owner.stop.stopping.load(std::sync::atomic::Ordering::Acquire)
+            && flow.roles.as_ref().is_some_and(|roles| roles.hard_source_producers()
+                && roles.published().is_none_or(|sent| mirror.data_messages < sent.messages))
+        {
+            return true;
+        }
+        if matches!(flow.stage, FlowStage::Quarantined | FlowStage::Closing)
+            && !flow.producer_stopped && flow.roles.as_ref().is_some_and(FlowRoles::hard_source_producers)
+        {
+            let turn = flow.roles.as_mut().and_then(|roles| roles.take_native_producers(owner, id, ctx, flow.stop_deadline));
+            drop(opens);
+            if let Some(turn) = turn {
+                turn.dispose_producers(owner, &mut std::task::Context::from_waker(std::task::Waker::noop()), ctx);
+            } else { owner.quarantine_quiet(); }
+            return false;
+        }
+        if flow.producer_stopped && flow.roles.as_ref().is_some_and(FlowRoles::hard_source_producers)
+            && (ctx.uplink_tx.is_some() || ctx.relay_read_credit_tx.is_some()) {
+            flow.stage = FlowStage::Quarantined;
+            drop(opens); owner.quarantine_quiet(); return false;
+        }
         if flow.stage == FlowStage::Quarantined {
             mirror.producer_stopped = true;
-            ctx.uplink_tx = None;
-            ctx.relay_read_credit_tx = None;
+            drop(ctx.uplink_tx.take());
+            drop(ctx.relay_read_credit_tx.take());
             flow.producer_stopped = true;
-            if let Some(roles) = &mut flow.roles {
+            if let Some(roles) = flow.roles.as_mut().filter(|_| flow.panic.is_none()) {
                 roles.stop();
             }
             owner.ledger().quarantined = true;
@@ -514,141 +684,28 @@ impl OpenDispatch {
                 owner.ledger().quarantined = true;
                 return false;
             }
+            let retired = flow.roles.as_ref().is_none_or(FlowRoles::settled);
             drop(opens);
-            if self.release_flow(receipt) {
+            if retired && self.release_flow(receipt) {
                 ctx.flow_mirror = None;
                 return true;
             }
             return false;
         }
-        if matches!(flow.stage, FlowStage::Closing | FlowStage::Rearming)
+        if !ordered
+            && matches!(flow.stage, FlowStage::Closing | FlowStage::Rearming)
             && !completion.sockets.get::<TcpSocket>(id.handle).is_active()
         {
-            let Some(discarded) = mirror
-                .abandoned_pending
-                .checked_add(ctx.downlink_pending.len())
-            else {
+            if !mirror.dispose_pending(&mut ctx.downlink_pending, &mut ctx.downlink_pending_permits)
+            {
                 flow.stage = FlowStage::Quarantined;
+                owner.ledger().quarantined = true;
                 return false;
-            };
-            mirror.abandoned_pending = discarded;
-            ctx.downlink_pending = Vec::new();
+            }
         }
+
         if flow.stage == FlowStage::Ready {
-            if self.relay_policy().generic_engine() != TcpRelayEngine::Legacy {
-                flow.close(("policy", "generic_engine_not_yet_custodied"));
-                return true;
-            }
-            let Some(attempt) = &mut flow.attempt else {
-                return false;
-            };
-            if flow.carrier.is_none() {
-                flow.carrier = attempt.take_carrier(tokio::time::Instant::now().into_std());
-            }
-            if flow.carrier.is_none() {
-                match attempt.view().phase {
-                    crate::upstream::TcpOpenPhase::Ready => return false,
-                    crate::upstream::TcpOpenPhase::Retiring
-                    | crate::upstream::TcpOpenPhase::Settled => {
-                        flow.close(("remote_open", "carrier_failed"));
-                        return true;
-                    }
-                    _ => {
-                        flow.stage = FlowStage::Quarantined;
-                        return false;
-                    }
-                }
-            }
-            if !matches!(
-                flow.carrier,
-                Some(OpenedOwnedTcp::Legacy(OpenedTcpRelay::Generic(_)))
-            ) {
-                flow.stage = FlowStage::Quarantined;
-                owner.ledger().quarantined = true;
-                return false;
-            }
-            let (tx, rx) = mpsc::channel(RELAY_CHANNEL_CAPACITY);
-            let (credit_tx, credit_rx) = watch::channel(initial_relay_read_credit(false));
-            let Some(OpenedOwnedTcp::Legacy(OpenedTcpRelay::Generic(stream))) = flow.carrier.take()
-            else {
-                return false;
-            };
-            flow.roles = Some(FlowRoles::new(
-                super::super::supervision::GenericLaunchRequest {
-                    engine: TcpRelayEngine::Legacy,
-                    handle: id.handle,
-                    epoch: id.epoch,
-                    stream,
-                    rx,
-                    back_tx: completion.global_tx.clone(),
-                    read_credit_rx: credit_rx,
-                    downlink_backpressure: completion.downlink_backpressure,
-                },
-            ));
-            let Some(roles) = flow.roles.as_mut() else {
-                return false;
-            };
-            if mirror.window.is_some() {
-                flow.stage = FlowStage::Quarantined;
-                return false;
-            }
-            mirror.window = Some(ReceiveWindow::new());
-            let Some(window) = mirror.window.as_mut().and_then(ReceiveWindow::take_reader) else {
-                flow.stage = FlowStage::Quarantined;
-                return false;
-            };
-            roles.prepare(window);
-            #[cfg(test)]
-            if let Some(index) = flow.missing_start_gate.take() {
-                roles.drop_start_gate_for_test(index);
-            }
-            if roles.quarantined() {
-                flow.stage = FlowStage::Quarantined;
-                owner.ledger().quarantined = true;
-                return false;
-            }
-            if ctx.uplink_tx.is_some()
-                || ctx.relay_read_credit_tx.is_some()
-                || !ctx.uplink_buffer.is_empty()
-                || mirror.published_bytes.is_some()
-            {
-                flow.stage = FlowStage::Quarantined;
-                return false;
-            }
-            // The fresh channel has a single original producer and closed worker
-            // gates. Keep escrow until the synchronous physical ACK is committed.
-            if tx
-                .try_send(RelayCommand::Data(flow.escrow.clone()))
-                .is_err()
-            {
-                flow.stage = FlowStage::Quarantined;
-                return false;
-            }
-            ctx.uplink_tx = Some(tx);
-            ctx.relay_read_credit_tx = Some(credit_tx);
-            ctx.state = SocketState::Relaying;
-            ctx.pending_open_mode = None;
-            mirror.published_bytes = Some(flow.escrow.len());
-            flow.published = true;
-            flow.stage = FlowStage::Published;
-            let reserved = flow.reserved;
-            let escrow_bytes = flow.escrow_bytes;
-            flow.escrow = Vec::new();
-            flow.escrow_bytes = 0;
-            flow.reserved = 0;
-            flow.w_held = false;
-            if let Some(accounting) = &mut opens.flow {
-                accounting.w -= 1;
-                accounting.bytes -= reserved;
-                accounting.escrow_bytes -= escrow_bytes;
-                accounting.published += 1;
-            }
-            if let Some(flow) = opens.flow_mut(id) {
-                if let Some(roles) = &mut flow.roles {
-                    roles.start();
-                }
-            }
-            return true;
+            return self.prepare_ready(owner, opens, id, completion);
         }
         if flow.stage == FlowStage::Closing {
             mirror.producer_stopped = true;
@@ -657,6 +714,28 @@ impl OpenDispatch {
             flow.producer_stopped = true;
             if let Some(roles) = &mut flow.roles {
                 roles.stop();
+                if d16_selected
+                    && roles.join_count() == 3
+                    && !mirror.discard_d16_queue_after_joins(roles, flow.close_reason)
+                {
+                    flow.stage = FlowStage::Quarantined;
+                    owner.ledger().quarantined = true;
+                    return false;
+                }
+                if d16_selected
+                    && roles.join_count() == 3
+                    && mirror.d16_reader_disposition_matches(
+                        roles,
+                        ctx.downlink_pending.len(),
+                        ctx.downlink_pending_permits.is_empty(),
+                        ctx.downlink_inflight_permits.is_empty(),
+                    )
+                    && !roles.dispose_d16_reader_after_physical_proof()
+                {
+                    flow.stage = FlowStage::Quarantined;
+                    owner.ledger().quarantined = true;
+                    return false;
+                }
             }
             return true;
         }
@@ -730,6 +809,22 @@ impl OpenDispatch {
         {
             return true;
         }
+        if !ordered
+            && (!mirror
+                .dispose_pending(&mut ctx.downlink_pending, &mut ctx.downlink_pending_permits)
+                || !ctx.downlink_inflight_permits.is_empty()
+                || !mirror.permit_physical_zero(flow.roles.as_ref()))
+        {
+            mirror.quarantined = true;
+            flow.stage = FlowStage::Quarantined;
+            owner.ledger().quarantined = true;
+            return false;
+        }
+        if !mirror.native_backing_matches(flow.roles.as_ref()) {
+            mirror.quarantined = true;
+            owner.ledger().quarantined = true;
+            return false;
+        }
         let Some(next_epoch) = ctx.conn_epoch.checked_add(1) else {
             mirror.quarantined = true;
             return false;
@@ -753,6 +848,71 @@ impl OpenDispatch {
             }
             return true;
         }
+        // Ordered external caps cannot settle until this original reset has
+        // actually dispatched/flushed. The same marker remains in this ctx.
+        // A legal pre-publication W has no queue/roles/window or DATA. The
+        // header proves that complete empty state; only bound Egress owns caps.
+        let precleared_d16_inflight = mirror
+            .d16_queue
+            .as_ref()
+            .and_then(|binding| binding.terminal_preclear_inflight);
+        #[cfg(all(test, feature = "harness"))]
+        let permit_reset_pre = tests::permit_reset::capture_pre(
+            &ctx.downlink_inflight_permits,
+            ctx.downlink_pending.len(),
+            mirror,
+        );
+        let discarded_inflight = if let Some(bytes) = precleared_d16_inflight {
+            bytes
+        } else if ordered && mirror.egress_bound() {
+            let bytes = ctx.downlink_inflight_permit_bytes();
+            if !ctx.discard_ordered_for_reset() {
+                flow.stage = FlowStage::Quarantined;
+                owner.ledger().quarantined = true;
+                return false;
+            }
+            bytes
+        } else {
+            0
+        };
+        let Some(mirror) = &mut ctx.flow_mirror else {
+            return false;
+        };
+        #[cfg(all(test, feature = "harness"))]
+        let permit_reset = tests::permit_reset::capture_post(
+            &ctx.downlink_inflight_permits,
+            mirror,
+            permit_reset_pre,
+            discarded_inflight,
+        );
+        if ordered
+            && (!ctx.downlink_inflight_permits.is_empty()
+                || !mirror.permit_physical_zero(flow.roles.as_ref()))
+        {
+            mirror.quarantined = true;
+            flow.stage = FlowStage::Quarantined;
+            owner.ledger().quarantined = true;
+            return false;
+        }
+        let d16_receipt = if d16_selected {
+            let Some(receipt) = flow.roles.as_ref().and_then(|roles| {
+                mirror.d16_receipt(
+                    ctx.d16_downlink_queue.as_ref(),
+                    ctx.downlink_pending.len(),
+                    ctx.downlink_pending_permits.is_empty(),
+                    ctx.downlink_inflight_permits.is_empty(),
+                    roles,
+                )
+            }) else {
+                mirror.quarantined = true;
+                flow.stage = FlowStage::Quarantined;
+                owner.ledger().quarantined = true;
+                return false;
+            };
+            Some(receipt)
+        } else {
+            None
+        };
         let release = match mirror
             .lease
             .as_ref()
@@ -786,10 +946,19 @@ impl OpenDispatch {
             discarded: mirror.discarded,
             discarded_escrow: flow.escrow_bytes,
             discarded_downlink,
+            discarded_inflight,
             discarded_uplink: ctx.uplink_buffer.len(),
             discarded_socket_rx: socket.recv_queue(),
             discarded_socket_tx: socket.send_queue(),
+            #[cfg(all(test, feature = "harness"))]
+            permit_reset,
             fake_release: None,
+            d16: d16_receipt,
+            native_pump: flow.roles.as_ref().and_then(FlowRoles::native_pump_receipt),
+            native_direct_received: flow
+                .roles
+                .as_ref()
+                .and_then(FlowRoles::native_direct_source_received_bytes),
         };
         mirror.rearm_started = true;
         socket.abort();
@@ -808,12 +977,13 @@ impl OpenDispatch {
         next.conn_epoch = next_epoch;
         next.flow_mirror = retained_mirror;
         *ctx = next;
+        let retired = flow.roles.as_ref().is_none_or(FlowRoles::settled);
         drop(opens);
         #[cfg(test)]
         if tests::defer_receipt(owner, id) {
             return false;
         }
-        if self.release_flow(receipt) {
+        if retired && self.release_flow(receipt) {
             #[cfg(test)]
             if let Some(accounting) = &mut owner.opens().flow {
                 // Observe only actual new-mint ACKs; never drive settlement.
@@ -939,6 +1109,8 @@ impl OpenDispatch {
             return Poll::Pending;
         };
         owner.request_stop();
+        #[cfg(test)]
+        self.observe_ordered_physical(physical.contexts, physical.sockets);
         let mut opens = owner.opens();
         let len = opens.slots.len();
         // Stop/join gets half each turn, even when the DATA lane is full.
@@ -949,13 +1121,18 @@ impl OpenDispatch {
             let index = opens.cursor;
             opens.cursor = (index + 1) % len;
             physical.scanned += 1;
-            let Some(slot) = &mut opens.slots[index] else {
+            let Some(slot) = opens.slots.get_mut(index) else {
                 continue;
             };
+            let envelope = (slot.handle, slot.epoch);
             let OpenPhase::Flow(flow) = &mut slot.phase else {
                 physical.uncertain = true;
                 continue;
             };
+            if flow.roles.as_ref().is_some_and(FlowRoles::disposition_in_flight) {
+                physical.pending = true;
+                continue;
+            }
             // Never enter a provider again after an unknown unwind. Every
             // callback in a fresh row, including view and endpoint drop, shares
             // this guard; its payload remains in that same original flow slot.
@@ -965,15 +1142,45 @@ impl OpenDispatch {
                 }
                 physical.pending = true;
                 physical.uncertain = true;
+                let disposal = flow.roles.as_mut().and_then(|roles| {
+                    roles.all_original_roles_joined().then(|| roles.take_original_disposal(owner, flow.id)).flatten()
+                        .or_else(|| roles.take_native_disposal(owner, flow.id, flow.producer_stopped, flow.stop_deadline))
+                });
+                if let Some(disposal) = disposal {
+                    drop(opens);
+                    disposal.dispose(owner, cx);
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
                 continue;
+            }
+            if !flow.producer_stopped && flow.roles.as_ref().is_some_and(FlowRoles::hard_source_producers) {
+                if !flow.physical || envelope != (flow.id.handle, flow.id.epoch) {
+                    flow.stage = FlowStage::Quarantined;
+                    drop(opens); owner.quarantine_quiet(); return Poll::Pending;
+                }
+                flow.close(("root", "loop_panic"));
+                let Some(ctx) = physical.contexts.get_mut(&flow.id.handle) else {
+                    flow.stage = FlowStage::Quarantined;
+                    drop(opens); owner.quarantine_quiet(); return Poll::Pending;
+                };
+                let turn = flow.roles.as_mut().and_then(|roles| roles.take_native_producers(owner, flow.id, ctx, flow.stop_deadline));
+                drop(opens);
+                if let Some(turn) = turn { turn.dispose_producers(owner, cx, ctx); }
+                else { owner.quarantine_quiet(); }
+                physical.pending = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
             }
             let settled = catch_unwind(AssertUnwindSafe(|| {
                 flow.close(("root", "loop_panic"));
                 if let Some(ctx) = physical.contexts.get_mut(&flow.id.handle) {
                     // Execution has ended permanently. Remove the original producer
                     // endpoints before marking it stopped, even if its mirror is bad.
-                    ctx.uplink_tx = None;
-                    ctx.relay_read_credit_tx = None;
+                    if !flow.producer_stopped {
+                        ctx.uplink_tx = None;
+                        ctx.relay_read_credit_tx = None;
+                    }
                     if let Some(mirror) = &mut ctx.flow_mirror {
                         mirror.producer_stopped = true;
                         physical.uncertain |= mirror.id != flow.id
@@ -992,6 +1199,7 @@ impl OpenDispatch {
                 }
 
                 flow.drive(cx);
+                if flow.preparing || flow.cold_retained.is_some() { return false; }
                 let roles_settled = flow.roles.as_ref().is_none_or(FlowRoles::settled);
                 let provider_settled = flow.attempt.as_ref().is_none_or(|attempt| {
                     let view = attempt.view();
@@ -999,16 +1207,31 @@ impl OpenDispatch {
                         && !view.lease_held
                         && !view.retirement_pending
                 });
-                roles_settled && provider_settled && flow.carrier.is_none()
+                !flow.preparing && roles_settled && provider_settled && flow.carrier.is_none()
             }));
             match settled {
                 Ok(settled) => physical.pending |= !settled,
                 Err(payload) => {
-                    flow.panic = Some(payload);
-                    flow.stage = FlowStage::Quarantined;
+                    flow.retain_unwind(payload);
                     physical.pending = true;
                     physical.uncertain = true;
+                    let id = flow.id;
+                    drop(opens);
+                    owner.note_flow_unwind(id);
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
                 }
+            }
+            let disposal = flow.roles.as_mut().and_then(|roles| {
+                roles.all_original_roles_joined().then(|| roles.take_original_disposal(owner, flow.id)).flatten()
+                    .or_else(|| roles.take_native_disposal(owner, flow.id, flow.producer_stopped, flow.stop_deadline))
+            });
+            if let Some(disposal) = disposal {
+                physical.pending = true;
+                drop(opens);
+                disposal.dispose(owner, cx);
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
             }
             physical.uncertain |= flow.stage == FlowStage::Quarantined;
         }
@@ -1065,10 +1288,18 @@ impl OpenDispatch {
         let mut census = [(0usize, 0usize); 3];
         #[cfg(all(test, feature = "harness"))]
         let mut in_flight = 0usize;
+        #[cfg(all(test, feature = "harness"))]
+        let mut census_complete = true;
         for slot in opens.slots.iter().flatten() {
             let OpenPhase::Flow(flow) = &slot.phase else {
                 continue;
             };
+            if flow.roles.as_ref().is_some_and(FlowRoles::disposition_in_flight) {
+                physical.uncertain = true; // Actual outcome is retained in its original turn, never absent/zero.
+                #[cfg(all(test, feature = "harness"))]
+                { census_complete = false; }
+                continue;
+            }
             let mirror = physical
                 .contexts
                 .get(&flow.id.handle)
@@ -1123,7 +1354,7 @@ impl OpenDispatch {
         physical.uncertain |= physical_flows != mirrors;
         // Panic invalidates the physical receipt even if all known work joined.
         // Keep every slot/mirror/payload/permit/lease and the original device.
-        for slot in opens.slots.iter_mut().flatten() {
+        for (_, slot) in opens.slots.occupied_mut() {
             if let OpenPhase::Flow(flow) = &mut slot.phase {
                 flow.stage = FlowStage::Quarantined;
             }
@@ -1132,7 +1363,7 @@ impl OpenDispatch {
         {
             self.observe_selected_relay(physical.selected);
             if let Some(bridge) = &self.relay_event_test_bridge {
-                bridge.observe_fatal_census(census, in_flight);
+                if census_complete { bridge.observe_fatal_census(census, in_flight); }
             }
         }
         owner.ledger().quarantined = true;
@@ -1142,3 +1373,44 @@ impl OpenDispatch {
 
 #[cfg(test)]
 pub(in crate::client_tun::compatibility_runtime::flow_custody) mod tests;
+#[cfg(all(test, feature = "harness"))]
+pub(in crate::client_tun::compatibility_runtime::flow_custody) use tests::permit_reset::PermitResetObservation;
+
+// Main calls this outside opens after a typed admission refusal. The original
+// physical Flow settles its own cause; no Session-wide Device error is invented.
+impl OpenDispatch {
+    pub(in crate::client_tun) fn refuse_native_uplink(&self, ctx: &mut SocketCtx, error: bytes::MeteredCopyError) {
+        let Some(owner) = &self.owner else { return; };
+        let Some(id) = ctx.flow_mirror.as_ref().map(|mirror| mirror.id) else { owner.quarantine_quiet(); return; };
+        let Some(tx) = ctx.uplink_tx.as_ref() else { owner.quarantine_quiet(); return; };
+        let Some((_, clock)) = tx.native_context() else { owner.quarantine_quiet(); return; };
+        let clock = clock.clone();
+        tx.close_native_admission();
+        let mut opens = owner.opens();
+        if !opens.slots.get(id.index).and_then(Option::as_ref).is_some_and(|slot| slot.matches_physical(id))
+            || !FlowMirror::producer_admission_matches(ctx, id) {
+            drop(opens); clock.quarantine(); return;
+        }
+        let Some(flow) = opens.flow_mut(id) else { drop(opens); clock.quarantine(); return; };
+        if error != bytes::MeteredCopyError::Quarantined && flow.stage != FlowStage::Published { return; }
+        if error == bytes::MeteredCopyError::Quarantined { flow.stage = FlowStage::Quarantined; }
+        else { flow.close(("native_uplink", "admission_failed")); }
+        drop(opens);
+        if error == bytes::MeteredCopyError::Quarantined { clock.quarantine(); }
+        else {
+            let source = crate::client_tun::uplink::admission_error(error);
+            clock.io(&source);
+            drop(source);
+        }
+        let deadline = crate::shared::errors::QuietFailureSink::deadline_quiet(&**owner)
+            .into_iter().chain(clock.parent_deadline_for_stop()).min().map(tokio::time::Instant::into_std);
+        let mut opens = owner.opens();
+        if !opens.slots.get(id.index).and_then(Option::as_ref).is_some_and(|slot| slot.matches_physical(id)) { return; }
+        if let Some(flow) = opens.flow_mut(id) {
+            if error != bytes::MeteredCopyError::Quarantined && flow.rejection.is_none() {
+                flow.rejection = Some(super::super::transaction::FlowRejection::ReportedNativeUplink(error));
+            }
+            if let Some(deadline) = deadline { flow.stop_deadline = Some(flow.stop_deadline.map_or(deadline, |old| old.min(deadline))); }
+        }
+    }
+}

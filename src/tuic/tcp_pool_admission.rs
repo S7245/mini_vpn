@@ -8,10 +8,46 @@
 use super::*;
 use std::sync::{MutexGuard, TryLockError};
 
+/// Immutable evidence from ONE physical slot borrow, not another ownership ledger.
+/// Closed remains eligible for the original demand-recovery path; unreadable is
+/// never permission to prepare or reserve. Current must contain Known evidence.
+#[derive(Clone)]
+pub(super) enum StagedSlotSnapshot {
+    Contended,
+    Current {
+        observation: TcpPoolPathObservation,
+        activity: Arc<TcpPoolGenerationActivity>,
+        replacement_allowed: bool,
+    },
+    Closed {
+        identity: TcpPoolTransportIdentity,
+        activity: Arc<TcpPoolGenerationActivity>,
+    },
+}
+impl StagedSlotSnapshot {
+    fn identity(&self) -> Option<TcpPoolTransportIdentity> {
+        match self {
+            Self::Current {
+                observation: TcpPoolPathObservation::Known { identity, .. },
+                ..
+            }
+            | Self::Closed { identity, .. } => Some(*identity),
+            _ => None,
+        }
+    }
+    fn activity(&self) -> Option<&Arc<TcpPoolGenerationActivity>> {
+        match self {
+            Self::Current { activity, .. } | Self::Closed { activity, .. } => Some(activity),
+            Self::Contended => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
-enum AdmissionLockPolicy {
+enum AdmissionLockPolicy<'a> {
     LegacyBlocking,
     BoundedTry,
+    Staged(&'a [StagedSlotSnapshot]),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,13 +64,13 @@ impl From<TcpPoolReservationError> for TcpPoolAdmissionRoundError {
     }
 }
 
-fn lock_for_admission<T>(
-    lock: &StdMutex<T>,
-    policy: AdmissionLockPolicy,
-) -> Result<Option<MutexGuard<'_, T>>, TcpPoolAdmissionRoundError> {
+fn lock_for_admission<'lock, T>(
+    lock: &'lock StdMutex<T>,
+    policy: AdmissionLockPolicy<'_>,
+) -> Result<Option<MutexGuard<'lock, T>>, TcpPoolAdmissionRoundError> {
     match policy {
         AdmissionLockPolicy::LegacyBlocking => Ok(lock.lock().ok()),
-        AdmissionLockPolicy::BoundedTry => match lock.try_lock() {
+        AdmissionLockPolicy::BoundedTry | AdmissionLockPolicy::Staged(_) => match lock.try_lock() {
             Ok(guard) => Ok(Some(guard)),
             Err(TryLockError::WouldBlock) => Err(TcpPoolAdmissionRoundError::Contended),
             Err(TryLockError::Poisoned(_)) => Err(TcpPoolAdmissionRoundError::Poisoned),
@@ -61,6 +97,17 @@ impl TcpPoolAdmission {
         excluded_slots: &[bool],
         qualified_only: bool,
     ) -> Result<TcpPoolAdmissionDecision, TcpPoolAdmissionRoundError> {
+        self.validate_inventory()?;
+        self.decide_round(
+            observations,
+            replacement_allowed,
+            excluded_slots,
+            qualified_only,
+            AdmissionLockPolicy::BoundedTry,
+        )
+    }
+
+    fn validate_inventory(&self) -> Result<(), TcpPoolAdmissionRoundError> {
         let count = self.active_slots.len();
         if count > MAX_TUIC_TCP_POOL
             || self.preparing_slots.len() != count
@@ -69,13 +116,60 @@ impl TcpPoolAdmission {
         {
             return Err(TcpPoolAdmissionRoundError::InvalidInventory);
         }
-        self.decide_round(
-            observations,
-            replacement_allowed,
-            excluded_slots,
+        Ok(())
+    }
+
+    /// One bounded staged turn; contention retains the caller's original attempt.
+    pub(super) fn try_decide_staged_once(
+        &self,
+        snapshots: &[StagedSlotSnapshot],
+        excluded_slots: &[bool],
+        qualified_only: bool,
+    ) -> Result<TcpPoolAdmissionDecision, TcpPoolAdmissionRoundError> {
+        self.validate_inventory()?;
+        let count = self.active_slots.len();
+        if snapshots.len() != count {
+            return Err(TcpPoolAdmissionRoundError::InvalidInventory);
+        }
+        let mut observations = [TcpPoolPathObservation::Unknown; MAX_TUIC_TCP_POOL];
+        let mut replacement = [false; MAX_TUIC_TCP_POOL];
+        let mut excluded = [false; MAX_TUIC_TCP_POOL];
+        let mut contended = false;
+        for (i, snapshot) in snapshots.iter().enumerate() {
+            excluded[i] = excluded_slots.get(i).copied().unwrap_or(false);
+            match snapshot {
+                StagedSlotSnapshot::Contended => {
+                    contended |= !excluded[i];
+                    excluded[i] = true;
+                }
+                StagedSlotSnapshot::Current {
+                    observation,
+                    replacement_allowed,
+                    ..
+                } => {
+                    if !matches!(observation, TcpPoolPathObservation::Known { .. }) {
+                        return Err(TcpPoolAdmissionRoundError::InvalidInventory);
+                    }
+                    observations[i] = *observation;
+                    replacement[i] = *replacement_allowed;
+                }
+                StagedSlotSnapshot::Closed { .. } => {}
+            }
+        }
+        match self.decide_round(
+            &observations[..count],
+            &replacement[..count],
+            &excluded[..count],
             qualified_only,
-            AdmissionLockPolicy::BoundedTry,
-        )
+            AdmissionLockPolicy::Staged(snapshots),
+        ) {
+            Err(TcpPoolAdmissionRoundError::Reservation(TcpPoolReservationError::Saturated))
+                if contended =>
+            {
+                Err(TcpPoolAdmissionRoundError::Contended)
+            }
+            result => result,
+        }
     }
 
     pub(super) fn try_decide_excluding(
@@ -111,7 +205,7 @@ impl TcpPoolAdmission {
         replacement_allowed: &[bool],
         excluded_slots: &[bool],
         qualified_only: bool,
-        policy: AdmissionLockPolicy,
+        policy: AdmissionLockPolicy<'_>,
     ) -> Result<TcpPoolAdmissionDecision, TcpPoolAdmissionRoundError> {
         if self.active_slots.is_empty() {
             return Err(TcpPoolReservationError::Empty.into());
@@ -155,9 +249,12 @@ impl TcpPoolAdmission {
             {
                 continue;
             }
-            let identity = match observation {
-                TcpPoolPathObservation::Unknown => None,
-                TcpPoolPathObservation::Known { identity, .. } => Some(identity),
+            let identity = match policy {
+                AdmissionLockPolicy::Staged(snapshots) => snapshots[index].identity(),
+                _ => match observation {
+                    TcpPoolPathObservation::Unknown => None,
+                    TcpPoolPathObservation::Known { identity, .. } => Some(identity),
+                },
             };
             candidates.push(TcpPoolAdmissionCandidate {
                 index,
@@ -253,6 +350,9 @@ impl TcpPoolAdmission {
             let Some(black_holes_current) = replacement.black_holes_current else {
                 return Err(TcpPoolAdmissionRoundError::Contended);
             };
+            // A stale physical sample cannot publish an auxiliary preparation.
+            let _activity_guard =
+                self.expected_activity_guard(replacement.index, Some(identity), policy)?;
             let slot_preparing = self.preparing_slots[replacement.index].clone();
             if slot_preparing
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -343,10 +443,43 @@ impl TcpPoolAdmission {
         )
     }
 
+    /// The original mapping guard is held through publication/count commit.
+    /// Compatibility entries introduce no extra lock or identity requirement.
+    fn expected_activity_guard(
+        &self,
+        index: usize,
+        identity: Option<TcpPoolTransportIdentity>,
+        policy: AdmissionLockPolicy<'_>,
+    ) -> Result<Option<MutexGuard<'_, Arc<TcpPoolGenerationActivity>>>, TcpPoolAdmissionRoundError>
+    {
+        let AdmissionLockPolicy::Staged(snapshots) = policy else {
+            return Ok(None);
+        };
+        let snapshot = snapshots
+            .get(index)
+            .ok_or(TcpPoolAdmissionRoundError::InvalidInventory)?;
+        if identity.is_none() || snapshot.identity() != identity {
+            return Err(TcpPoolAdmissionRoundError::Contended);
+        }
+        let expected = snapshot
+            .activity()
+            .ok_or(TcpPoolAdmissionRoundError::Contended)?;
+        let lock = self
+            .current_generation_activity
+            .get(index)
+            .ok_or(TcpPoolAdmissionRoundError::InvalidInventory)?;
+        let guard =
+            lock_for_admission(lock, policy)?.ok_or(TcpPoolAdmissionRoundError::Contended)?;
+        if !Arc::ptr_eq(&guard, expected) {
+            return Err(TcpPoolAdmissionRoundError::Contended);
+        }
+        Ok(Some(guard))
+    }
+
     fn reserve_selected(
         &self,
         selection: SelectedAdmission,
-        policy: AdmissionLockPolicy,
+        policy: AdmissionLockPolicy<'_>,
     ) -> Result<TcpPoolAdmissionDecision, TcpPoolAdmissionRoundError> {
         let SelectedAdmission {
             selected,
@@ -369,9 +502,15 @@ impl TcpPoolAdmission {
             preparing: slot_preparing,
             available: self.available.clone(),
         };
-        let Some(generation_active) = self.activity_for_admission(index, policy)? else {
-            drop(preparation);
-            return Err(TcpPoolAdmissionRoundError::Contended);
+        let activity_guard = self.expected_activity_guard(index, selected.identity, policy)?;
+        let generation_active = match activity_guard.as_ref() {
+            Some(guard) => Arc::clone(guard),
+            None => {
+                let Some(activity) = self.activity_for_admission(index, policy)? else {
+                    return Err(TcpPoolAdmissionRoundError::Contended);
+                };
+                activity
+            }
         };
         // The idle epoch is the final fallible lock, acquired BEFORE any lease count.
         // No selected guard escapes this synchronous turn.
@@ -450,7 +589,7 @@ impl TcpPoolAdmission {
         index: usize,
         active_before: u64,
         observation: TcpPoolPathObservation,
-        policy: AdmissionLockPolicy,
+        policy: AdmissionLockPolicy<'_>,
     ) -> Result<TcpPoolQualificationDecision, TcpPoolAdmissionRoundError> {
         let TcpPoolPathObservation::Known {
             identity,
@@ -534,7 +673,7 @@ impl TcpPoolAdmission {
     fn activity_for_admission(
         &self,
         index: usize,
-        policy: AdmissionLockPolicy,
+        policy: AdmissionLockPolicy<'_>,
     ) -> Result<Option<Arc<TcpPoolGenerationActivity>>, TcpPoolAdmissionRoundError> {
         let Some(activity) = self.current_generation_activity.get(index) else {
             return Ok(None);
@@ -627,6 +766,19 @@ impl TcpPoolSlotLease {
         if self.release.is_some() || !self.drop_release {
             return Err(TcpPoolReservationError::LeaseNotActive);
         }
+        self.clone_active()
+    }
+
+    /// Staged provider keeps its original lease until the retirement witness;
+    /// each transferred Native half receives one independently counted lease.
+    pub(super) fn try_clone_retained(&self) -> Result<Self, TcpPoolReservationError> {
+        if self.release.is_some() || self.drop_release {
+            return Err(TcpPoolReservationError::LeaseNotActive);
+        }
+        self.clone_active()
+    }
+
+    fn clone_active(&self) -> Result<Self, TcpPoolReservationError> {
         if let Some(active) = &self.generation_active {
             active.try_increment()?;
         }

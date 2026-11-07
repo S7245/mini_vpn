@@ -47,7 +47,7 @@ pub use crate::connection::{
     Chunk, Chunks, ClosedStream, Connection, ConnectionError, ConnectionStats, Datagrams,
     EndpointPacingConnectionSnapshot, EndpointPacingSnapshot, EndpointPacingSocketOutcomeError,
     EndpointPacingStatelessResponseDenied, EndpointPacingStatelessResponseReservation, Event,
-    FinishError, FrameStats, PathStats, ReadError, ReadableError, RecvStream, RecvStreamProgress,
+    FinishError, PriorityError, FrameStats, PathStats, ReadError, ReadableError, RecvStream, RecvStreamProgress,
     RttEstimator, SendDatagramError, SendStream, SendStreamProgress, ShouldTransmit, StreamEvent,
     Streams, UdpStats, WriteError, Written,
 };
@@ -58,6 +58,9 @@ pub use crate::connection::{
 };
 #[cfg(feature = "qlog")]
 pub use connection::qlog::QlogStream;
+/// C6 read-only sent-history observation (test harness feature only).
+#[cfg(feature = "sent-history-observe")]
+pub use connection::sent_history_observe;
 
 #[cfg(feature = "rustls")]
 pub use rustls;
@@ -79,7 +82,10 @@ pub use crate::frame::{ApplicationClose, ConnectionClose, Datagram, FrameType};
 
 mod endpoint;
 pub use crate::endpoint::{
-    AcceptError, ConnectError, ConnectionHandle, DatagramEvent, Endpoint, Incoming, RetryError,
+    AcceptError, AdmittedDatagram, BoundRegistrationObserver, ConnectError, ConnectionHandle,
+    DatagramEvent, Endpoint, EndpointEventDisposition, EndpointEventOutcome, Incoming,
+    PreparedConnect, RegistrationKey, RegistrationObserver, ResponseBuffer, ResponseScratch,
+    RetryError,
 };
 
 mod packet;
@@ -88,6 +94,8 @@ pub use packet::{
     ProtectedHeader, ProtectedInitialHeader,
 };
 
+#[doc(hidden)]
+pub mod owned_events;
 mod shared;
 pub use crate::shared::{ConnectionEvent, ConnectionId, EcnCodepoint, EndpointEvent};
 
@@ -103,7 +111,10 @@ pub use crate::cid_generator::{
 
 mod token;
 use token::ResetToken;
-pub use token::{NoneTokenLog, NoneTokenStore, TokenLog, TokenReuseError, TokenStore};
+pub use token::{
+    NoneTokenLog, NoneTokenStore, TokenLog, TokenReuseError, TokenStore, TokenStoreError,
+    PreparedTokenInsert, TokenInsert,
+};
 
 mod token_memory_cache;
 pub use token_memory_cache::TokenMemoryCache;
@@ -336,6 +347,9 @@ pub struct Transmit {
 //
 
 /// The maximum number of CIDs we bother to issue per connection
+/// Maximum simultaneous registrations in the bounded Endpoint profile.
+#[doc(hidden)]
+pub const BUDGETED_CONNECTION_LIMIT: usize = 19;
 const LOC_CID_COUNT: u64 = 8;
 const RESET_TOKEN_SIZE: usize = 16;
 const MAX_CID_SIZE: usize = 20;

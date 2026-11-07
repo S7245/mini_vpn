@@ -10,7 +10,7 @@ use tokio::task::JoinError;
 
 const TEXT_CAPACITY: usize = 1024;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FailureClass {
     Io,
     InvalidTarget,
@@ -20,7 +20,7 @@ pub(crate) enum FailureClass {
     Cancelled,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FailurePhase {
     DeviceRead,
     DeviceWrite,
@@ -37,7 +37,7 @@ pub(crate) enum FailurePhase {
     UdpJoin,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FailureResource {
     TunPump,
     UdpDriver,
@@ -46,7 +46,7 @@ pub(crate) enum FailureResource {
     TcpOpen,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FailureOrigin {
     pub(crate) phase: FailurePhase,
     pub(crate) resource: FailureResource,
@@ -54,7 +54,7 @@ pub(crate) struct FailureOrigin {
     pub(crate) attempt_id: Option<u64>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FailureFacts {
     pub(crate) origin: FailureOrigin,
     pub(crate) class: FailureClass,
@@ -70,6 +70,7 @@ pub(crate) struct FailureFacts {
     pub(crate) source_content_omitted: bool,
 }
 
+#[derive(Clone)]
 pub(crate) struct RetainedFailure {
     facts: FailureFacts,
     text: [u8; TEXT_CAPACITY],
@@ -79,6 +80,12 @@ pub(crate) struct RetainedFailure {
 const _: () = assert!(std::mem::size_of::<RetainedFailure>() <= 1152);
 
 impl RetainedFailure {
+    /// Rebind diagnostic ownership without constructing a replacement error.
+    pub(crate) fn with_origin(mut self, origin: FailureOrigin) -> Self {
+        self.facts.origin = origin;
+        self
+    }
+
     pub(crate) fn from_io(origin: FailureOrigin, error: io::Error) -> Self {
         Self::from_io_ref(origin, &error)
     }

@@ -100,13 +100,14 @@ async fn read_from_peer(mut stream: quinn::RecvStream) -> Result<(), quinn::Conn
             Ok(())
         }
         Err(e) => {
-            use ReadError::*;
             use quinn::ReadToEndError::*;
+            use ReadError::*;
             match e {
                 TooLong | Read(ClosedStream) | Read(ZeroRttRejected) | Read(IllegalOrderedRead) => {
                     unreachable!()
                 }
                 Read(Reset(error_code)) => panic!("unexpected stream reset: {error_code}"),
+                Read(BackingAuthorityLost) => panic!("unexpected backing authority loss"),
                 Read(ConnectionLost(e)) => Err(e),
             }
         }

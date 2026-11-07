@@ -364,6 +364,8 @@ async fn connection_path_changed_resets_transport_state_and_preserves_stream() {
             .await
             .expect("post-reset payload");
         assert_eq!(second, SECOND);
+        // Keep the actual peer alive in the JoinHandle until the local close.
+        connection
     });
 
     let connection = endpoint
@@ -411,13 +413,26 @@ async fn connection_path_changed_resets_transport_state_and_preserves_stream() {
         .await
         .expect("write after path reset");
     send.finish().expect("finish same stream");
-    server.await.expect("server task");
+    let peer = server.await.expect("server task");
+    assert_eq!(connection.close_reason(), None);
 
     connection.close(0u32.into(), b"test complete");
     assert!(matches!(
         connection.path_changed(),
         Err(crate::ConnectionError::LocallyClosed)
     ));
+    // The other endpoint observes this real peer Close first. Its subsequent
+    // local close must retain that first error through the same host setter.
+    let peer_first = timeout(Duration::from_secs(5), peer.closed())
+        .await
+        .expect("peer observes original close");
+    assert!(matches!(
+        &peer_first,
+        crate::ConnectionError::ApplicationClosed(error)
+            if error.error_code == 0u32.into() && error.reason.as_ref() == b"test complete"
+    ));
+    peer.close(0u32.into(), b"peer cleanup");
+    assert_eq!(peer.path_changed(), Err(peer_first));
 }
 
 #[tokio::test]

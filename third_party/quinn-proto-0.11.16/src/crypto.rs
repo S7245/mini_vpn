@@ -13,8 +13,8 @@ use std::{any::Any, str, sync::Arc};
 use bytes::BytesMut;
 
 use crate::{
-    ConnectError, Side, TransportError, shared::ConnectionId,
-    transport_parameters::TransportParameters,
+    shared::ConnectionId, transport_parameters::TransportParameters, ConnectError, Side,
+    TransportError,
 };
 
 /// Cryptography interface based on *ring*
@@ -23,6 +23,20 @@ pub(crate) mod ring_like;
 /// TLS interface based on rustls
 #[cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
 pub mod rustls;
+
+/// Failure to write a complete handshake flight into caller-owned storage.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum HandshakeOutputError {
+    /// This provider does not implement bounded output.
+    Unsupported,
+    /// The flight requires more storage; no bytes or session state were changed.
+    Insufficient {
+        /// Exact space required by the current flight.
+        required: usize,
+    },
+    /// The flight length cannot be represented by `usize`.
+    LengthOverflow,
+}
 
 /// A cryptographic session (commonly TLS)
 pub trait Session: Send + Sync + 'static {
@@ -72,6 +86,25 @@ pub trait Session: Send + Sync + 'static {
     /// When the handshake proceeds to the next phase, this method will return a new set of
     /// keys to encrypt data with.
     fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<Keys>;
+
+    /// Write one complete flight without growing the caller's storage.
+    ///
+    /// Every error leaves both output and session state unchanged. Success may transfer
+    /// keys even when zero bytes are written, so an empty slice is not a read-only probe.
+    /// Callers must secure metadata custody before calling, and must not fall back to
+    /// unbounded output when enforcing a hard budget. Returned keys retain the provider's
+    /// original allocation behavior; this bounds output storage, not all crypto state.
+    fn write_handshake_bounded(
+        &mut self,
+        _output: &mut [u8],
+    ) -> Result<(usize, Option<Keys>), HandshakeOutputError> {
+        Err(HandshakeOutputError::Unsupported)
+    }
+
+    /// Read-only proof that a bounded handshake-output call has neither bytes
+    /// nor key transitions to publish. None means this provider has no proof.
+    /// This must not consume messages, secrets or keys, even on zero output.
+    fn handshake_output_is_idle(&self) -> Option<bool> { None }
 
     /// Compute keys for the next key update
     fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>>;

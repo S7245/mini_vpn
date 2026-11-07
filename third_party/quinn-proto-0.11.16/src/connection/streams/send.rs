@@ -1,7 +1,7 @@
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut, BackingMeter, MeteredCopyError};
 use thiserror::Error;
 
-use crate::{VarInt, connection::send_buffer::SendBuffer, frame};
+use crate::{connection::send_buffer::SendBuffer, frame, VarInt};
 
 #[derive(Debug)]
 pub(super) struct Send {
@@ -31,7 +31,10 @@ pub(super) struct Send {
 
 impl Send {
     pub(super) fn new(max_data: VarInt) -> Box<Self> {
-        Box::new(Self {
+        Box::new(Self::initial(max_data))
+    }
+    fn initial(max_data: VarInt) -> Self {
+        Self {
             max_data: max_data.into(),
             state: SendState::Ready,
             pending: SendBuffer::new(),
@@ -41,7 +44,12 @@ impl Send {
             transport_write_blocked: false,
             transport_write_demand_through: None,
             stop_reason: None,
-        })
+        }
+    }
+    pub(super) fn try_new(max_data: VarInt) -> Result<Box<Self>, MeteredCopyError> {
+        let pointer = unsafe { std::alloc::alloc(std::alloc::Layout::new::<Self>()).cast::<Self>() };
+        if pointer.is_null() { return Err(MeteredCopyError::Allocation); }
+        unsafe { pointer.write(Self::initial(max_data)); Ok(Box::from_raw(pointer)) }
     }
 
     /// Record that the application reached transport backpressure.
@@ -106,51 +114,44 @@ impl Send {
         matches!(self.state, SendState::ResetSent)
     }
 
+    pub(super) fn check_finish(&self) -> Result<(), FinishError> {
+        if let Some(error_code) = self.stop_reason { Err(FinishError::Stopped(error_code)) }
+        else if self.state != SendState::Ready { Err(FinishError::ClosedStream) }
+        else { Ok(()) }
+    }
     pub(super) fn finish(&mut self) -> Result<(), FinishError> {
-        if let Some(error_code) = self.stop_reason {
-            Err(FinishError::Stopped(error_code))
-        } else if self.state == SendState::Ready {
-            self.state = SendState::DataSent {
-                finish_acked: false,
-            };
-            self.fin_pending = true;
-            Ok(())
-        } else {
-            Err(FinishError::ClosedStream)
-        }
+        self.check_finish()?;
+        self.state = SendState::DataSent { finish_acked: false };
+        self.fin_pending = true;
+        Ok(())
     }
 
-    pub(super) fn write<S: BytesSource>(
-        &mut self,
-        source: &mut S,
-        limit: u64,
-    ) -> Result<Written, WriteError> {
-        if !self.is_writable() {
-            return Err(WriteError::ClosedStream);
-        }
-        if let Some(error_code) = self.stop_reason {
-            return Err(WriteError::Stopped(error_code));
-        }
+    pub(super) fn prepare_write<S: BytesSource>(
+        &mut self, source: &S, limit: u64, meter: Option<&BackingMeter>,
+    ) -> Result<PreparedWrite, WriteError> {
+        if !self.is_writable() { return Err(WriteError::ClosedStream); }
+        if let Some(error_code) = self.stop_reason { return Err(WriteError::Stopped(error_code)); }
         let budget = self.max_data - self.pending.offset();
-        if budget == 0 {
-            return Err(WriteError::Blocked);
-        }
-        let mut limit = limit.min(budget) as usize;
-
+        if budget == 0 { return Err(WriteError::Blocked); }
+        let limit = limit.min(budget) as usize;
+        let chunks = match meter { Some(meter) => source.native_plan(limit, meter)?, None => 0 };
+        let storage = self.pending.prepare_write(chunks, meter)?;
+        let copy = match meter { Some(meter) => source.native_copy(limit, meter)?, None => None };
+        if let Some(meter) = meter { meter.admit_precharged()?; }
+        Ok(PreparedWrite { limit, storage, copy, native: meter.is_some() })
+    }
+    pub(super) fn commit_write<S: BytesSource>(&mut self, source: &mut S, mut plan: PreparedWrite) -> Result<Written, WriteError> {
+        self.pending.install_write(plan.storage)?;
         let mut result = Written::default();
         loop {
-            let (chunk, chunks_consumed) = source.pop_chunk(limit);
-            result.chunks += chunks_consumed;
+            let (chunk, consumed) = if plan.native { source.pop_prepared(plan.limit, &mut plan.copy) }
+                else { source.pop_chunk(plan.limit) };
+            result.chunks += consumed;
             result.bytes += chunk.len();
-
-            if chunk.is_empty() {
-                break;
-            }
-
-            limit -= chunk.len();
+            if chunk.is_empty() { break; }
+            plan.limit -= chunk.len();
             self.pending.write(chunk);
         }
-
         Ok(result)
     }
 
@@ -176,8 +177,9 @@ impl Send {
     }
 
     /// Returns whether the stream has been finished and all data has been acknowledged by the peer
-    pub(super) fn ack(&mut self, frame: frame::StreamMeta) -> bool {
-        self.pending.ack(frame.offsets);
+    pub(super) fn ack(&mut self, frame: frame::StreamMeta, plan: crate::connection::send_buffer::PreparedRange) -> Result<bool, MeteredCopyError> {
+        self.pending.apply_ack(plan)?;
+        Ok(
         match self.state {
             SendState::DataSent {
                 ref mut finish_acked,
@@ -186,7 +188,7 @@ impl Send {
                 *finish_acked && self.pending.is_fully_acked()
             }
             _ => false,
-        }
+        })
     }
 
     /// Handle increase to stream-level flow control limit
@@ -214,6 +216,24 @@ impl Send {
     }
 }
 
+pub(super) struct PreparedWrite {
+    limit: usize,
+    storage: crate::connection::send_buffer::PreparedWrite,
+    copy: Option<Bytes>,
+    native: bool,
+}
+fn admit_chunk(chunk: &Bytes, meter: &BackingMeter) -> Result<(), MeteredCopyError> {
+    match chunk.backing_meter() {
+        Some(owner) if owner.same_budget(meter) => Ok(()),
+        None if chunk.is_empty() => Ok(()), // Empty originals remain in the caller's array.
+        other => {
+            meter.quarantine();
+            if let Some(other) = other { other.quarantine(); }
+            Err(MeteredCopyError::Quarantined)
+        }
+    }
+}
+
 /// A [`BytesSource`] implementation for `&'a mut [Bytes]`
 ///
 /// The type allows to dequeue [`Bytes`] chunks from an array of chunks, up to
@@ -235,6 +255,28 @@ impl<'a> BytesArray<'a> {
 }
 
 impl BytesSource for BytesArray<'_> {
+    fn native_plan(&self, mut limit: usize, meter: &BackingMeter) -> Result<usize, MeteredCopyError> {
+        let mut count = 0usize;
+        for chunk in &self.chunks[self.consumed..] {
+            if !chunk.is_empty() && limit == 0 { break; }
+            admit_chunk(chunk, meter)?;
+            if !chunk.is_empty() {
+                count = count.checked_add(1).ok_or(MeteredCopyError::TooLarge)?;
+                limit -= chunk.len().min(limit);
+            }
+        }
+        Ok(count)
+    }
+    fn native_copy(&self, _: usize, _: &BackingMeter) -> Result<Option<Bytes>, MeteredCopyError> { Ok(None) }
+    fn pop_prepared(&mut self, limit: usize, _: &mut Option<Bytes>) -> (Bytes, usize) {
+        let mut empty = 0;
+        while self.consumed < self.chunks.len() && self.chunks[self.consumed].is_empty() {
+            self.consumed += 1; empty += 1;
+        }
+        let (value, consumed) = self.pop_chunk(limit);
+        (value, empty + consumed)
+    }
+
     fn pop_chunk(&mut self, limit: usize) -> (Bytes, usize) {
         // The loop exists to skip empty chunks while still marking them as
         // consumed
@@ -280,6 +322,18 @@ impl<'a> ByteSlice<'a> {
 }
 
 impl BytesSource for ByteSlice<'_> {
+    fn native_plan(&self, limit: usize, _: &BackingMeter) -> Result<usize, MeteredCopyError> { Ok(usize::from(limit.min(self.data.len()) != 0)) }
+    fn native_copy(&self, limit: usize, meter: &BackingMeter) -> Result<Option<Bytes>, MeteredCopyError> {
+        let len = limit.min(self.data.len());
+        if len == 0 { return Ok(None); }
+        BytesMut::try_copy_from_slice_metered(&self.data[..len], meter).map(|value| Some(value.freeze()))
+    }
+    fn pop_prepared(&mut self, _: usize, copy: &mut Option<Bytes>) -> (Bytes, usize) {
+        let Some(chunk) = copy.take() else { return (Bytes::new(), 0); };
+        self.data = &self.data[chunk.len()..];
+        (chunk, usize::from(self.data.is_empty()))
+    }
+
     fn pop_chunk(&mut self, limit: usize) -> (Bytes, usize) {
         let limit = limit.min(self.data.len());
         if limit == 0 {
@@ -299,6 +353,10 @@ impl BytesSource for ByteSlice<'_> {
 /// The purpose of this data type is to defer conversion as long as possible,
 /// so that no heap allocation is required in case no data is writable.
 pub(super) trait BytesSource {
+    fn native_plan(&self, limit: usize, meter: &BackingMeter) -> Result<usize, MeteredCopyError>;
+    fn native_copy(&self, limit: usize, meter: &BackingMeter) -> Result<Option<Bytes>, MeteredCopyError>;
+    fn pop_prepared(&mut self, limit: usize, copy: &mut Option<Bytes>) -> (Bytes, usize);
+
     /// Returns the next chunk from the source of owned chunks.
     ///
     /// This method will consume parts of the source.
@@ -328,6 +386,9 @@ pub struct Written {
 /// Errors triggered while writing to a send stream
 #[derive(Debug, Error, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum WriteError {
+    /// The original Native physical inventory refused this unconsumed write.
+    #[error("native stream inventory refused: {0:?}")]
+    Admission(MeteredCopyError),
     /// The peer is not able to accept additional data, or the connection is congested.
     ///
     /// If the peer issues additional flow control credit, a [`StreamEvent::Writable`] event will
@@ -362,6 +423,8 @@ pub(super) enum SendState {
 /// Reasons why attempting to finish a stream might fail
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum FinishError {
+    #[error("native stream inventory refused: {0:?}")]
+    Admission(MeteredCopyError),
     /// The peer is no longer accepting data on this stream. No
     /// [`StreamEvent::Finished`] event will be emitted for this stream.
     ///
@@ -493,4 +556,8 @@ mod tests {
             }
         }
     }
+}
+
+impl From<MeteredCopyError> for WriteError {
+    fn from(error: MeteredCopyError) -> Self { Self::Admission(error) }
 }

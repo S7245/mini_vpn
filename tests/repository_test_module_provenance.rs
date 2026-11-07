@@ -40,7 +40,6 @@ const LEGACY_INLINE_TEST_MODULES_AFTER_TWO_LEG_HARNESS: &[&str] = &[
     "src/owned_upstream/supervisor.rs::tests",
     "src/owned_upstream/target.rs::tests",
     "src/owned_upstream/two_leg.rs::tests",
-    "src/owned_upstream/udp.rs::tests",
     "src/quic.rs::tests",
     "src/quic_udp_send_service.rs::tests",
     "src/reality/auth.rs::tests",
@@ -56,7 +55,6 @@ const LEGACY_INLINE_TEST_MODULES_AFTER_TWO_LEG_HARNESS: &[&str] = &[
     "src/resumable/capacity.rs::tests",
     "src/resumable/session.rs::tests",
     "src/resumable/tcp.rs::tests",
-    "src/tcp_downlink_pump.rs::tests",
     "src/tcp_egress.rs::tests",
     "src/tcp_stream_service.rs::tests",
 ];
@@ -276,8 +274,28 @@ fn repository_test_extractions_advance_the_inline_test_module_ratchet() {
         "the production TUIC source must not inline the test Implementation",
     );
     let tcp_open_tests = include_str!("../src/tuic/tcp_open/tests/mod.rs");
+    let unordered_tests = include_str!("../src/tuic/unordered/tests/mod.rs");
+    assert_eq!(rust_test_attribute_count(unordered_tests), 4);
     let udp_send_tests = include_str!("../src/tuic/udp_send/tests/uplink.rs");
     let udp_reassembly_tests = include_str!("../src/tuic/udp_reassembly/tests/mod.rs");
+    let assoc_characterization = include_str!("../src/tuic/assoc/tests/characterization.rs");
+    let assoc_tests = [
+        "assoc_intern_stable_and_unique",
+        "assoc_intern_skips_live_id_on_wraparound",
+        "assoc_contains_tracks_membership",
+        "assoc_resolve_endpoints_and_sweep",
+        "assoc_sweep_reclaims_fake_ip",
+        "assoc_evict_reclaims_fake_ip",
+        "assoc_touch_keeps_alive",
+        "assoc_lru_evicts_at_cap",
+    ];
+    for name in assoc_tests {
+        assert_eq!(
+            source_occurrences(assoc_characterization, &format!("#[test]\nfn {name}()")),
+            1,
+        );
+    }
+    assert_eq!(rust_test_attribute_count(assoc_characterization), 8);
     let moved_tests = [
         (udp_send_tests, "udp_send_plan_native_is_size_based"),
         (udp_send_tests, "udp_send_plan_quic_is_always_stream"),
@@ -307,14 +325,19 @@ fn repository_test_extractions_advance_the_inline_test_module_ratchet() {
     assert_eq!(
         rust_test_attribute_count(TUIC_TESTS_SOURCE)
             + moved_tests.len()
-            + rust_test_attribute_count(tcp_open_tests),
-        162,
-        "the external private Modules retain all original TUIC tests after the UDP and TCP open Moves",
+            + rust_test_attribute_count(tcp_open_tests)
+            + rust_test_attribute_count(assoc_characterization)
+            + rust_test_attribute_count(unordered_tests)
+            + rust_test_attribute_count(include_str!(
+                "../src/tuic/tests/native_combine.rs"
+            ))
+            + rust_test_attribute_count(include_str!(
+                "../src/tuic/tcp_readers/ordered_pump/tests/lifecycle.rs"
+            )),
+        166,
+        "all 162 original TUIC tests and the four Native terminal custody tracers remain reachable",
     );
-    assert!(
-        TUIC_TESTS_SOURCE.starts_with("use super::*;\n"),
-        "the external TUIC test Implementation starts at the unchanged parent seam",
-    );
+    assert!(TUIC_TESTS_SOURCE.starts_with("use super::*;\n"));
     assert_eq!(
         rust_inline_module_declaration_count(TUIC_TESTS_SOURCE),
         0,
@@ -457,14 +480,14 @@ fn client_tun_test_module_stays_external_and_private() {
             + rust_test_attribute_count(flow_custody_tests)
             + rust_test_attribute_count(rearm_custody_tests)
             + rust_test_attribute_count(reader_batch_tests)
-            + rust_test_attribute_count(local_egress_tests),
+            + rust_test_attribute_count(local_egress_tests)
+            + rust_test_attribute_count(include_str!(
+                "../src/client_tun/tests/native_permit_owner.rs"
+            )),
         349,
         "the external private Module retains the complete client TUN test inventory",
     );
-    assert!(
-        CLIENT_TUN_TESTS_SOURCE.starts_with("use super::*;\n"),
-        "the external test Implementation must not add a second tests Module layer",
-    );
+    assert!(CLIENT_TUN_TESTS_SOURCE.starts_with("use super::*;\n"));
     assert_eq!(
         rust_inline_module_declaration_count(CLIENT_TUN_TESTS_SOURCE),
         0,

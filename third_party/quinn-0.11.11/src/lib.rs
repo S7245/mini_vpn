@@ -58,6 +58,9 @@ pub(crate) use std::time::{Duration, Instant};
 pub(crate) use web_time::{Duration, Instant};
 
 #[cfg(feature = "bloom")]
+#[doc(hidden)]
+pub use proto::owned_events;
+
 pub use proto::BloomTokenLog;
 pub use proto::{
     congestion, crypto, AckFrequencyConfig, ApplicationClose, Chunk, ClientConfig, ClosedStream,
@@ -66,11 +69,13 @@ pub use proto::{
     EndpointPacingConnectionSnapshot, EndpointPacingServiceConfig, EndpointPacingSnapshot,
     FrameStats, FrameType, IdleTimeout, MtuDiscoveryConfig, NoneTokenLog, NoneTokenStore,
     PathStats, ServerConfig, Side, StdSystemTime, StreamId, TimeSource, TokenLog, TokenMemoryCache,
-    TokenReuseError, TokenStore, Transmit, TransportConfig, TransportErrorCode, UdpStats,
-    ValidationTokenConfig, VarInt, VarIntBoundsExceeded, Written,
+    TokenReuseError, TokenStore, TokenStoreError, Transmit, TransportConfig, TransportErrorCode,
+    UdpStats, ValidationTokenConfig, VarInt, VarIntBoundsExceeded, Written,
 };
 #[cfg(feature = "qlog")]
 pub use proto::{QlogConfig, QlogStream};
+#[cfg(feature = "sent-history-observe")]
+pub use proto::sent_history_observe;
 #[doc(hidden)]
 pub use proto::{SuccessorServiceTurnFailure, SuccessorServiceTurnStats};
 #[cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
@@ -119,7 +124,7 @@ enum ConnectionToEndpointEvent {
         event: proto::EndpointEvent,
         endpoint_released: Option<tokio::sync::oneshot::Sender<()>>,
     },
-    AuthenticatedCurrentSocketRx(u64),
+    AuthenticatedCurrentSocketRx(Option<proto::RegistrationKey>, u64),
 }
 
 fn udp_transmit<'a>(t: &proto::Transmit, buffer: &'a [u8]) -> udp::Transmit<'a> {

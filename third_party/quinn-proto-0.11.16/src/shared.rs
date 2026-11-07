@@ -2,18 +2,39 @@ use std::{fmt, net::SocketAddr};
 
 use bytes::{Buf, BufMut, BytesMut};
 
-use crate::{Instant, MAX_CID_SIZE, ResetToken, coding::BufExt, packet::PartialDecode};
+use crate::{coding::BufExt, packet::PartialDecode, Instant, ResetToken, MAX_CID_SIZE};
 
 /// Events sent from an Endpoint to a Connection
 #[derive(Debug)]
 pub struct ConnectionEvent(pub(crate) ConnectionEventInner);
+
+impl ConnectionEvent {
+    /// Full owned UDP datagram length, including coalesced packet bytes.
+    /// Identifier responses are control operations and return None.
+    #[doc(hidden)]
+    pub fn datagram_len(&self) -> Option<usize> {
+        match &self.0 {
+            ConnectionEventInner::Datagram(event) => Some(
+                event
+                    .first_decode
+                    .len()
+                    .saturating_add(event.remaining.as_ref().map_or(0, BytesMut::len)),
+            ),
+            ConnectionEventInner::NewIdentifiers(..)
+            | ConnectionEventInner::IdentifierCapacityUnavailable(..)
+            | ConnectionEventInner::RegistrationRefused(..) => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum ConnectionEventInner {
     /// A datagram has been received for the Connection
     Datagram(DatagramConnectionEvent),
     /// New connection identifiers have been issued for the Connection
-    NewIdentifiers(Vec<IssuedCid>, Instant),
+    NewIdentifiers(crate::connection::cid_frames::Frames, Instant),
+    IdentifierCapacityUnavailable(crate::connection::cid_frames::CapacityFailure),
+    RegistrationRefused(Option<crate::RegistrationKey>, Instant, &'static str),
 }
 
 /// Variant of [`ConnectionEventInner`].
@@ -28,7 +49,10 @@ pub(crate) struct DatagramConnectionEvent {
 
 /// Events sent from a Connection to an Endpoint
 #[derive(Debug)]
-pub struct EndpointEvent(pub(crate) EndpointEventInner);
+pub struct EndpointEvent(
+    pub(crate) EndpointEventInner,
+    pub(crate) Option<crate::RegistrationKey>,
+);
 
 impl EndpointEvent {
     /// Construct an event that indicating that a `Connection` will no longer emit events
@@ -36,7 +60,21 @@ impl EndpointEvent {
     /// Useful for notifying an `Endpoint` that a `Connection` has been destroyed outside of the
     /// usual state machine flow, e.g. when being dropped by the user.
     pub fn drained() -> Self {
-        Self(EndpointEventInner::Drained)
+        Self(EndpointEventInner::Drained, None)
+    }
+
+    pub(crate) fn control_time(&self) -> Option<Instant> {
+        match &self.0 {
+            EndpointEventInner::NeedIdentifiers(now, _)
+            | EndpointEventInner::RetireConnectionId(now, ..)
+            | EndpointEventInner::ResetToken(now, ..) => Some(*now),
+            EndpointEventInner::Drained => None,
+        }
+    }
+    /// Opaque originating registration, independent of the reusable handle.
+    #[doc(hidden)]
+    pub fn registration_key(&self) -> Option<crate::RegistrationKey> {
+        self.1
     }
 
     /// Determine whether this is the last event a `Connection` will emit
@@ -52,7 +90,7 @@ pub(crate) enum EndpointEventInner {
     /// The connection has been drained
     Drained,
     /// The reset token and/or address eligible for generating resets has been updated
-    ResetToken(SocketAddr, ResetToken),
+    ResetToken(Instant, SocketAddr, ResetToken),
     /// The connection needs connection identifiers
     NeedIdentifiers(Instant, u64),
     /// Stop routing connection ID for this sequence number to the connection

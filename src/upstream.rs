@@ -130,6 +130,18 @@ impl Default for RelayFamilyPolicy {
 }
 
 impl RelayFamilyPolicy {
+    /// Legacy Generic callers never selected TUIC Native carriers. Project only
+    /// that transport decision; the original TUN policy remains its own value.
+    pub(crate) fn generic_tuic_transport(&self) -> Self {
+        Self {
+            generic: self.generic,
+            native: self.native,
+            native_read_floor: self.native_read_floor,
+            tuic_generic: self.tuic_generic,
+            tuic_native: TuicNativeOverride::None,
+        }
+    }
+
     pub fn from_sources(s: RelayFamilyPolicySources<'_>) -> Self {
         Self {
             generic: select_tcp_relay_engine(
@@ -277,6 +289,17 @@ pub struct NativeTcpChunk {
 }
 
 pub trait NativeTcpReader: Unpin + Send {
+    /// Cold-path identity of the transport allocation authority, if present.
+    fn receive_backing_meter(&self) -> Option<bytes::BackingMeter> {
+        None
+    }
+
+    /// Cold terminal receipt from the transport adapter, independent of the
+    /// Root reader's accounting of chunks handed to its offset assembler.
+    fn source_read_bytes(&self) -> Option<usize> {
+        None
+    }
+
     /// Poll one transport-owned TCP chunk. Ordered readers selected by D16
     /// must return the next contiguous chunk and never return more than
     /// `max_len` bytes. D16 callers provide a nonzero byte reservation.
@@ -290,9 +313,66 @@ pub trait NativeTcpReader: Unpin + Send {
 pub type NativeTcpReadHalf = Box<dyn NativeTcpReader>;
 pub type NativeTcpWriteHalf = Box<dyn AsyncWrite + Unpin + Send>;
 
+mod native_pump;
+pub use native_pump::PreparedNativePump;
+pub(crate) use native_pump::{
+    Control as NativePumpControl, Failure as NativePumpFailure,
+    FailureValue as NativePumpFailureValue, Finished as NativePumpFinished,
+    LegacyPump as LegacyNativePump, Receipt as NativePumpReceipt, RunningNativePump,
+    Work as NativePumpWork,
+};
+
 pub struct NativeTcpRelayStream {
     pub reader: NativeTcpReadHalf,
     pub writer: NativeTcpWriteHalf,
+    prepared_pump: Option<PreparedNativePump>,
+}
+impl NativeTcpRelayStream {
+    pub fn new(reader: NativeTcpReadHalf, writer: NativeTcpWriteHalf) -> Self {
+        Self {
+            reader,
+            writer,
+            prepared_pump: None,
+        }
+    }
+    pub(crate) fn with_prepared_pump(mut self, pump: PreparedNativePump) -> Self {
+        self.prepared_pump = Some(pump);
+        self
+    }
+    pub(crate) fn has_prepared_pump(&self) -> bool {
+        self.prepared_pump.is_some()
+    }
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        NativeTcpReadHalf,
+        NativeTcpWriteHalf,
+        Option<PreparedNativePump>,
+    ) {
+        (self.reader, self.writer, self.prepared_pump)
+    }
+    /// The detached legacy launchers have no hard-budget settlement Root.
+    /// Reject that capability before consuming the carrier or committing its pump.
+    pub(crate) fn try_start_legacy(
+        self,
+    ) -> Result<
+        (
+            NativeTcpReadHalf,
+            NativeTcpWriteHalf,
+            native_pump::LegacyPump,
+        ),
+        Self,
+    > {
+        if self
+            .reader
+            .receive_backing_meter()
+            .is_some_and(|meter| meter.budget_limit().is_some())
+        {
+            return Err(self);
+        }
+        let (reader, writer, prepared) = self.into_parts();
+        Ok((reader, writer, native_pump::LegacyPump::new(prepared)))
+    }
 }
 
 pub enum OpenedTcpRelay {
@@ -429,6 +509,11 @@ pub trait ProxyUpstream: Send + Sync {
 #[async_trait::async_trait]
 pub trait DatagramUpstream: Send + Sync {
     async fn send_udp(&self, datagram: Vec<u8>);
+
+    /// Keep encoding with the transport owner so Native can fund the actual output first.
+    async fn send_udp_packet(&self, association: u16, target: &TargetAddr, payload: &[u8]) {
+        self.send_udp(crate::tuic::encode_packet(association, target, payload)).await;
+    }
 
     /// 上行 UDP datagram 累计丢弃（刀11 可观测性）：默认 0；`TuicUpstream` override 返回
     /// `udp_drop_count()`，`FailoverUpstream` 转发 tuic 腿（UDP 恒 TUIC）。snapshot 时读，与新增的

@@ -470,4 +470,4 @@ fn parse_inbound_tcp(packet: &[u8]) -> Option<InboundTcp> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(in crate::client_tun) mod tests;

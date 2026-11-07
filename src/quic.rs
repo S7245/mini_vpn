@@ -328,6 +328,24 @@ fn quic_transport_config(
     gso_policy: QuicGsoPolicy,
     pacing_policy: QuicPacingPolicy,
 ) -> Arc<TransportConfig> {
+    quic_transport_config_shaped(
+        cc,
+        mtu_policy,
+        gso_policy,
+        pacing_policy,
+        &honest_bound::TransportShape::tuic(mtu_policy),
+    )
+}
+
+/// Same transport with every buffer-bounding term taken from one `shape`, so
+/// the A2 honest bound and the installed config cannot diverge.
+fn quic_transport_config_shaped(
+    cc: CcChoice,
+    mtu_policy: MtuPolicy,
+    gso_policy: QuicGsoPolicy,
+    pacing_policy: QuicPacingPolicy,
+    shape: &honest_bound::TransportShape,
+) -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
     let idle = IdleTimeout::try_from(Duration::from_secs(QUIC_MAX_IDLE_SECS))
         .expect("idle timeout fits VarInt");
@@ -338,11 +356,14 @@ fn quic_transport_config(
     if matches!(pacing_policy, QuicPacingPolicy::PacerCap64) {
         t.max_pacing_burst_datagram_equivalents(NonZeroU16::new(64));
     }
-    t.max_concurrent_bidi_streams(QUIC_MAX_CONCURRENT_BIDI_STREAMS.into());
-    t.max_concurrent_uni_streams(QUIC_MAX_CONCURRENT_UNI_STREAMS.into());
-    t.stream_receive_window(quic_stream_receive_window_bytes(mtu_policy).into());
-    t.receive_window(quic_receive_window_bytes(mtu_policy).into());
-    t.send_window(QUIC_SEND_WINDOW_BYTES);
+    t.max_concurrent_bidi_streams(shape.bidi_streams.into());
+    t.max_concurrent_uni_streams(shape.uni_streams.into());
+    t.stream_receive_window(shape.stream_window.into());
+    t.receive_window(shape.connection_window.into());
+    t.send_window(shape.send_window);
+    t.datagram_receive_buffer_size(Some(shape.datagram_rx));
+    t.datagram_send_buffer_size(shape.datagram_tx);
+    t.crypto_buffer_size(shape.crypto_buffer);
     match cc {
         CcChoice::Bbr => t.congestion_controller_factory(Arc::new(BbrConfig::default())),
         CcChoice::Cubic => t.congestion_controller_factory(Arc::new(CubicConfig::default())),
@@ -400,6 +421,7 @@ pub fn client_quic_config(ca_path: &str) -> Result<ClientConfig, String> {
         MtuPolicy::Default,
         QuicGsoPolicy::Enabled,
         QuicPacingPolicy::QuinnDefault,
+        &honest_bound::TransportShape::tuic(MtuPolicy::Default),
     ))
 }
 
@@ -414,6 +436,28 @@ pub fn client_quic_config_alpn(
     gso_policy: QuicGsoPolicy,
     pacing_policy: QuicPacingPolicy,
 ) -> Result<ClientConfig, String> {
+    client_quic_config_alpn_shaped(
+        ca_path,
+        alpn_protocols,
+        cc,
+        mtu_policy,
+        gso_policy,
+        pacing_policy,
+        &honest_bound::TransportShape::tuic(mtu_policy),
+    )
+}
+
+/// `client_quic_config_alpn` with an explicit buffer-bounding transport shape
+/// (the Node passes its configured shape so the A2 preflight sees the truth).
+pub fn client_quic_config_alpn_shaped(
+    ca_path: &str,
+    alpn_protocols: Vec<Vec<u8>>,
+    cc: CcChoice,
+    mtu_policy: MtuPolicy,
+    gso_policy: QuicGsoPolicy,
+    pacing_policy: QuicPacingPolicy,
+    shape: &honest_bound::TransportShape,
+) -> Result<ClientConfig, String> {
     let crypto = client_crypto(ca_path, alpn_protocols, true)?;
     Ok(finish_client_config(
         crypto,
@@ -421,6 +465,7 @@ pub fn client_quic_config_alpn(
         mtu_policy,
         gso_policy,
         pacing_policy,
+        shape,
     ))
 }
 
@@ -431,15 +476,17 @@ fn finish_client_config(
     mtu_policy: MtuPolicy,
     gso_policy: QuicGsoPolicy,
     pacing_policy: QuicPacingPolicy,
+    shape: &honest_bound::TransportShape,
 ) -> ClientConfig {
     let quic_crypto = QuicClientConfig::try_from(crypto)
         .expect("rustls client config must support QUIC initial cipher suite");
     let mut cfg = ClientConfig::new(Arc::new(quic_crypto));
-    cfg.transport_config(quic_transport_config(
+    cfg.transport_config(quic_transport_config_shaped(
         cc,
         mtu_policy,
         gso_policy,
         pacing_policy,
+        shape,
     ));
     cfg
 }
@@ -486,6 +533,24 @@ pub(crate) fn client_endpoint_with_udp_send_service(
     send_service_policy: QuicUdpSendServicePolicy,
     pacing_policy: QuicPacingPolicy,
 ) -> Result<(Endpoint, Option<QuicUdpSendServiceStats>), String> {
+    client_endpoint_with_udp_send_service_inner(cfg, send_service_policy, pacing_policy, None)
+}
+
+pub(crate) fn client_endpoint_with_udp_send_service_metered(
+    cfg: ClientConfig,
+    send_service_policy: QuicUdpSendServicePolicy,
+    pacing_policy: QuicPacingPolicy,
+    meter: bytes::BackingMeter,
+) -> Result<(Endpoint, Option<QuicUdpSendServiceStats>), String> {
+    client_endpoint_with_udp_send_service_inner(cfg, send_service_policy, pacing_policy, Some(meter))
+}
+
+fn client_endpoint_with_udp_send_service_inner(
+    cfg: ClientConfig,
+    send_service_policy: QuicUdpSendServicePolicy,
+    pacing_policy: QuicPacingPolicy,
+    meter: Option<bytes::BackingMeter>,
+) -> Result<(Endpoint, Option<QuicUdpSendServiceStats>), String> {
     let bind: SocketAddr = "0.0.0.0:0".parse().expect("valid bind addr");
     let runtime =
         quinn::default_runtime().ok_or_else(|| "no async runtime for quic endpoint".to_string())?;
@@ -503,8 +568,13 @@ pub(crate) fn client_endpoint_with_udp_send_service(
             quinn::EndpointPacingServiceConfig::endpoint_window_v1(),
         ));
     }
-    let mut ep = Endpoint::new_with_abstract_socket(ep_cfg, None, abstract_socket, runtime)
-        .map_err(|e| format!("quic client endpoint: {e}"))?;
+    let mut ep = match meter {
+        Some(meter) => Endpoint::new_with_metered_abstract_socket(
+            ep_cfg, None, abstract_socket, runtime, meter,
+        ),
+        None => Endpoint::new_with_abstract_socket(ep_cfg, None, abstract_socket, runtime),
+    }
+    .map_err(|e| format!("quic client endpoint: {e}"))?;
     ep.set_default_client_config(cfg);
     Ok((ep, send_service_stats))
 }
@@ -624,6 +694,8 @@ fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, String> {
     }
     Ok(certs)
 }
+
+pub mod honest_bound;
 
 #[cfg(test)]
 #[path = "quic_path_probe.rs"]

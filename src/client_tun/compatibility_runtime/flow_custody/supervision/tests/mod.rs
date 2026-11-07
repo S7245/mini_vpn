@@ -4,6 +4,7 @@ use smoltcp::iface::SocketSet;
 use smoltcp::socket::tcp::{Socket, SocketBuffer};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+mod native_start;
 mod start_gate;
 
 #[derive(Default)]
@@ -64,11 +65,11 @@ impl Drop for Stream {
 }
 struct Fixture {
     roles: FlowRoles,
-    tx: mpsc::Sender<RelayCommand>,
-    _back: mpsc::Receiver<(SocketHandle, RelayEvent)>,
+    tx: crate::client_tun::uplink::Sender,
+    _back: crate::client_tun::relay_channel::Receiver<(SocketHandle, RelayEvent)>,
     _credit: watch::Sender<RelayReadCredit>,
     probe: Arc<Probe>,
-    _window: super::super::receive_window::ReceiveWindow,
+    _window: super::super::super::receive_window::ReceiveWindow,
 }
 fn fixture(fail: bool) -> Fixture {
     let mut sockets = SocketSet::new(Vec::new());
@@ -77,8 +78,8 @@ fn fixture(fail: bool) -> Fixture {
         SocketBuffer::new(vec![0; 8]),
     ));
     let probe = Arc::new(Probe::default());
-    let (tx, rx) = mpsc::channel(2);
-    let (back_tx, back) = mpsc::channel(2);
+    let (tx, rx) = crate::client_tun::uplink::channel(2);
+    let (back_tx, back) = crate::client_tun::relay_channel::channel(2);
     let (credit, read_credit_rx) = watch::channel(RelayReadCredit::default());
     let mut roles = FlowRoles::new(GenericLaunchRequest {
         engine: TcpRelayEngine::Legacy,
@@ -93,7 +94,7 @@ fn fixture(fail: bool) -> Fixture {
         read_credit_rx,
         downlink_backpressure: DownlinkBackpressureConfig::default(),
     });
-    let mut window = super::super::receive_window::ReceiveWindow::new();
+    let mut window = super::super::super::receive_window::ReceiveWindow::new();
     roles.prepare(window.take_reader().unwrap());
     Fixture {
         roles,
@@ -104,11 +105,24 @@ fn fixture(fail: bool) -> Fixture {
         probe,
     }
 }
+// Actor-only fixtures run the same bounded physical disposition outside any
+// Session lock. Full identity/turn-loss tests use original OpenDispatch instead.
+fn poll_role_fixture(roles: &mut FlowRoles, cx: &mut Context<'_>, stopped: bool) {
+    roles.poll(cx, stopped);
+    if let Some(native) = &mut roles.native {
+        if let Some(mut work) = native.take_disposal(stopped) {
+            work.run(cx);
+            assert!(work.matches(native));
+            work.restore(native);
+            cx.waker().wake_by_ref();
+        }
+    }
+}
 async fn until(roles: &mut FlowRoles, stopped: bool, done: impl Fn(&FlowRoles) -> bool) {
     tokio::time::timeout(
         std::time::Duration::from_secs(1),
         std::future::poll_fn(|cx| {
-            roles.poll(cx, stopped);
+            poll_role_fixture(roles, cx, stopped);
             if done(roles) {
                 Poll::Ready(())
             } else {
@@ -124,7 +138,7 @@ async fn until(roles: &mut FlowRoles, stopped: bool, done: impl Fn(&FlowRoles) -
 async fn dropped_start_gates_join_without_io_and_keep_outstanding_command_permit() {
     let mut f = fixture(false);
     f.tx.try_send(RelayCommand::Data(vec![1, 2, 3])).unwrap();
-    let permit = f.tx.clone().reserve_owned().await.unwrap();
+    let permit = f.tx.legacy_sender_for_test().expect("original Legacy Tokio permit").clone().reserve_owned().await.unwrap();
     drop(f.tx);
     f.roles.stop();
     until(&mut f.roles, false, |roles| roles.join_count() == 3).await;
@@ -187,106 +201,4 @@ async fn actual_reader_error_precedes_writer_and_shutdown_errors() {
     assert_eq!(f.roles.failures.load(Ordering::SeqCst), 3);
 }
 
-#[tokio::test]
-async fn poisoned_provider_still_joins_writer_blocked_by_full_monitor_notifications() {
-    let mut f = fixture(false);
-    f.probe
-        .fail_at_write
-        .store(RELAY_CHANNEL_CAPACITY / 3 + 1, Ordering::SeqCst);
-    f.roles.start();
-    f.roles.stops[2].take().unwrap().send(()).unwrap();
-    let setup = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        std::future::poll_fn(|cx| {
-            f.roles.poll_handles(cx);
-            if matches!(f.roles.monitor, Role::Joined(_)) {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
-        })
-        .await;
-        // Wait each real notification triple so the production writer cannot
-        // coalesce multiple queued DATA commands into one write.
-        for n in 1..=RELAY_CHANNEL_CAPACITY / 3 {
-            f.tx.send(RelayCommand::Data(vec![1])).await.unwrap();
-            loop {
-                if matches!(&f.roles.monitor, Role::Joined(m)
-                    if m.monitor.signals.writer_signal_rx.len() == n * 3)
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        }
-        f.tx.send(RelayCommand::Data(vec![1])).await.unwrap();
-        loop {
-            if f.probe.writes.load(Ordering::SeqCst) == RELAY_CHANNEL_CAPACITY / 3 + 1
-                && matches!(&f.roles.monitor, Role::Joined(m)
-                    if m.monitor.signals.writer_signal_rx.len() == RELAY_CHANNEL_CAPACITY)
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
-    let joined = if setup.is_ok() {
-        tokio::time::timeout(
-            std::time::Duration::from_millis(250),
-            std::future::poll_fn(|cx| {
-                f.roles.poll_fatal_joins(cx);
-                if f.roles.join_count() == 3 {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
-            }),
-        )
-        .await
-    } else {
-        setup
-    };
-    // Cleanup on RED must not normalize the successfully retained inventory.
-    if joined.is_err() {
-        if let Role::Joined(m) = &mut f.roles.monitor {
-            m.monitor.signals.writer_signal_rx.close();
-            m.monitor.signals.reader_signal_rx.close();
-        }
-        f.roles.stop();
-        drop(f.tx);
-        until(&mut f.roles, false, |r| r.join_count() == 3).await;
-    }
-    assert!(
-        joined.is_ok(),
-        "full retained monitor queue must not block actual join"
-    );
-    let Role::Joined(m) = &f.roles.monitor else {
-        panic!("actual monitor join")
-    };
-    assert_eq!(
-        m.monitor.signals.writer_signal_rx.len(),
-        RELAY_CHANNEL_CAPACITY
-    );
-    assert!(
-        m.closed
-            && m.monitor.signals.writer_signal_rx.is_closed()
-            && m.monitor.signals.reader_signal_rx.is_closed()
-    );
-    assert_eq!(f.probe.drops.load(Ordering::SeqCst), 1);
-    let Role::Joined(writer) = &f.roles.writer else {
-        panic!("actual writer join")
-    };
-    assert_eq!(
-        writer
-            .result
-            .failure
-            .as_ref()
-            .unwrap()
-            .source
-            .raw_os_error(),
-        Some(32)
-    );
-    assert_eq!(m.discarded, [0, 0]);
-    assert_eq!(m.drained, [false, false]);
-    assert!(f.roles.writer_receipt.is_none() && f.roles.reader_receipt.is_none());
-}
+mod notification_fatal;

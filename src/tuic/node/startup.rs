@@ -66,18 +66,32 @@ impl TuicUpstream {
         }
         quic::validate_quic_send_policies(pacing_policy, udp_send_service)
             .map_err(ClientError::InvalidTarget)?;
-        let qcfg = quic::client_quic_config_alpn(
+        let qcfg = quic::client_quic_config_alpn_shaped(
             &cfg.ca_path,
             vec![cfg.alpn.as_bytes().to_vec()],
             cc,
             mtu_policy,
             gso_policy,
             pacing_policy,
+            &cfg.transport_shape(),
         )
         .map_err(ClientError::InvalidTarget)?;
-        let (mut endpoint, udp_send_service_stats) =
-            quic::client_endpoint_with_udp_send_service(qcfg, udp_send_service, pacing_policy)
-                .map_err(ClientError::InvalidTarget)?;
+        let (mut endpoint, udp_send_service_stats) = if let Some(owner) = &owner {
+            quic::client_endpoint_with_udp_send_service_metered(
+                qcfg,
+                udp_send_service,
+                pacing_policy,
+                owner.state().backing_meter.clone(),
+            )
+        } else {
+            quic::client_endpoint_with_udp_send_service_metered(
+                qcfg,
+                udp_send_service,
+                pacing_policy,
+                bytes::BackingMeter::new(),
+            )
+        }
+        .map_err(ClientError::InvalidTarget)?;
         if let Some(owner) = &owner {
             owner.register_endpoint(&mut endpoint)?;
         }
@@ -213,6 +227,12 @@ impl TuicUpstream {
         }
         let tcp_pool_admission =
             TcpPoolAdmission::with_current_generation_activity(current_generation_activity);
+        // All original AUTH awaits are complete; no table loan crosses an await.
+        let udp_stream_sender = udp_send::UdpStreamSender::prepare(owner.as_ref())
+            .map_err(|error| match &owner {
+                Some(owner) => owner.uplink_admission(error),
+                None => ClientError::Io(std::io::Error::from(quinn::owned_events::AdmissionError(error))),
+            })?;
         Ok(Self {
             relay_policy: Arc::clone(&cfg.relay_policy),
             endpoint,
@@ -227,7 +247,7 @@ impl TuicUpstream {
             tcp_pool_draining_predecessor: Arc::new(AtomicBool::new(false)),
             tcp_pool_admission,
             udp_drops: AtomicU64::new(0),
-            udp_stream_sender: Default::default(),
+            udp_stream_sender: StdMutex::new(udp_stream_sender),
             udp_stream_fallbacks: AtomicU64::new(0),
             last_udp_activity: AtomicU64::new(0),
             clock,
@@ -358,8 +378,14 @@ impl TuicUpstream {
             .map_err(|e| io_err("tuic open_uni", e))?;
         uni.write_all(&encode_authenticate(uuid, &token))
             .await
-            .map_err(|e| io_err("tuic auth write", e))?;
-        uni.finish().map_err(|e| io_err("tuic auth finish", e))?;
+            .map_err(|e| match e {
+                quinn::WriteError::Admission(error) => ClientError::Io(quinn::owned_events::AdmissionError(error).into()),
+                error => io_err("tuic auth write", error),
+            })?;
+        uni.finish().map_err(|e| match e {
+                quinn::WriteError::Admission(error) => ClientError::Io(quinn::owned_events::AdmissionError(error).into()),
+                error => io_err("tuic auth finish", error),
+            })?;
         Ok(())
     }
 }

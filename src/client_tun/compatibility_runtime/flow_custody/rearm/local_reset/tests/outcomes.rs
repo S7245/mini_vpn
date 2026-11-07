@@ -174,6 +174,9 @@ impl TunIo for DrainThenFail<'_> {
     fn rx_take(&mut self) -> Option<bytes::BytesMut> {
         self.0.rx_take()
     }
+    fn rx_take_packet(&mut self) -> Option<crate::device::RxPacket> {
+        self.0.rx_take_packet()
+    }
     fn stage_rx_for_iface(&mut self) -> bool {
         self.0.stage_rx_for_iface()
     }
@@ -184,7 +187,7 @@ impl TunIo for DrainThenFail<'_> {
     fn queued_tx_bytes(&self) -> usize {
         self.0.queued_tx_bytes()
     }
-    fn take_flushed_tcp_packets(&mut self) -> Vec<TunFlushedTcpPacket> {
+    fn take_flushed_tcp_packets(&mut self) -> crate::device::FlushedTcpBatch<'_> {
         self.0.take_flushed_tcp_packets()
     }
     fn inject_ip_packet(&mut self, pkt: &[u8]) {
@@ -487,7 +490,7 @@ impl RejectedFlow {
                 now: 0,
             },
         );
-        let (global_tx, _global_rx) = mpsc::channel(4);
+        let (global_tx, _global_rx) = crate::client_tun::relay_channel::channel(4);
         let (owned_action_tx, _owned_rx) = mpsc::channel(4);
         for _ in 0..512 {
             dispatch.begin_turn().await;
@@ -554,7 +557,7 @@ impl RejectedFlow {
             .as_ref()
             .unwrap()
             .id;
-        let (global_tx, _global_rx) = mpsc::channel(4);
+        let (global_tx, _global_rx) = crate::client_tun::relay_channel::channel(4);
         let (owned_action_tx, _owned_rx) = mpsc::channel(4);
         self.dispatch.service_flow(
             id,
@@ -608,8 +611,9 @@ async fn f_reset_flush_error_retains_original_source_even_after_queue_drained_an
             &mut flow.server.sockets,
         );
         let result = if wrapped {
+            let mut source = DrainThenFail(&mut flow.server.device);
             let mut device = crate::client_tun::compatibility_runtime::egress::SessionEgress::new(
-                DrainThenFail(&mut flow.server.device),
+                &mut source,
                 flow.owner.clone(),
             );
             flush_tx_and_release_downlink_permits(

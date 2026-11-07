@@ -1,7 +1,13 @@
+mod payload;
 use bytes::{Bytes, BytesMut};
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex as StdMutex};
+pub(crate) use payload::{CustodiedBytes, CustodiedPayload, OwnedPayload};
+pub(crate) use payload::{MeteredMutation, PreparedPayload};
+mod storage;
+mod output_stock;
+pub(crate) use output_stock::{OutputStock, StockProducer, StockReadOperation, OutputSpace, StockKey, StockWaitError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use storage::Chunks;
 use tokio::sync::{Mutex, Notify};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,11 +35,20 @@ pub enum ByteQueuePushError {
     ChunkExceedsCapacity { len: usize, capacity: usize },
     Full { len: usize, available: usize },
     Closed,
+    Capacity(bytes::MeteredCopyError),
+}
+
+#[derive(Debug)]
+struct ByteChunk {
+    bytes: CustodiedBytes,
+    // Legacy Bytes have opaque backing. Custodied Vec transfers retain its
+    // actual allocation through any partial front slice, without another heap.
+    allocation: Option<usize>,
 }
 
 #[derive(Debug)]
 pub struct ByteBoundedFlowQueue {
-    chunks: VecDeque<Bytes>,
+    chunks: Chunks,
     queued_bytes: usize,
     capacity_bytes: usize,
     high_water_bytes: usize,
@@ -45,7 +60,7 @@ impl ByteBoundedFlowQueue {
             return Err(ByteQueueConfigError::ZeroCapacity);
         }
         Ok(Self {
-            chunks: VecDeque::new(),
+            chunks: Chunks::default(),
             queued_bytes: 0,
             capacity_bytes,
             high_water_bytes: 0,
@@ -80,15 +95,33 @@ impl ByteBoundedFlowQueue {
         if len > available {
             return Err(ByteQueuePushError::Full { len, available });
         }
+        self.chunks
+            .prepare(bytes.backing_meter())
+            .map_err(ByteQueuePushError::Capacity)?;
         self.queued_bytes = self.queued_bytes.saturating_add(len);
         self.high_water_bytes = self.high_water_bytes.max(self.queued_bytes);
-        self.chunks.push_back(bytes);
+        self.chunks.push_back(ByteChunk {
+            bytes: bytes.into(),
+            allocation: None,
+        });
         Ok(())
     }
 
     pub fn pop_up_to(&mut self, limit: usize) -> Option<Bytes> {
+        if self.chunks.front().is_some_and(|c| c.bytes.has_stock()) {
+            if let Some(chunk) = self.chunks.front() { chunk.bytes.quarantine_stock(); }
+            return None;
+        }
+        self.pop_owned(limit).and_then(|(bytes, _)| bytes.try_into_raw_legacy().ok())
+    }
+
+    fn pop_owned(&mut self, limit: usize) -> Option<(CustodiedBytes, usize)> {
         if limit == 0 {
             return None;
+        }
+        if let Some((bytes, capacity)) = self.chunks.pop_native(limit) {
+            self.queued_bytes -= bytes.len();
+            return Some((bytes, capacity));
         }
         let mut remaining = limit;
         let mut out = BytesMut::new();
@@ -96,12 +129,12 @@ impl ByteBoundedFlowQueue {
             let Some(mut chunk) = self.chunks.pop_front() else {
                 break;
             };
-            let take = chunk.len().min(remaining);
-            out.extend_from_slice(&chunk[..take]);
+            let take = chunk.bytes.len().min(remaining);
+            out.extend_from_slice(&chunk.bytes[..take]);
             self.queued_bytes = self.queued_bytes.saturating_sub(take);
             remaining -= take;
-            if take < chunk.len() {
-                chunk = chunk.slice(take..);
+            if take < chunk.bytes.len() {
+                chunk.bytes = chunk.bytes.slice(take..);
                 self.chunks.push_front(chunk);
                 break;
             }
@@ -109,7 +142,8 @@ impl ByteBoundedFlowQueue {
         if out.is_empty() {
             None
         } else {
-            Some(out.freeze())
+            let allocation = out.capacity();
+            Some((out.freeze().into(), allocation))
         }
     }
 }
@@ -197,6 +231,7 @@ impl Default for ContinuousPumpStats {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AsyncByteQueueWait {
     Closed,
+    Quarantined,
 }
 
 #[derive(Debug, Clone)]
@@ -206,7 +241,11 @@ pub struct AsyncByteBoundedFlowQueue {
 
 #[derive(Debug)]
 struct AsyncByteBoundedFlowQueueInner {
+    start: native_wait::Start,
+    waiters: std::sync::OnceLock<native_wait::Waiters>,
     state: Mutex<AsyncByteBoundedFlowQueueState>,
+    stock: std::sync::OnceLock<output_stock::StockKey>,
+    read: output_stock::ReadAdmission,
     not_empty: Notify,
     not_full: Notify,
 }
@@ -215,16 +254,83 @@ struct AsyncByteBoundedFlowQueueInner {
 struct AsyncByteBoundedFlowQueueState {
     queue: ByteBoundedFlowQueue,
     closed: bool,
+    custody: ByteQueueCustody,
+}
+
+/// Independent source-chunk and dispatcher-batch domains. No one-to-one
+/// relation is assumed: pop coalesces and slices original chunks.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ByteQueueCustody {
+    pub(crate) sources: usize,
+    pub(crate) emitted: usize,
+    pub(crate) batches: usize,
+    pub(crate) consumed: usize,
+    pub(crate) discarded_chunks: usize,
+    pub(crate) discarded_bytes: usize,
+    pub(crate) discarded_allocation: usize,
+    pub(crate) frozen_bytes: usize,
+    pub(crate) frozen_chunks: usize,
+    pub(crate) metadata_slots: usize,
+    pub(crate) metadata_bytes: usize,
+    frozen: bool,
+    interrupted: bool,
+}
+
+/// Physical DATA/metadata disposal only. Callbacks and external loans remain.
+pub(crate) struct ByteQueueDataDisposition(ByteQueueCustody);
+impl ByteQueueDataDisposition {
+    pub(crate) fn custody(&self) -> ByteQueueCustody { self.0 }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ByteCustodyError {
+    Rejected,
+    Invalid,
+    Capacity(bytes::MeteredCopyError),
+}
+
+/// The actual coalesced batch and its original BytesMut allocation move into
+/// the consumer's retained slot before any capacity waiter can be woken.
+pub(crate) struct ByteQueueBatch {
+    pub(crate) bytes: CustodiedBytes,
+    pub(crate) allocation: usize,
 }
 
 impl AsyncByteBoundedFlowQueue {
+    pub(crate) fn bind_native_meter(&self, meter: Option<bytes::BackingMeter>) -> Option<()> {
+        self.bind_native_meter_typed(meter).ok()
+    }
+    pub(crate) fn bind_native_meter_typed(&self, meter: Option<bytes::BackingMeter>) -> Result<(), bytes::MeteredCopyError> {
+        let _cold = self.inner.start.cold().ok_or(bytes::MeteredCopyError::Quarantined)?;
+        self.bind_native_meter_cold(meter)
+    }
+    fn bind_native_meter_cold(&self, meter: Option<bytes::BackingMeter>) -> Result<(), bytes::MeteredCopyError> {
+        let mut state = self.inner.state.try_lock().map_err(|_| bytes::MeteredCopyError::Quarantined)?;
+        if let Some(meter) = meter.as_ref().filter(|m| m.budget_limit().is_some()) {
+            if self.inner.waiters.get().is_none() {
+                self.inner
+                    .waiters
+                    .set(native_wait::Waiters::prepare(meter)?)
+                    .map_err(|_| bytes::MeteredCopyError::Quarantined)?;
+            }
+        }
+        state.queue.chunks.bind(meter).ok_or(bytes::MeteredCopyError::Quarantined)
+    }
+    pub(crate) fn bind_native_failures(&self, clock: crate::shared::errors::FailureClock) -> bool {
+        self.inner.waiters.get().is_none_or(|w| w.bind(clock))
+    }
     pub fn new(capacity_bytes: usize) -> Result<Self, ByteQueueConfigError> {
         Ok(Self {
             inner: Arc::new(AsyncByteBoundedFlowQueueInner {
+                start: native_wait::Start::default(),
+                waiters: std::sync::OnceLock::new(),
                 state: Mutex::new(AsyncByteBoundedFlowQueueState {
                     queue: ByteBoundedFlowQueue::new(capacity_bytes)?,
                     closed: false,
+                    custody: ByteQueueCustody::default(),
                 }),
+                stock: std::sync::OnceLock::new(),
+                read: output_stock::ReadAdmission::default(),
                 not_empty: Notify::new(),
                 not_full: Notify::new(),
             }),
@@ -232,16 +338,57 @@ impl AsyncByteBoundedFlowQueue {
     }
 
     pub async fn snapshot(&self) -> ByteQueueSnapshot {
+        self.inner.start.begin();
+        if let Some(w) = self.inner.waiters.get() {
+            w.reject_raw();
+            return std::future::pending().await;
+        }
         self.inner.state.lock().await.queue.snapshot()
     }
 
+    #[cfg(test)]
+    pub(crate) async fn custody_snapshot(&self) -> (ByteQueueSnapshot, ByteQueueCustody) {
+        self.inner.start.begin();
+        let state = self
+            .inner
+            .state
+            .try_lock()
+            .expect("passive custody inspection must be quiescent");
+        (state.queue.snapshot(), state.custody)
+    }
+
     pub async fn wait_read_len(&self, max_read_len: usize) -> Result<usize, AsyncByteQueueWait> {
+        self.inner.start.begin();
+        if self.inner.stock.get().is_some() {
+            if let Some(waiters) = self.inner.waiters.get() { waiters.reject_raw(); }
+            return Err(AsyncByteQueueWait::Closed);
+        }
+        match self.inner.waiters.get() {
+            Some(w) => w
+                .run(
+                    native_wait::Role::Producer,
+                    self.wait_read_len_inner(max_read_len),
+                )
+                .await
+                .map_err(|e| match e {
+                    native_wait::RunError::Closed => AsyncByteQueueWait::Closed,
+                    native_wait::RunError::Quarantined => AsyncByteQueueWait::Quarantined,
+                })?,
+            None => self.wait_read_len_inner(max_read_len).await,
+        }
+    }
+    async fn wait_read_len_inner(&self, max_read_len: usize) -> Result<usize, AsyncByteQueueWait> {
         if max_read_len == 0 {
             return Ok(0);
         }
         loop {
             let state = self.inner.state.lock().await;
-            if state.closed {
+            if self
+                .inner
+                .waiters
+                .get()
+                .map_or(state.closed, native_wait::Waiters::is_closed)
+            {
                 return Err(AsyncByteQueueWait::Closed);
             }
             let available = state.queue.snapshot().available_bytes();
@@ -255,8 +402,20 @@ impl AsyncByteBoundedFlowQueue {
     }
 
     pub async fn try_push(&self, bytes: Bytes) -> Result<(), ByteQueuePushError> {
+        self.inner.start.begin();
+        if let Some(w) = self.inner.waiters.get() {
+            w.reject_raw();
+            return Err(ByteQueuePushError::Capacity(
+                bytes::MeteredCopyError::Quarantined,
+            ));
+        }
         let mut state = self.inner.state.lock().await;
-        if state.closed {
+        if self
+            .inner
+            .waiters
+            .get()
+            .map_or(state.closed, native_wait::Waiters::is_closed)
+        {
             return Err(ByteQueuePushError::Closed);
         }
         state.queue.try_push(bytes)?;
@@ -266,13 +425,25 @@ impl AsyncByteBoundedFlowQueue {
     }
 
     pub async fn push(&self, bytes: Bytes) -> Result<(), ByteQueuePushError> {
+        self.inner.start.begin();
+        if let Some(w) = self.inner.waiters.get() {
+            w.reject_raw();
+            return Err(ByteQueuePushError::Capacity(
+                bytes::MeteredCopyError::Quarantined,
+            ));
+        }
         let len = bytes.len();
         if len == 0 {
             return Err(ByteQueuePushError::EmptyChunk);
         }
         loop {
             let mut state = self.inner.state.lock().await;
-            if state.closed {
+            if self
+                .inner
+                .waiters
+                .get()
+                .map_or(state.closed, native_wait::Waiters::is_closed)
+            {
                 return Err(ByteQueuePushError::Closed);
             }
             let snapshot = state.queue.snapshot();
@@ -295,6 +466,11 @@ impl AsyncByteBoundedFlowQueue {
     }
 
     pub async fn pop_up_to(&self, limit: usize) -> Option<Bytes> {
+        self.inner.start.begin();
+        if let Some(w) = self.inner.waiters.get() {
+            w.reject_raw();
+            return std::future::pending().await;
+        }
         let mut state = self.inner.state.lock().await;
         let popped = state.queue.pop_up_to(limit);
         let should_notify = popped.is_some();
@@ -306,6 +482,11 @@ impl AsyncByteBoundedFlowQueue {
     }
 
     pub async fn recv_up_to(&self, limit: usize) -> Option<Bytes> {
+        self.inner.start.begin();
+        if let Some(w) = self.inner.waiters.get() {
+            w.reject_raw();
+            return std::future::pending().await;
+        }
         if limit == 0 {
             return None;
         }
@@ -316,7 +497,12 @@ impl AsyncByteBoundedFlowQueue {
                 self.inner.not_full.notify_waiters();
                 return Some(bytes);
             }
-            if state.closed {
+            if self
+                .inner
+                .waiters
+                .get()
+                .map_or(state.closed, native_wait::Waiters::is_closed)
+            {
                 return None;
             }
             let notified = self.inner.not_empty.notified();
@@ -326,1514 +512,321 @@ impl AsyncByteBoundedFlowQueue {
     }
 
     pub async fn close(&self) {
+        self.inner.start.begin();
+        if let Some(w) = self.inner.waiters.get() {
+            w.close();
+            self.inner.not_empty.notify_waiters();
+            self.inner.not_full.notify_waiters();
+        } else {
+            self.close_inner().await;
+        }
+    }
+    async fn close_inner(&self) {
         let mut state = self.inner.state.lock().await;
         state.closed = true;
         drop(state);
         self.inner.not_empty.notify_waiters();
         self.inner.not_full.notify_waiters();
     }
-}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LeasedByteQueueSnapshot {
-    pub queued_bytes: usize,
-    pub leased_bytes: usize,
-    pub reserved_bytes: usize,
-    /// Monotonic evidence that owned payload advanced toward local egress.
-    pub local_progress_bytes: u64,
-    pub capacity_bytes: usize,
-    pub high_water_bytes: usize,
-    pub chunks: usize,
-    pub closure: LeasedByteQueueClosure,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LeasedByteQueueTerminalCause {
-    pub direction: &'static str,
-    pub reason: &'static str,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LeasedByteQueueClosure {
-    Open,
-    RemoteEof,
-    Terminal(LeasedByteQueueTerminalCause),
-}
-
-impl LeasedByteQueueClosure {
-    pub fn is_closed(self) -> bool {
-        !matches!(self, Self::Open)
-    }
-
-    pub fn terminal_cause(self) -> Option<LeasedByteQueueTerminalCause> {
-        match self {
-            Self::Terminal(cause) => Some(cause),
-            Self::Open | Self::RemoteEof => None,
-        }
-    }
-}
-
-pub const D16_GLOBAL_BYTE_BUDGET_DEFAULT_BYTES: usize = 64 * 1024 * 1024;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct D16GlobalByteBudgetSnapshot {
-    pub reserved_bytes: usize,
-    pub owned_bytes: usize,
-    pub capacity_bytes: usize,
-    pub high_water_bytes: usize,
-}
-
-impl D16GlobalByteBudgetSnapshot {
-    pub fn total_bytes(self) -> usize {
-        self.reserved_bytes.saturating_add(self.owned_bytes)
-    }
-
-    pub fn available_bytes(self) -> usize {
-        self.capacity_bytes.saturating_sub(self.total_bytes())
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct D16GlobalByteBudget {
-    inner: Arc<D16GlobalByteBudgetInner>,
-}
-
-#[derive(Debug)]
-struct D16GlobalByteBudgetInner {
-    state: StdMutex<D16GlobalByteBudgetState>,
-    not_full: Notify,
-}
-
-#[derive(Debug)]
-struct D16GlobalByteBudgetState {
-    reserved_bytes: usize,
-    owned_bytes: usize,
-    capacity_bytes: usize,
-    high_water_bytes: usize,
-}
-
-impl D16GlobalByteBudgetState {
-    fn snapshot(&self) -> D16GlobalByteBudgetSnapshot {
-        D16GlobalByteBudgetSnapshot {
-            reserved_bytes: self.reserved_bytes,
-            owned_bytes: self.owned_bytes,
-            capacity_bytes: self.capacity_bytes,
-            high_water_bytes: self.high_water_bytes,
-        }
-    }
-
-    fn total_bytes(&self) -> usize {
-        self.reserved_bytes.saturating_add(self.owned_bytes)
-    }
-
-    fn available_bytes(&self) -> usize {
-        self.capacity_bytes.saturating_sub(self.total_bytes())
-    }
-
-    fn note_high_water(&mut self) {
-        self.high_water_bytes = self.high_water_bytes.max(self.total_bytes());
-    }
-}
-
-impl D16GlobalByteBudget {
-    pub fn new(capacity_bytes: usize) -> Result<Self, ByteQueueConfigError> {
-        if capacity_bytes == 0 {
-            return Err(ByteQueueConfigError::ZeroCapacity);
-        }
-        Ok(Self::new_nonzero(capacity_bytes))
-    }
-
-    fn new_nonzero(capacity_bytes: usize) -> Self {
-        Self {
-            inner: Arc::new(D16GlobalByteBudgetInner {
-                state: StdMutex::new(D16GlobalByteBudgetState {
-                    reserved_bytes: 0,
-                    owned_bytes: 0,
-                    capacity_bytes,
-                    high_water_bytes: 0,
-                }),
-                not_full: Notify::new(),
-            }),
-        }
-    }
-
-    pub fn new_default() -> Self {
-        Self::new_nonzero(D16_GLOBAL_BYTE_BUDGET_DEFAULT_BYTES)
-    }
-
-    pub fn snapshot(&self) -> D16GlobalByteBudgetSnapshot {
-        self.inner.lock_state().snapshot()
-    }
-
-    async fn reserve_up_to(&self, requested: usize) -> D16GlobalReadReservation {
-        debug_assert!(requested > 0);
-        loop {
-            let notified = self.inner.not_full.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            {
-                let mut state = self.inner.lock_state();
-                let available = state.available_bytes();
-                if available > 0 {
-                    let reserved_bytes = requested.min(available);
-                    state.reserved_bytes = state.reserved_bytes.saturating_add(reserved_bytes);
-                    state.note_high_water();
-                    return D16GlobalReadReservation {
-                        inner: self.inner.clone(),
-                        reserved_bytes,
-                    };
-                }
-            }
-            notified.await;
-        }
-    }
-}
-
-impl D16GlobalByteBudgetInner {
-    fn lock_state(&self) -> std::sync::MutexGuard<'_, D16GlobalByteBudgetState> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn release_owned(&self, bytes: usize) {
-        if bytes == 0 {
-            return;
-        }
-        let mut state = self.lock_state();
-        state.owned_bytes = state.owned_bytes.saturating_sub(bytes);
-        drop(state);
-        self.not_full.notify_waiters();
-    }
-
-    fn try_acquire_owned(&self, bytes: usize) -> bool {
-        if bytes == 0 {
-            return true;
-        }
-        let mut state = self.lock_state();
-        if bytes > state.available_bytes() {
-            return false;
-        }
-        state.owned_bytes = state.owned_bytes.saturating_add(bytes);
-        state.note_high_water();
-        true
-    }
-}
-
-struct D16GlobalReadReservation {
-    inner: Arc<D16GlobalByteBudgetInner>,
-    reserved_bytes: usize,
-}
-
-impl D16GlobalReadReservation {
-    fn max_len(&self) -> usize {
-        self.reserved_bytes
-    }
-
-    fn retain(&mut self, retained_bytes: usize) {
-        let retained_bytes = retained_bytes.min(self.reserved_bytes);
-        let released = self.reserved_bytes.saturating_sub(retained_bytes);
-        if released == 0 {
-            return;
-        }
-        let mut state = self.inner.lock_state();
-        state.reserved_bytes = state.reserved_bytes.saturating_sub(released);
-        self.reserved_bytes = retained_bytes;
-        drop(state);
-        self.inner.not_full.notify_waiters();
-    }
-
-    fn commit(&mut self, bytes: usize) {
-        debug_assert!(bytes <= self.reserved_bytes);
-        let mut state = self.inner.lock_state();
-        state.reserved_bytes = state.reserved_bytes.saturating_sub(self.reserved_bytes);
-        state.owned_bytes = state.owned_bytes.saturating_add(bytes);
-        let released = self.reserved_bytes.saturating_sub(bytes);
-        self.reserved_bytes = 0;
-        state.note_high_water();
-        drop(state);
-        if released > 0 {
-            self.inner.not_full.notify_waiters();
-        }
-    }
-}
-
-impl Drop for D16GlobalReadReservation {
-    fn drop(&mut self) {
-        if self.reserved_bytes == 0 {
-            return;
-        }
-        let mut state = self.inner.lock_state();
-        state.reserved_bytes = state.reserved_bytes.saturating_sub(self.reserved_bytes);
-        self.reserved_bytes = 0;
-        drop(state);
-        self.inner.not_full.notify_waiters();
-    }
-}
-
-impl LeasedByteQueueSnapshot {
-    pub fn owned_bytes(self) -> usize {
-        self.queued_bytes
-            .saturating_add(self.leased_bytes)
-            .saturating_add(self.reserved_bytes)
-    }
-
-    pub fn available_bytes(self) -> usize {
-        self.capacity_bytes.saturating_sub(self.owned_bytes())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DownstreamPermitReleaseMode {
-    OnAdmission,
-    OnEgressDrain,
-}
-
-#[derive(Debug)]
-pub enum LeasedQueuePoll {
-    Data(LeasedBytes),
-    Empty,
-    Closed,
-}
-
-#[derive(Debug, Clone)]
-pub struct AsyncLeasedByteFlowQueue {
-    inner: Arc<AsyncLeasedByteFlowQueueInner>,
-}
-
-#[derive(Debug)]
-struct AsyncLeasedByteFlowQueueInner {
-    state: StdMutex<LeasedByteFlowQueueState>,
-    not_empty: Notify,
-    not_full: Notify,
-    global_budget: Option<D16GlobalByteBudget>,
-}
-
-#[derive(Debug)]
-struct LeasedByteFlowQueueState {
-    chunks: VecDeque<Bytes>,
-    queued_bytes: usize,
-    leased_bytes: usize,
-    reserved_bytes: usize,
-    local_progress_bytes: u64,
-    wake_pending: bool,
-    capacity_bytes: usize,
-    high_water_bytes: usize,
-    release_mode: DownstreamPermitReleaseMode,
-    closure: LeasedByteQueueClosure,
-}
-
-impl LeasedByteFlowQueueState {
-    fn new(capacity_bytes: usize, release_mode: DownstreamPermitReleaseMode) -> Self {
-        Self {
-            chunks: VecDeque::new(),
-            queued_bytes: 0,
-            leased_bytes: 0,
-            reserved_bytes: 0,
-            local_progress_bytes: 0,
-            wake_pending: false,
-            capacity_bytes,
-            high_water_bytes: 0,
-            release_mode,
-            closure: LeasedByteQueueClosure::Open,
-        }
-    }
-
-    fn snapshot(&self) -> LeasedByteQueueSnapshot {
-        LeasedByteQueueSnapshot {
-            queued_bytes: self.queued_bytes,
-            leased_bytes: self.leased_bytes,
-            reserved_bytes: self.reserved_bytes,
-            local_progress_bytes: self.local_progress_bytes,
-            capacity_bytes: self.capacity_bytes,
-            high_water_bytes: self.high_water_bytes,
-            chunks: self.chunks.len(),
-            closure: self.closure,
-        }
-    }
-
-    fn available_bytes(&self) -> usize {
-        self.capacity_bytes.saturating_sub(self.owned_bytes())
-    }
-
-    fn note_high_water(&mut self) {
-        self.high_water_bytes = self.high_water_bytes.max(self.owned_bytes());
-    }
-
-    fn owned_bytes(&self) -> usize {
-        self.queued_bytes
-            .saturating_add(self.leased_bytes)
-            .saturating_add(self.reserved_bytes)
-    }
-
-    fn pop_up_to(&mut self, limit: usize) -> Option<Bytes> {
-        if limit == 0 {
-            return None;
-        }
-        let mut remaining = limit;
-        let mut out = BytesMut::new();
-        while remaining > 0 {
-            let Some(mut chunk) = self.chunks.pop_front() else {
-                break;
-            };
-            let take = chunk.len().min(remaining);
-            out.extend_from_slice(&chunk[..take]);
-            self.queued_bytes = self.queued_bytes.saturating_sub(take);
-            self.leased_bytes = self.leased_bytes.saturating_add(take);
-            remaining -= take;
-            if take < chunk.len() {
-                chunk = chunk.slice(take..);
-                self.chunks.push_front(chunk);
-                break;
-            }
-        }
-        if out.is_empty() {
-            None
-        } else {
-            self.local_progress_bytes = self.local_progress_bytes.saturating_add(out.len() as u64);
-            self.note_high_water();
-            Some(out.freeze())
-        }
-    }
-}
-
-impl AsyncLeasedByteFlowQueue {
-    pub fn new(capacity_bytes: usize) -> Result<Self, ByteQueueConfigError> {
-        Self::new_with_release_mode(capacity_bytes, DownstreamPermitReleaseMode::OnAdmission)
-    }
-
-    pub fn new_with_release_mode(
-        capacity_bytes: usize,
-        release_mode: DownstreamPermitReleaseMode,
-    ) -> Result<Self, ByteQueueConfigError> {
-        Self::new_inner(capacity_bytes, release_mode, None)
-    }
-
-    pub fn new_with_global_budget(
-        capacity_bytes: usize,
-        release_mode: DownstreamPermitReleaseMode,
-        global_budget: D16GlobalByteBudget,
-    ) -> Result<Self, ByteQueueConfigError> {
-        Self::new_inner(capacity_bytes, release_mode, Some(global_budget))
-    }
-
-    fn new_inner(
-        capacity_bytes: usize,
-        release_mode: DownstreamPermitReleaseMode,
-        global_budget: Option<D16GlobalByteBudget>,
-    ) -> Result<Self, ByteQueueConfigError> {
-        if capacity_bytes == 0 {
-            return Err(ByteQueueConfigError::ZeroCapacity);
-        }
-        Ok(Self {
-            inner: Arc::new(AsyncLeasedByteFlowQueueInner {
-                state: StdMutex::new(LeasedByteFlowQueueState::new(capacity_bytes, release_mode)),
-                not_empty: Notify::new(),
-                not_full: Notify::new(),
-                global_budget,
-            }),
-        })
-    }
-
-    pub async fn snapshot(&self) -> LeasedByteQueueSnapshot {
-        self.snapshot_now()
-    }
-
-    pub fn snapshot_now(&self) -> LeasedByteQueueSnapshot {
-        self.inner.lock_state().snapshot()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn blocking_snapshot_for_test(&self) -> LeasedByteQueueSnapshot {
-        self.inner.lock_state().snapshot()
-    }
-
-    pub async fn reserve_read_up_to(
+    pub(crate) async fn push_custodied<P: crate::tcp_downlink_pump::payload::CustodiedPayload>(
         &self,
-        requested: usize,
-    ) -> Result<ByteQueueReadReservation, AsyncByteQueueWait> {
-        if requested == 0 {
-            return Ok(ByteQueueReadReservation {
-                inner: self.inner.clone(),
-                reserved_bytes: 0,
-                global_reservation: None,
-            });
+        pending: &mut Option<P>,
+    ) -> Result<(), ByteCustodyError> {
+        self.inner.start.begin();
+        if self.inner.stock.get().is_some() || pending.as_ref().is_some_and(|p| p.has_stock()) {
+            return Err(payload::reject_raw_stock(
+                self.inner.waiters.get().map(|w| w.quiet_scope()), pending));
+        }
+        match self.inner.waiters.get() {
+            Some(w) => w
+                .run(
+                    native_wait::Role::Producer,
+                    self.push_custodied_inner(pending),
+                )
+                .await
+                .map_err(|e| match e {
+                    native_wait::RunError::Closed => ByteCustodyError::Rejected,
+                    native_wait::RunError::Quarantined => ByteCustodyError::Invalid,
+                })?,
+            None => self.push_custodied_inner(pending).await,
+        }
+    }
+    async fn push_custodied_inner<P: crate::tcp_downlink_pump::payload::CustodiedPayload>(
+        &self,
+        pending: &mut Option<P>,
+    ) -> Result<(), ByteCustodyError> {
+        let mut state = self.inner.state.lock().await;
+        let Some(payload) = pending.as_ref() else {
+            return Err(ByteCustodyError::Invalid);
+        };
+        if payload.meter().is_some_and(|m| m.budget_limit().is_some())
+            && self.inner.waiters.get().is_none()
+        {
+            return Err(ByteCustodyError::Invalid);
+        }
+        if state.custody.interrupted || state.custody.frozen {
+            return Err(ByteCustodyError::Invalid);
+        }
+        if self
+            .inner
+            .waiters
+            .get()
+            .map_or(state.closed, native_wait::Waiters::is_closed)
+            || !state.queue.can_accept(payload.len())
+        {
+            return Err(ByteCustodyError::Rejected);
+        }
+        let sources = state.custody.sources.checked_add(1);
+        let emitted = state.custody.emitted.checked_add(payload.len());
+        let (Some(sources), Some(emitted)) = (sources, emitted) else {
+            return Err(ByteCustodyError::Invalid);
+        };
+        state
+            .queue
+            .chunks
+            .prepare(payload.meter())
+            .map_err(ByteCustodyError::Capacity)?;
+        let mutation = MeteredMutation::begin(state.queue.chunks.meter())
+            .map_err(ByteCustodyError::Capacity)?;
+        state.custody.interrupted = true;
+        let payload = pending.take().ok_or(ByteCustodyError::Invalid)?;
+        let allocation = payload.capacity();
+        // All fallible validation precedes the actual transfer. This preserves
+        // the original FIFO algorithm and uses its existing VecDeque storage.
+        state.queue.queued_bytes += payload.len();
+        state.queue.high_water_bytes = state.queue.high_water_bytes.max(state.queue.queued_bytes);
+        state.queue.chunks.push_back(ByteChunk {
+            bytes: payload.into_custodied_bytes(),
+            allocation: Some(allocation),
+        });
+        state.custody.sources = sources;
+        state.custody.emitted = emitted;
+        state.custody.interrupted = false;
+        drop(state);
+        self.inner.not_empty.notify_one();
+        mutation.commit();
+        Ok(())
+    }
+
+    pub(crate) async fn recv_custodied(
+        &self,
+        limit: usize,
+        held: &mut Option<ByteQueueBatch>,
+    ) -> Result<bool, ByteCustodyError> {
+        self.inner.start.begin();
+        match self.inner.waiters.get() {
+            Some(w) => w
+                .run(
+                    native_wait::Role::Consumer,
+                    self.recv_custodied_inner(limit, held),
+                )
+                .await
+                .map_err(|e| match e {
+                    native_wait::RunError::Closed => ByteCustodyError::Rejected,
+                    native_wait::RunError::Quarantined => ByteCustodyError::Invalid,
+                })?,
+            None => self.recv_custodied_inner(limit, held).await,
+        }
+    }
+    async fn recv_custodied_inner(
+        &self,
+        limit: usize,
+        held: &mut Option<ByteQueueBatch>,
+    ) -> Result<bool, ByteCustodyError> {
+        if held.is_some() || limit == 0 {
+            return Err(ByteCustodyError::Invalid);
         }
         loop {
-            let notified = self.inner.not_full.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let flow_available = {
-                let state = self.inner.lock_state();
-                if state.closure.is_closed() {
-                    return Err(AsyncByteQueueWait::Closed);
+            let mut state = self.inner.state.lock().await;
+            if state.custody.interrupted || state.custody.frozen {
+                return Err(ByteCustodyError::Invalid);
+            }
+            if state.queue.queued_bytes != 0 {
+                let n = state.queue.chunks.next_len(limit, state.queue.queued_bytes);
+                let batches = state.custody.batches.checked_add(1);
+                let consumed = state.custody.consumed.checked_add(n);
+                let (Some(batches), Some(consumed)) = (batches, consumed) else {
+                    return Err(ByteCustodyError::Invalid);
+                };
+                let mutation = MeteredMutation::begin(state.queue.chunks.meter())
+                    .map_err(ByteCustodyError::Capacity)?;
+                state.custody.interrupted = true;
+                let (bytes, allocation) = state
+                    .queue
+                    .pop_owned(limit)
+                    .ok_or(ByteCustodyError::Invalid)?;
+                *held = Some(ByteQueueBatch { bytes, allocation });
+                if held.as_ref().is_none_or(|batch| {
+                    batch.bytes.len() != n || batch.allocation < batch.bytes.len()
+                }) {
+                    return Err(ByteCustodyError::Invalid);
                 }
-                state.available_bytes()
-            };
-            if flow_available == 0 {
+                state.custody.batches = batches;
+                state.custody.consumed = consumed;
+                state.custody.interrupted = false;
+                drop(state);
+                self.inner.not_full.notify_waiters();
+                mutation.commit();
+                return Ok(true);
+            }
+            if self
+                .inner
+                .waiters
+                .get()
+                .map_or(state.closed, native_wait::Waiters::is_closed)
+            {
+                if !self.inner.read.is_active() { return Ok(false); }
+                // An already granted read may still deliver its real tail.
+                // Its cancellation is lock-free, so register then recheck.
+                let notified = self.inner.not_empty.notified();
+                drop(state);
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if !self.inner.read.is_active() { continue; }
                 notified.await;
                 continue;
             }
-            let mut global_reservation = if let Some(budget) = &self.inner.global_budget {
-                let requested = requested.min(flow_available);
-                Some(tokio::select! {
-                    reservation = budget.reserve_up_to(requested) => reservation,
-                    _ = notified.as_mut() => continue,
-                })
+            let notified = self.inner.not_empty.notified();
+            drop(state);
+            notified.await;
+        }
+    }
+
+    /// Only after all original actors join and the producer stops. Every turn
+    /// touches at most32 original chunks, even for millions of 1-byte records.
+    /// None means more work/lock contention; Err is sticky unknown custody.
+    pub(crate) fn has_output_stock(&self) -> bool { self.inner.stock.get().is_some() }
+
+    pub(crate) fn dispose_custodied(&self) -> Result<Option<ByteQueueCustody>, ByteCustodyError> {
+        let _quiet = self.inner.waiters.get().map(|w| w.quiet_scope());
+        let Some(data) = self.dispose_data()? else { return Ok(None); };
+        if self.inner.waiters.get().is_some_and(|w| !w.finish()) { return Ok(None); }
+        Ok(Some(data.custody()))
+    }
+
+    /// Original bounded disposal transaction, before external loans and the
+    /// protected Producer retirement waiter have actually exited.
+    pub(crate) fn dispose_data(&self) -> Result<Option<ByteQueueDataDisposition>, ByteCustodyError> {
+        let _quiet = self.inner.waiters.get().map(|w| w.quiet_scope());
+        self.inner.start.begin();
+        if self.inner.read.is_active() {
+            return if self.inner.waiters.get().is_some_and(|w| w.is_quarantined()) {
+                Err(ByteCustodyError::Invalid)
+            } else { Ok(None) };
+        }
+        let turn = match self.inner.waiters.get() {
+            Some(w) => match w.try_disposal_turn() { Some(turn) => Some(turn), None => return Ok(None) },
+            None => None,
+        };
+        let Ok(mut state) = self.inner.state.try_lock() else {
+            return Ok(None);
+        };
+        if let Some(w) = self.inner.waiters.get() {
+            let phase = w.disposal_state();
+            if phase != 0 {
+                if !state.custody.interrupted || !state.custody.frozen || phase > 2 {
+                    w.mark_quarantined(); return Err(ByteCustodyError::Invalid);
+                }
+                if phase == 1 { return Ok(None); }
+                if !w.commit_disposal() { return Err(ByteCustodyError::Invalid); }
+                state.custody.interrupted = false;
+            }
+        }
+        if state.custody.interrupted {
+            return Err(ByteCustodyError::Invalid);
+        }
+        if !state.custody.frozen {
+            if let Some(w) = self.inner.waiters.get() {
+                w.close();
             } else {
-                None
-            };
-            let mut state = self.inner.lock_state();
-            if state.closure.is_closed() {
-                return Err(AsyncByteQueueWait::Closed);
+                state.closed = true;
             }
-            let global_available = global_reservation
-                .as_ref()
-                .map(D16GlobalReadReservation::max_len)
-                .unwrap_or(requested);
-            let reserved_bytes = requested.min(state.available_bytes()).min(global_available);
-            if reserved_bytes == 0 {
+            state.custody.frozen_bytes = state.queue.queued_bytes;
+            state.custody.frozen_chunks = state.queue.chunks.len();
+            state.custody.metadata_slots = state.queue.chunks.capacity();
+            state.custody.metadata_bytes = state
+                .queue
+                .chunks
+                .capacity()
+                .checked_mul(std::mem::size_of::<ByteChunk>())
+                .ok_or(ByteCustodyError::Invalid)?;
+            state.custody.frozen = true;
+        }
+        for _ in 0..32 {
+            let Some(chunk) = state.queue.chunks.front() else {
+                let valid = state.queue.queued_bytes == 0
+                    && state.custody.discarded_bytes == state.custody.frozen_bytes
+                    && state.custody.discarded_chunks == state.custody.frozen_chunks
+                    && state
+                        .custody
+                        .consumed
+                        .checked_add(state.custody.discarded_bytes)
+                        == Some(state.custody.emitted);
+                if !valid {
+                    state.custody.interrupted = true;
+                    return Err(ByteCustodyError::Invalid);
+                }
+                state.queue.chunks = Chunks::default();
+                let receipt = state.custody;
                 drop(state);
-                drop(global_reservation);
-                continue;
-            }
-            if let Some(global_reservation) = global_reservation.as_mut() {
-                global_reservation.retain(reserved_bytes);
-            }
-            state.reserved_bytes = state.reserved_bytes.saturating_add(reserved_bytes);
-            state.note_high_water();
-            return Ok(ByteQueueReadReservation {
-                inner: self.inner.clone(),
-                reserved_bytes,
-                global_reservation,
-            });
-        }
-    }
-
-    pub async fn wait_read_len(&self, max_read_len: usize) -> Result<usize, AsyncByteQueueWait> {
-        if max_read_len == 0 {
-            return Ok(0);
-        }
-        loop {
-            let notified = {
-                let state = self.inner.lock_state();
-                if state.closure.is_closed() {
-                    return Err(AsyncByteQueueWait::Closed);
-                }
-                let available = state.available_bytes();
-                if available > 0 {
-                    return Ok(available.min(max_read_len));
-                }
-                self.inner.not_full.notified()
+                drop(turn);
+                return Ok(Some(ByteQueueDataDisposition(receipt)));
             };
-            notified.await;
-        }
-    }
-
-    pub async fn push(&self, bytes: Bytes) -> Result<(), ByteQueuePushError> {
-        let len = bytes.len();
-        if len == 0 {
-            return Err(ByteQueuePushError::EmptyChunk);
-        }
-        if let Some(global_budget) = &self.inner.global_budget {
-            let global_capacity = global_budget.snapshot().capacity_bytes;
-            let flow_capacity = self.inner.lock_state().capacity_bytes;
-            let capacity = flow_capacity.min(global_capacity);
-            if len > capacity {
-                return Err(ByteQueuePushError::ChunkExceedsCapacity { len, capacity });
-            }
-            loop {
-                let flow_notified = self.inner.not_full.notified();
-                tokio::pin!(flow_notified);
-                flow_notified.as_mut().enable();
-                let global_notified = global_budget.inner.not_full.notified();
-                tokio::pin!(global_notified);
-                global_notified.as_mut().enable();
-                {
-                    let mut state = self.inner.lock_state();
-                    if state.closure.is_closed() {
-                        return Err(ByteQueuePushError::Closed);
-                    }
-                    if len <= state.available_bytes() && global_budget.inner.try_acquire_owned(len)
-                    {
-                        state.queued_bytes = state.queued_bytes.saturating_add(len);
-                        state.note_high_water();
-                        state.chunks.push_back(bytes);
-                        drop(state);
-                        self.inner.not_empty.notify_one();
-                        return Ok(());
-                    }
-                }
-                tokio::select! {
-                    _ = flow_notified.as_mut() => {}
-                    _ = global_notified.as_mut() => {}
-                }
-            }
-        }
-        loop {
-            let notified = {
-                let mut state = self.inner.lock_state();
-                if state.closure.is_closed() {
-                    return Err(ByteQueuePushError::Closed);
-                }
-                if len > state.capacity_bytes {
-                    return Err(ByteQueuePushError::ChunkExceedsCapacity {
-                        len,
-                        capacity: state.capacity_bytes,
-                    });
-                }
-                if len <= state.available_bytes() {
-                    state.queued_bytes = state.queued_bytes.saturating_add(len);
-                    state.note_high_water();
-                    state.chunks.push_back(bytes);
-                    drop(state);
-                    self.inner.not_empty.notify_one();
-                    return Ok(());
-                }
-                self.inner.not_full.notified()
+            let n = chunk.bytes.len();
+            let Some(allocation) = chunk.allocation else {
+                state.custody.interrupted = true;
+                return Err(ByteCustodyError::Invalid);
             };
-            notified.await;
-        }
-    }
-
-    pub fn try_recv_up_to(&self, limit: usize) -> LeasedQueuePoll {
-        let mut state = self.inner.lock_state();
-        if limit > 0
-            && let Some(bytes) = state.pop_up_to(limit)
-        {
-            let permit = DownstreamBytePermit {
-                inner: self.inner.clone(),
-                remaining_bytes: bytes.len(),
-                release_mode: state.release_mode,
+            let chunks = state.custody.discarded_chunks.checked_add(1);
+            let bytes = state.custody.discarded_bytes.checked_add(n);
+            let storage = state.custody.discarded_allocation.checked_add(allocation);
+            let remaining = state.queue.queued_bytes.checked_sub(n);
+            let (Some(chunks), Some(bytes), Some(storage), Some(remaining)) =
+                (chunks, bytes, storage, remaining)
+            else {
+                state.custody.interrupted = true;
+                return Err(ByteCustodyError::Invalid);
             };
-            return LeasedQueuePoll::Data(LeasedBytes { bytes, permit });
-        }
-        if state.closure.is_closed() {
-            if state.queued_bytes == 0 && state.reserved_bytes == 0 {
-                state.wake_pending = false;
-                return LeasedQueuePoll::Closed;
+            if let Some(w) = self.inner.waiters.get() {
+                if !w.begin_disposal() { return Err(ByteCustodyError::Invalid); }
             }
-            return LeasedQueuePoll::Empty;
-        }
-        if state.queued_bytes == 0 {
-            state.wake_pending = false;
-        }
-        LeasedQueuePoll::Empty
-    }
-
-    pub async fn recv_up_to(&self, limit: usize) -> Option<LeasedBytes> {
-        if limit == 0 {
-            return None;
-        }
-        loop {
-            let notified = {
-                let mut state = self.inner.lock_state();
-                if let Some(bytes) = state.pop_up_to(limit) {
-                    let permit = DownstreamBytePermit {
-                        inner: self.inner.clone(),
-                        remaining_bytes: bytes.len(),
-                        release_mode: state.release_mode,
-                    };
-                    return Some(LeasedBytes { bytes, permit });
+            state.custody.interrupted = true;
+            let retired = state.queue.chunks.pop_front();
+            state.queue.queued_bytes = remaining;
+            state.custody.discarded_chunks = chunks;
+            state.custody.discarded_bytes = bytes;
+            state.custody.discarded_allocation = storage;
+            if let Some(w) = self.inner.waiters.get() {
+                drop(state);
+                let Some(retired) = retired else { w.mark_quarantined(); return Err(ByteCustodyError::Invalid); };
+                if !w.dispose_chunk(retired) { return Err(ByteCustodyError::Invalid); }
+                let Some(guard) = self.inner.state.try_lock().ok() else { return Ok(None); };
+                state = guard;
+                if !state.custody.interrupted || !state.custody.frozen || !w.commit_disposal() {
+                    w.mark_quarantined(); return Err(ByteCustodyError::Invalid);
                 }
-                if state.closure.is_closed() {
-                    return None;
-                }
-                self.inner.not_empty.notified()
-            };
-            notified.await;
+            } else { drop(retired); }
+            state.custody.interrupted = false;
         }
-    }
-
-    pub async fn close_for_remote_eof_and_mark_ready(&self) -> bool {
-        let mut state = self.inner.lock_state();
-        if state.closure.is_closed() {
-            return false;
-        }
-        state.closure = LeasedByteQueueClosure::RemoteEof;
-        let should_wake = !state.wake_pending;
-        state.wake_pending = true;
-        drop(state);
-        self.inner.not_empty.notify_waiters();
-        self.inner.not_full.notify_waiters();
-        should_wake
-    }
-
-    pub async fn close_for_terminal_and_mark_ready(
-        &self,
-        direction: &'static str,
-        reason: &'static str,
-    ) -> bool {
-        let mut state = self.inner.lock_state();
-        let was_closed = state.closure.is_closed();
-        if !matches!(state.closure, LeasedByteQueueClosure::Terminal(_)) {
-            state.closure = LeasedByteQueueClosure::Terminal(LeasedByteQueueTerminalCause {
-                direction,
-                reason,
-            });
-        }
-        let should_wake = !was_closed && !state.wake_pending;
-        state.wake_pending = true;
-        drop(state);
-        self.inner.not_empty.notify_waiters();
-        self.inner.not_full.notify_waiters();
-        should_wake
-    }
-
-    pub async fn close(&self) {
-        let _ = self
-            .close_for_terminal_and_mark_ready("internal", "queue_closed")
-            .await;
-    }
-
-    pub fn close_and_drop_queued_for_terminal(
-        &self,
-        direction: &'static str,
-        reason: &'static str,
-    ) -> usize {
-        let mut state = self.inner.lock_state();
-        if !matches!(state.closure, LeasedByteQueueClosure::Terminal(_)) {
-            state.closure = LeasedByteQueueClosure::Terminal(LeasedByteQueueTerminalCause {
-                direction,
-                reason,
-            });
-        }
-        let dropped = state.queued_bytes;
-        state.chunks.clear();
-        state.queued_bytes = 0;
-        state.wake_pending = false;
-        drop(state);
-        if let Some(global_budget) = &self.inner.global_budget {
-            global_budget.inner.release_owned(dropped);
-        }
-        self.inner.not_empty.notify_waiters();
-        self.inner.not_full.notify_waiters();
-        dropped
+        Ok(None)
     }
 }
 
-impl AsyncLeasedByteFlowQueueInner {
-    fn lock_state(&self) -> std::sync::MutexGuard<'_, LeasedByteFlowQueueState> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-}
-
-impl Drop for AsyncLeasedByteFlowQueueInner {
-    fn drop(&mut self) {
-        let state = self
-            .state
-            .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let remaining_owned = state.queued_bytes.saturating_add(state.leased_bytes);
-        if let Some(global_budget) = &self.global_budget {
-            global_budget.inner.release_owned(remaining_owned);
-        }
-    }
-}
-
-pub struct ByteQueueReadReservation {
-    inner: Arc<AsyncLeasedByteFlowQueueInner>,
-    reserved_bytes: usize,
-    global_reservation: Option<D16GlobalReadReservation>,
-}
-
-impl ByteQueueReadReservation {
-    pub fn max_len(&self) -> usize {
-        self.reserved_bytes
-    }
-
-    pub fn commit(mut self, bytes: Bytes) -> Result<bool, ByteQueuePushError> {
-        let len = bytes.len();
-        if len == 0 {
-            return Err(ByteQueuePushError::EmptyChunk);
-        }
-        if len > self.reserved_bytes {
-            return Err(ByteQueuePushError::ChunkExceedsCapacity {
-                len,
-                capacity: self.reserved_bytes,
-            });
-        }
-
-        let mut state = self.inner.lock_state();
-        if state.closure.is_closed() {
-            return Err(ByteQueuePushError::Closed);
-        }
-        let unused_bytes = self.reserved_bytes.saturating_sub(len);
-        state.reserved_bytes = state.reserved_bytes.saturating_sub(self.reserved_bytes);
-        if let Some(global_reservation) = self.global_reservation.as_mut() {
-            global_reservation.commit(len);
-        }
-        self.reserved_bytes = 0;
-        let should_wake = state.queued_bytes == 0 && !state.wake_pending;
-        state.queued_bytes = state.queued_bytes.saturating_add(len);
-        state.chunks.push_back(bytes);
-        state.wake_pending = true;
-        state.note_high_water();
-        drop(state);
-
-        if unused_bytes > 0 {
-            self.inner.not_full.notify_waiters();
-        }
-        self.inner.not_empty.notify_one();
-        Ok(should_wake)
-    }
-}
-
-impl Drop for ByteQueueReadReservation {
-    fn drop(&mut self) {
-        if self.reserved_bytes == 0 {
-            return;
-        }
-        let mut state = self.inner.lock_state();
-        state.reserved_bytes = state.reserved_bytes.saturating_sub(self.reserved_bytes);
-        self.reserved_bytes = 0;
-        drop(state);
-        self.global_reservation.take();
-        self.inner.not_full.notify_waiters();
-    }
-}
-
-pub struct LeasedBytes {
-    bytes: Bytes,
-    permit: DownstreamBytePermit,
-}
-
-impl LeasedBytes {
-    pub fn bytes(&self) -> &Bytes {
-        &self.bytes
-    }
-
-    pub fn permit_mut(&mut self) -> &mut DownstreamBytePermit {
-        &mut self.permit
-    }
-
-    pub fn into_parts(self) -> (Bytes, DownstreamBytePermit) {
-        (self.bytes, self.permit)
-    }
-}
-
-impl std::fmt::Debug for LeasedBytes {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LeasedBytes")
-            .field("bytes", &self.bytes.len())
-            .field("permit", &self.permit)
-            .finish()
-    }
-}
-
-pub struct DownstreamBytePermit {
-    inner: Arc<AsyncLeasedByteFlowQueueInner>,
-    remaining_bytes: usize,
-    release_mode: DownstreamPermitReleaseMode,
-}
-
-impl DownstreamBytePermit {
-    pub fn remaining_bytes(&self) -> usize {
-        self.remaining_bytes
-    }
-
-    pub fn release_mode(&self) -> DownstreamPermitReleaseMode {
-        self.release_mode
-    }
-
-    pub fn release(&mut self, bytes: usize) -> usize {
-        let released = self.remaining_bytes.min(bytes);
-        if released == 0 {
-            return 0;
-        }
-        self.remaining_bytes = self.remaining_bytes.saturating_sub(released);
-        let mut state = self.inner.lock_state();
-        state.leased_bytes = state.leased_bytes.saturating_sub(released);
-        state.local_progress_bytes = state.local_progress_bytes.saturating_add(released as u64);
-        drop(state);
-        if let Some(global_budget) = &self.inner.global_budget {
-            global_budget.inner.release_owned(released);
-        }
-        self.inner.not_full.notify_waiters();
-        released
-    }
-}
-
-impl crate::tcp_egress::TcpEgressLease for DownstreamBytePermit {
-    fn remaining_bytes(&self) -> usize {
-        DownstreamBytePermit::remaining_bytes(self)
-    }
-
-    fn release(&mut self, bytes: usize) -> usize {
-        DownstreamBytePermit::release(self, bytes)
-    }
-
-    fn split_to(&mut self, bytes: usize) -> Option<Self> {
-        let moved = self.remaining_bytes.min(bytes);
-        if moved == 0 {
-            return None;
-        }
-        self.remaining_bytes = self.remaining_bytes.saturating_sub(moved);
-        Some(Self {
-            inner: self.inner.clone(),
-            remaining_bytes: moved,
-            release_mode: self.release_mode,
-        })
-    }
-}
-
-impl Drop for DownstreamBytePermit {
-    fn drop(&mut self) {
-        self.release(usize::MAX);
-    }
-}
-
-impl std::fmt::Debug for DownstreamBytePermit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DownstreamBytePermit")
-            .field("remaining_bytes", &self.remaining_bytes)
-            .field("release_mode", &self.release_mode)
-            .finish_non_exhaustive()
-    }
-}
+mod leased;
+mod native_wait;
+#[cfg(all(test, feature = "harness"))]
+pub(crate) use leased::PermitProvedReleaseSource;
+#[cfg(test)]
+pub(crate) use leased::PermitQueueReleaseAudit;
+pub use leased::{
+    AsyncLeasedByteFlowQueue, ByteQueueReadReservation, D16_GLOBAL_BYTE_BUDGET_DEFAULT_BYTES,
+    D16GlobalByteBudget, D16GlobalByteBudgetSnapshot, DownstreamBytePermit,
+    DownstreamPermitReleaseMode, LeasedByteQueueClosure, LeasedByteQueueSnapshot,
+    LeasedByteQueueTerminalCause, LeasedBytes, LeasedQueuePoll,
+};
+pub(crate) use leased::{LeasedQueueBatch, PermitQueueIdentity};
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const ONE_HUNDRED_MBIT_CHUNK_BYTES: usize = 64 * 1024;
-    const ONE_HUNDRED_MBIT_CADENCE: Duration = Duration::from_millis(5);
-    const THIRTY_SECONDS_AT_100M_STEPS: usize = 30_000 / 5;
-
-    #[test]
-    fn byte_bounded_flow_queue_enforces_byte_capacity() {
-        let mut queue = ByteBoundedFlowQueue::new(128 * 1024).unwrap();
-
-        queue.try_push(Bytes::from(vec![1; 64 * 1024])).unwrap();
-        queue.try_push(Bytes::from(vec![2; 64 * 1024])).unwrap();
-
-        assert_eq!(queue.snapshot().queued_bytes, 128 * 1024);
-        assert_eq!(
-            queue.try_push(Bytes::from(vec![3; 1])),
-            Err(ByteQueuePushError::Full {
-                len: 1,
-                available: 0
-            })
-        );
-
-        let drained = queue.pop_up_to(96 * 1024).unwrap();
-        assert_eq!(drained.len(), 96 * 1024);
-        assert_eq!(queue.snapshot().queued_bytes, 32 * 1024);
-
-        queue.try_push(Bytes::from(vec![4; 64 * 1024])).unwrap();
-        assert_eq!(queue.snapshot().queued_bytes, 96 * 1024);
-    }
-
-    #[test]
-    fn continuous_pump_model_sustains_100mbit_for_30s_without_capacity_read_gaps() {
-        let mut queue = ByteBoundedFlowQueue::new(4 * 1024 * 1024).unwrap();
-        let mut probe = ContinuousPumpProbe::default();
-        let start = Instant::now();
-
-        for step in 0..THIRTY_SECONDS_AT_100M_STEPS {
-            let now = start + ONE_HUNDRED_MBIT_CADENCE.saturating_mul(step as u32);
-            let before = queue.snapshot();
-            assert!(
-                queue.can_accept(ONE_HUNDRED_MBIT_CHUNK_BYTES),
-                "100M equivalent reader should have queue capacity at step {step}: {before:?}"
-            );
-            probe.note_read_armed(before, ONE_HUNDRED_MBIT_CHUNK_BYTES);
-            queue
-                .try_push(Bytes::from(vec![0; ONE_HUNDRED_MBIT_CHUNK_BYTES]))
-                .unwrap();
-            probe.note_remote_read(now, ONE_HUNDRED_MBIT_CHUNK_BYTES, true);
-
-            let drained = queue.pop_up_to(ONE_HUNDRED_MBIT_CHUNK_BYTES).unwrap();
-            probe.note_drain(drained.len(), queue.snapshot());
-        }
-
-        let stats = probe.stats();
-        assert_eq!(
-            stats.remote_read_bytes,
-            (THIRTY_SECONDS_AT_100M_STEPS * ONE_HUNDRED_MBIT_CHUNK_BYTES) as u64
-        );
-        assert_eq!(stats.remote_read_bytes, stats.drained_bytes);
-        assert_eq!(queue.snapshot().queued_bytes, 0);
-        assert_eq!(stats.queue_full_waits, 0);
-        assert!(
-            stats.max_remote_read_gap_with_capacity <= ONE_HUNDRED_MBIT_CADENCE,
-            "capacity read gap must stay at cadence, got {:?}",
-            stats.max_remote_read_gap_with_capacity
-        );
-    }
-
-    #[test]
-    fn continuous_pump_absorbs_short_drain_stall_without_remote_read_gap() {
-        let mut queue = ByteBoundedFlowQueue::new(4 * 1024 * 1024).unwrap();
-        let mut probe = ContinuousPumpProbe::default();
-        let start = Instant::now();
-        let stall_start = 5_000 / 5;
-        let stall_end = stall_start + 200 / 5;
-
-        for step in 0..THIRTY_SECONDS_AT_100M_STEPS {
-            let now = start + ONE_HUNDRED_MBIT_CADENCE.saturating_mul(step as u32);
-            let before = queue.snapshot();
-            assert!(
-                queue.can_accept(ONE_HUNDRED_MBIT_CHUNK_BYTES),
-                "4MiB queue should absorb a 200ms drain stall at step {step}: {before:?}"
-            );
-            probe.note_read_armed(before, ONE_HUNDRED_MBIT_CHUNK_BYTES);
-            queue
-                .try_push(Bytes::from(vec![0; ONE_HUNDRED_MBIT_CHUNK_BYTES]))
-                .unwrap();
-            probe.note_remote_read(now, ONE_HUNDRED_MBIT_CHUNK_BYTES, true);
-
-            if !(stall_start..stall_end).contains(&step) {
-                let drain_limit = if step >= stall_end {
-                    256 * 1024
-                } else {
-                    ONE_HUNDRED_MBIT_CHUNK_BYTES
-                };
-                if let Some(drained) = queue.pop_up_to(drain_limit) {
-                    probe.note_drain(drained.len(), queue.snapshot());
-                }
-            }
-        }
-
-        while let Some(drained) = queue.pop_up_to(256 * 1024) {
-            probe.note_drain(drained.len(), queue.snapshot());
-        }
-
-        let stats = probe.stats();
-        assert_eq!(stats.remote_read_bytes, stats.drained_bytes);
-        assert_eq!(queue.snapshot().queued_bytes, 0);
-        assert_eq!(stats.queue_full_waits, 0);
-        assert!(
-            stats.max_queue_bytes >= 2 * 1024 * 1024,
-            "stall should exercise real queue buffering, got {}",
-            stats.max_queue_bytes
-        );
-        assert!(
-            stats.max_remote_read_gap_with_capacity <= ONE_HUNDRED_MBIT_CADENCE,
-            "drain jitter must not create remote read gaps while queue has capacity: {:?}",
-            stats.max_remote_read_gap_with_capacity
-        );
-    }
-
-    #[test]
-    fn continuous_pump_pauses_only_at_explicit_queue_full_edge() {
-        let mut queue = ByteBoundedFlowQueue::new(128 * 1024).unwrap();
-        let mut probe = ContinuousPumpProbe::default();
-        let start = Instant::now();
-
-        for step in 0..4 {
-            let now = start + ONE_HUNDRED_MBIT_CADENCE.saturating_mul(step);
-            let before = queue.snapshot();
-            if queue.can_accept(ONE_HUNDRED_MBIT_CHUNK_BYTES) {
-                probe.note_read_armed(before, ONE_HUNDRED_MBIT_CHUNK_BYTES);
-                queue
-                    .try_push(Bytes::from(vec![0; ONE_HUNDRED_MBIT_CHUNK_BYTES]))
-                    .unwrap();
-                probe.note_remote_read(now, ONE_HUNDRED_MBIT_CHUNK_BYTES, true);
-            } else {
-                probe.note_queue_full_wait(before);
-            }
-        }
-
-        let stats = probe.stats();
-        assert_eq!(stats.remote_read_chunks, 2);
-        assert_eq!(stats.queue_full_waits, 2);
-        assert_eq!(stats.max_queue_bytes, 128 * 1024);
-        assert!(
-            stats.max_remote_read_gap_with_capacity <= ONE_HUNDRED_MBIT_CADENCE,
-            "queue-full pauses must not be counted as unexplained read gaps"
-        );
-    }
-
-    #[tokio::test]
-    async fn async_byte_queue_waits_until_drain_creates_capacity() {
-        let queue = AsyncByteBoundedFlowQueue::new(128 * 1024).unwrap();
-        queue.push(Bytes::from(vec![1; 64 * 1024])).await.unwrap();
-        queue.push(Bytes::from(vec![2; 64 * 1024])).await.unwrap();
-
-        let producer_queue = queue.clone();
-        let producer = tokio::spawn(async move {
-            producer_queue
-                .push(Bytes::from(vec![3; 32 * 1024]))
-                .await
-                .unwrap();
-        });
-
-        tokio::task::yield_now().await;
-        assert!(
-            !producer.is_finished(),
-            "producer must wait when the byte queue is full"
-        );
-
-        let drained = queue.pop_up_to(64 * 1024).await.unwrap();
-        assert_eq!(drained.len(), 64 * 1024);
-        producer.await.unwrap();
-
-        let snapshot = queue.snapshot().await;
-        assert_eq!(snapshot.queued_bytes, 96 * 1024);
-        assert_eq!(snapshot.high_water_bytes, 128 * 1024);
-    }
-
-    #[tokio::test]
-    async fn async_byte_queue_wait_read_len_tracks_available_capacity() {
-        let queue = AsyncByteBoundedFlowQueue::new(128 * 1024).unwrap();
-        queue.push(Bytes::from(vec![1; 128 * 1024])).await.unwrap();
-
-        let waiter_queue = queue.clone();
-        let waiter = tokio::spawn(async move { waiter_queue.wait_read_len(64 * 1024).await });
-
-        tokio::task::yield_now().await;
-        assert!(
-            !waiter.is_finished(),
-            "remote reader must not arm another read while the byte queue is full"
-        );
-
-        let drained = queue.pop_up_to(48 * 1024).await.unwrap();
-        assert_eq!(drained.len(), 48 * 1024);
-        assert_eq!(waiter.await.unwrap().unwrap(), 48 * 1024);
-    }
-
-    #[tokio::test]
-    async fn async_byte_queue_recv_waits_for_producer_and_releases_capacity() {
-        let queue = AsyncByteBoundedFlowQueue::new(128 * 1024).unwrap();
-        let consumer_queue = queue.clone();
-        let consumer = tokio::spawn(async move { consumer_queue.recv_up_to(64 * 1024).await });
-
-        tokio::task::yield_now().await;
-        assert!(
-            !consumer.is_finished(),
-            "consumer should wait for producer data"
-        );
-
-        queue.push(Bytes::from(vec![4; 96 * 1024])).await.unwrap();
-        let consumed = consumer.await.unwrap().unwrap();
-        assert_eq!(consumed.len(), 64 * 1024);
-        assert_eq!(queue.snapshot().await.queued_bytes, 32 * 1024);
-
-        queue.push(Bytes::from(vec![5; 96 * 1024])).await.unwrap();
-        assert_eq!(queue.snapshot().await.queued_bytes, 128 * 1024);
-    }
-
-    #[tokio::test]
-    async fn async_byte_queue_closes_waiters_without_data_loss() {
-        let consumer_queue = AsyncByteBoundedFlowQueue::new(64 * 1024).unwrap();
-        consumer_queue
-            .push(Bytes::from(vec![1; 16 * 1024]))
-            .await
-            .unwrap();
-
-        let first = consumer_queue.recv_up_to(64 * 1024).await.unwrap();
-        assert_eq!(first.len(), 16 * 1024);
-
-        let waiting_consumer_queue = consumer_queue.clone();
-        let consumer =
-            tokio::spawn(async move { waiting_consumer_queue.recv_up_to(64 * 1024).await });
-
-        let reader_queue = AsyncByteBoundedFlowQueue::new(64 * 1024).unwrap();
-        reader_queue
-            .push(Bytes::from(vec![2; 64 * 1024]))
-            .await
-            .unwrap();
-        let waiting_reader_queue = reader_queue.clone();
-        let reader = tokio::spawn(async move { reader_queue.wait_read_len(64 * 1024).await });
-
-        tokio::task::yield_now().await;
-        consumer_queue.close().await;
-        waiting_reader_queue.close().await;
-
-        assert!(consumer.await.unwrap().is_none());
-        assert_eq!(reader.await.unwrap(), Err(AsyncByteQueueWait::Closed));
-    }
-
-    #[tokio::test]
-    async fn async_byte_queue_close_allows_draining_already_queued_bytes() {
-        let queue = AsyncByteBoundedFlowQueue::new(64 * 1024).unwrap();
-        queue.push(Bytes::from(vec![1; 48 * 1024])).await.unwrap();
-
-        queue.close().await;
-
-        let drained = queue.recv_up_to(64 * 1024).await.unwrap();
-        assert_eq!(drained.len(), 48 * 1024);
-        assert_eq!(
-            queue.recv_up_to(64 * 1024).await,
-            None,
-            "closed queue should report EOF only after queued bytes are drained"
-        );
-    }
-
-    #[tokio::test]
-    async fn async_byte_queue_close_releases_full_queue_producer() {
-        let queue = AsyncByteBoundedFlowQueue::new(64 * 1024).unwrap();
-        queue.push(Bytes::from(vec![1; 64 * 1024])).await.unwrap();
-
-        let producer_queue = queue.clone();
-        let producer =
-            tokio::spawn(async move { producer_queue.push(Bytes::from(vec![2; 1])).await });
-
-        tokio::task::yield_now().await;
-        assert!(
-            !producer.is_finished(),
-            "producer should wait while the queue is full"
-        );
-
-        queue.close().await;
-        assert_eq!(producer.await.unwrap(), Err(ByteQueuePushError::Closed));
-        assert_eq!(
-            queue.try_push(Bytes::from(vec![3; 1])).await,
-            Err(ByteQueuePushError::Closed)
-        );
-        assert_eq!(queue.snapshot().await.queued_bytes, 64 * 1024);
-    }
-
-    #[tokio::test]
-    async fn leased_byte_queue_holds_capacity_until_permit_release() {
-        let queue = AsyncLeasedByteFlowQueue::new(128 * 1024).unwrap();
-        queue.push(Bytes::from(vec![1; 128 * 1024])).await.unwrap();
-        assert_eq!(queue.snapshot().await.local_progress_bytes, 0);
-
-        let mut leased = queue.recv_up_to(64 * 1024).await.unwrap();
-        assert_eq!(leased.bytes().len(), 64 * 1024);
-        assert_eq!(queue.snapshot().await.queued_bytes, 64 * 1024);
-        assert_eq!(queue.snapshot().await.leased_bytes, 64 * 1024);
-        assert_eq!(queue.snapshot().await.local_progress_bytes, 64 * 1024);
-        assert_eq!(queue.snapshot().await.available_bytes(), 0);
-
-        let producer_queue = queue.clone();
-        let producer =
-            tokio::spawn(async move { producer_queue.push(Bytes::from(vec![2; 1])).await });
-        tokio::task::yield_now().await;
-        assert!(
-            !producer.is_finished(),
-            "dispatcher pop must not release reader capacity before local admission"
-        );
-
-        assert_eq!(leased.permit_mut().release(32 * 1024), 32 * 1024);
-        assert_eq!(
-            queue.snapshot().await.local_progress_bytes,
-            64 * 1024 + 32 * 1024
-        );
-        tokio::task::yield_now().await;
-        assert!(
-            producer.is_finished(),
-            "partial local admission should release matching reader capacity"
-        );
-        producer.await.unwrap().unwrap();
-
-        assert_eq!(leased.permit_mut().release(usize::MAX), 32 * 1024);
-        let snapshot = queue.snapshot().await;
-        assert_eq!(snapshot.leased_bytes, 0);
-        assert_eq!(snapshot.queued_bytes, 64 * 1024 + 1);
-        assert_eq!(snapshot.local_progress_bytes, 128 * 1024);
-    }
-
-    #[tokio::test]
-    async fn read_reservation_is_counted_before_commit_and_refunded_on_drop() {
-        let queue = AsyncLeasedByteFlowQueue::new(128 * 1024).unwrap();
-        let reservation = queue.reserve_read_up_to(64 * 1024).await.unwrap();
-        assert_eq!(reservation.max_len(), 64 * 1024);
-        assert_eq!(queue.snapshot().await.reserved_bytes, 64 * 1024);
-        drop(reservation);
-        assert_eq!(queue.snapshot().await.reserved_bytes, 0);
-    }
-
-    #[tokio::test]
-    async fn read_reservation_commit_refunds_unused_capacity() {
-        let queue = AsyncLeasedByteFlowQueue::new(128 * 1024).unwrap();
-        let reservation = queue.reserve_read_up_to(64 * 1024).await.unwrap();
-        assert!(reservation.commit(Bytes::from(vec![1; 16 * 1024])).unwrap());
-        let snapshot = queue.snapshot().await;
-        assert_eq!(snapshot.reserved_bytes, 0);
-        assert_eq!(snapshot.queued_bytes, 16 * 1024);
-        assert_eq!(snapshot.available_bytes(), 112 * 1024);
-    }
-
-    #[tokio::test]
-    async fn read_reservation_rejects_overcommit_and_refunds_capacity() {
-        let queue = AsyncLeasedByteFlowQueue::new(128 * 1024).unwrap();
-        let reservation = queue.reserve_read_up_to(64 * 1024).await.unwrap();
-        assert_eq!(
-            reservation.commit(Bytes::from(vec![1; 64 * 1024 + 1])),
-            Err(ByteQueuePushError::ChunkExceedsCapacity {
-                len: 64 * 1024 + 1,
-                capacity: 64 * 1024,
-            })
-        );
-        let snapshot = queue.snapshot().await;
-        assert_eq!(snapshot.reserved_bytes, 0);
-        assert_eq!(snapshot.queued_bytes, 0);
-        assert_eq!(snapshot.available_bytes(), 128 * 1024);
-    }
-
-    #[tokio::test]
-    async fn read_reservation_preserves_owned_byte_cap_across_queue_lifecycle() {
-        const CAPACITY: usize = 128 * 1024;
-
-        let queue = AsyncLeasedByteFlowQueue::new(CAPACITY).unwrap();
-        let first = queue.reserve_read_up_to(96 * 1024).await.unwrap();
-        let snapshot = queue.snapshot().await;
-        assert_eq!(snapshot.owned_bytes(), 96 * 1024);
-        assert!(snapshot.owned_bytes() <= CAPACITY);
-
-        first.commit(Bytes::from(vec![1; 64 * 1024])).unwrap();
-        let second = queue.reserve_read_up_to(64 * 1024).await.unwrap();
-        let snapshot = queue.snapshot().await;
-        assert_eq!(snapshot.queued_bytes, 64 * 1024);
-        assert_eq!(snapshot.reserved_bytes, 64 * 1024);
-        assert_eq!(snapshot.owned_bytes(), CAPACITY);
-        assert!(snapshot.high_water_bytes <= CAPACITY);
-
-        drop(second);
-        let mut leased = queue.recv_up_to(48 * 1024).await.unwrap();
-        let snapshot = queue.snapshot().await;
-        assert_eq!(snapshot.queued_bytes, 16 * 1024);
-        assert_eq!(snapshot.leased_bytes, 48 * 1024);
-        assert_eq!(snapshot.reserved_bytes, 0);
-        assert_eq!(snapshot.owned_bytes(), 64 * 1024);
-        assert!(snapshot.owned_bytes() <= CAPACITY);
-
-        assert_eq!(leased.permit_mut().release(16 * 1024), 16 * 1024);
-        assert_eq!(queue.snapshot().await.owned_bytes(), 48 * 1024);
-        drop(leased);
-
-        let snapshot = queue.snapshot().await;
-        assert_eq!(snapshot.queued_bytes, 16 * 1024);
-        assert_eq!(snapshot.leased_bytes, 0);
-        assert_eq!(snapshot.owned_bytes(), 16 * 1024);
-        assert!(snapshot.high_water_bytes <= CAPACITY);
-    }
-
-    #[tokio::test]
-    async fn read_reservation_waiter_rearms_after_capacity_release() {
-        let queue = AsyncLeasedByteFlowQueue::new(128 * 1024).unwrap();
-        let first = queue.reserve_read_up_to(128 * 1024).await.unwrap();
-        let waiting_queue = queue.clone();
-        let waiter = tokio::spawn(async move { waiting_queue.reserve_read_up_to(64 * 1024).await });
-
-        tokio::task::yield_now().await;
-        assert!(!waiter.is_finished());
-        drop(first);
-
-        let second = tokio::time::timeout(Duration::from_millis(200), waiter)
-            .await
-            .expect("released reservation must wake the next reader")
-            .unwrap()
-            .unwrap();
-        assert_eq!(second.max_len(), 64 * 1024);
-    }
-
-    #[tokio::test]
-    async fn read_reservation_closed_commit_refunds_exactly_once() {
-        let queue = AsyncLeasedByteFlowQueue::new(128 * 1024).unwrap();
-        let reservation = queue.reserve_read_up_to(64 * 1024).await.unwrap();
-        queue
-            .close_for_terminal_and_mark_ready("test", "reservation_commit_after_close")
-            .await;
-
-        assert_eq!(
-            reservation.commit(Bytes::from(vec![1; 16 * 1024])),
-            Err(ByteQueuePushError::Closed)
-        );
-        let snapshot = queue.snapshot().await;
-        assert_eq!(snapshot.reserved_bytes, 0);
-        assert_eq!(snapshot.queued_bytes, 0);
-        assert_eq!(snapshot.available_bytes(), 128 * 1024);
-    }
-
-    #[tokio::test]
-    async fn leased_queue_readiness_coalesces_until_open_empty_is_observed() {
-        let queue = AsyncLeasedByteFlowQueue::new(128 * 1024).unwrap();
-        let first = queue.reserve_read_up_to(16 * 1024).await.unwrap();
-        assert!(first.commit(Bytes::from(vec![1; 16 * 1024])).unwrap());
-        let second = queue.reserve_read_up_to(16 * 1024).await.unwrap();
-        assert!(!second.commit(Bytes::from(vec![2; 16 * 1024])).unwrap());
-
-        let LeasedQueuePoll::Data(leased) = queue.try_recv_up_to(32 * 1024) else {
-            panic!("one readiness event must expose all queued data to the actor");
-        };
-        assert_eq!(leased.bytes().len(), 32 * 1024);
-        drop(leased);
-        assert!(matches!(
-            queue.try_recv_up_to(32 * 1024),
-            LeasedQueuePoll::Empty
-        ));
-
-        let third = queue.reserve_read_up_to(16 * 1024).await.unwrap();
-        assert!(
-            third.commit(Bytes::from(vec![3; 16 * 1024])).unwrap(),
-            "observing an open empty queue must rearm one future readiness wake"
-        );
-    }
-
-    #[tokio::test]
-    async fn leased_queue_close_reuses_pending_wake_and_reports_closed_after_data() {
-        let queue = AsyncLeasedByteFlowQueue::new(128 * 1024).unwrap();
-        let reservation = queue.reserve_read_up_to(16 * 1024).await.unwrap();
-        assert!(reservation.commit(Bytes::from(vec![1; 16 * 1024])).unwrap());
-        assert!(
-            !queue.close_for_remote_eof_and_mark_ready().await,
-            "the queued payload wake must also carry the later close state"
-        );
-
-        let LeasedQueuePoll::Data(leased) = queue.try_recv_up_to(128 * 1024) else {
-            panic!("closed queue must drain its owned payload first");
-        };
-        drop(leased);
-        assert!(matches!(
-            queue.try_recv_up_to(128 * 1024),
-            LeasedQueuePoll::Closed
-        ));
-        assert!(!queue.close_for_remote_eof_and_mark_ready().await);
-    }
-
-    #[tokio::test]
-    async fn leased_queue_closed_waits_for_reservation_refund() {
-        let queue = AsyncLeasedByteFlowQueue::new(128 * 1024).unwrap();
-        let reservation = queue.reserve_read_up_to(64 * 1024).await.unwrap();
-        assert!(queue.close_for_remote_eof_and_mark_ready().await);
-        assert!(matches!(
-            queue.try_recv_up_to(128 * 1024),
-            LeasedQueuePoll::Empty
-        ));
-
-        drop(reservation);
-        assert!(matches!(
-            queue.try_recv_up_to(128 * 1024),
-            LeasedQueuePoll::Closed
-        ));
-    }
-
-    #[tokio::test]
-    async fn leased_queue_terminal_drop_is_exact_and_idempotent() {
-        let queue = AsyncLeasedByteFlowQueue::new(128 * 1024).unwrap();
-        let reservation = queue.reserve_read_up_to(32 * 1024).await.unwrap();
-        reservation.commit(Bytes::from(vec![1; 32 * 1024])).unwrap();
-
-        assert_eq!(
-            queue.close_and_drop_queued_for_terminal("test", "terminal_drop"),
-            32 * 1024
-        );
-        let snapshot = queue.snapshot_now();
-        assert!(snapshot.closure.is_closed());
-        assert_eq!(
-            snapshot.closure.terminal_cause(),
-            Some(LeasedByteQueueTerminalCause {
-                direction: "test",
-                reason: "terminal_drop",
-            })
-        );
-        assert_eq!(snapshot.queued_bytes, 0);
-        assert_eq!(snapshot.leased_bytes, 0);
-        assert_eq!(snapshot.reserved_bytes, 0);
-        assert_eq!(
-            queue.close_and_drop_queued_for_terminal("test", "different_reason"),
-            0
-        );
-        assert_eq!(
-            queue.snapshot_now().closure.terminal_cause(),
-            Some(LeasedByteQueueTerminalCause {
-                direction: "test",
-                reason: "terminal_drop",
-            }),
-            "the first terminal cause must remain authoritative"
-        );
-    }
-
-    #[tokio::test]
-    async fn d16_global_budget_counts_reservation_and_owned_bytes_across_flows() {
-        let budget = D16GlobalByteBudget::new(128 * 1024).unwrap();
-        let first = AsyncLeasedByteFlowQueue::new_with_global_budget(
-            128 * 1024,
-            DownstreamPermitReleaseMode::OnEgressDrain,
-            budget.clone(),
-        )
-        .unwrap();
-        let second = AsyncLeasedByteFlowQueue::new_with_global_budget(
-            128 * 1024,
-            DownstreamPermitReleaseMode::OnEgressDrain,
-            budget.clone(),
-        )
-        .unwrap();
-
-        let first_reservation = first.reserve_read_up_to(96 * 1024).await.unwrap();
-        let second_reservation = second.reserve_read_up_to(64 * 1024).await.unwrap();
-        assert_eq!(first_reservation.max_len(), 96 * 1024);
-        assert_eq!(second_reservation.max_len(), 32 * 1024);
-        assert_eq!(budget.snapshot().reserved_bytes, 128 * 1024);
-        assert_eq!(budget.snapshot().owned_bytes, 0);
-
-        first_reservation
-            .commit(Bytes::from(vec![1; 64 * 1024]))
-            .unwrap();
-        second_reservation
-            .commit(Bytes::from(vec![2; 32 * 1024]))
-            .unwrap();
-        let snapshot = budget.snapshot();
-        assert_eq!(snapshot.reserved_bytes, 0);
-        assert_eq!(snapshot.owned_bytes, 96 * 1024);
-        assert!(snapshot.total_bytes() <= snapshot.capacity_bytes);
-
-        let mut first_lease = first.recv_up_to(64 * 1024).await.unwrap();
-        let mut second_lease = second.recv_up_to(32 * 1024).await.unwrap();
-        assert_eq!(first_lease.permit_mut().release(usize::MAX), 64 * 1024);
-        assert_eq!(second_lease.permit_mut().release(usize::MAX), 32 * 1024);
-        let snapshot = budget.snapshot();
-        assert_eq!(snapshot.total_bytes(), 0);
-        assert!(snapshot.high_water_bytes <= 128 * 1024);
-    }
-
-    #[tokio::test]
-    async fn d16_global_budget_waiter_wakes_after_other_flow_releases() {
-        let budget = D16GlobalByteBudget::new(128 * 1024).unwrap();
-        let first = AsyncLeasedByteFlowQueue::new_with_global_budget(
-            128 * 1024,
-            DownstreamPermitReleaseMode::OnEgressDrain,
-            budget.clone(),
-        )
-        .unwrap();
-        let second = AsyncLeasedByteFlowQueue::new_with_global_budget(
-            128 * 1024,
-            DownstreamPermitReleaseMode::OnEgressDrain,
-            budget.clone(),
-        )
-        .unwrap();
-        let reservation = first.reserve_read_up_to(128 * 1024).await.unwrap();
-        reservation
-            .commit(Bytes::from(vec![3; 128 * 1024]))
-            .unwrap();
-        let waiting = second.clone();
-        let waiter = tokio::spawn(async move { waiting.reserve_read_up_to(64 * 1024).await });
-        tokio::task::yield_now().await;
-        assert!(!waiter.is_finished());
-
-        let mut leased = first.recv_up_to(64 * 1024).await.unwrap();
-        assert_eq!(leased.permit_mut().release(64 * 1024), 64 * 1024);
-        let reservation = tokio::time::timeout(Duration::from_millis(200), waiter)
-            .await
-            .expect("global release must wake another flow")
-            .unwrap()
-            .unwrap();
-        assert_eq!(reservation.max_len(), 64 * 1024);
-        drop(reservation);
-        drop(leased);
-        assert_eq!(budget.snapshot().total_bytes(), 64 * 1024);
-    }
-
-    #[tokio::test]
-    async fn d16_global_budget_accounts_direct_push_and_lease_release() {
-        let budget = D16GlobalByteBudget::new(64 * 1024).unwrap();
-        let queue = AsyncLeasedByteFlowQueue::new_with_global_budget(
-            64 * 1024,
-            DownstreamPermitReleaseMode::OnEgressDrain,
-            budget.clone(),
-        )
-        .unwrap();
-        queue.push(Bytes::from(vec![9; 64 * 1024])).await.unwrap();
-        assert_eq!(budget.snapshot().owned_bytes, 64 * 1024);
-
-        let leased = queue.recv_up_to(64 * 1024).await.unwrap();
-        drop(leased);
-        assert_eq!(budget.snapshot().total_bytes(), 0);
-    }
-}
+#[path = "tcp_downlink_pump/tests/queue.rs"]
+mod tests;

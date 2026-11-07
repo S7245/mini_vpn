@@ -100,6 +100,7 @@ rustls-ring = [
     "proto/rustls-ring",
     "proto/ring",
 ]
+sent-history-observe = ["proto/sent-history-observe"]
 
 [lib]
 name = "quinn"

@@ -1,7 +1,7 @@
 use std::{
-    future::{Future, poll_fn},
+    future::{poll_fn, Future},
     io,
-    pin::{Pin, pin},
+    pin::{pin, Pin},
     task::{Context, Poll},
 };
 
@@ -10,8 +10,8 @@ use proto::{ClosedStream, ConnectionError, FinishError, StreamId, Written};
 use thiserror::Error;
 
 use crate::{
-    VarInt,
     connection::{ConnectionRef, State},
+    VarInt,
 };
 
 /// A stream that can only be used to send data
@@ -52,7 +52,7 @@ impl SendStreamProgress {
         if self.is_0rtt && conn.check_0rtt().is_err() {
             return Err(ClosedStream::default());
         }
-        conn.inner.send_stream(self.stream).progress()
+        conn.send_stream(self.stream).progress()
     }
 
     /// Get the identity of the sampled stream.
@@ -172,8 +172,17 @@ impl SendStream {
             return Poll::Ready(Err(WriteError::ConnectionLost(x.clone())));
         }
 
-        let result = match write_fn(&mut conn.inner.send_stream(self.stream)) {
+        let attempted = write_fn(&mut conn.send_stream(self.stream));
+        conn.settle_local_failure(&self.conn.shared);
+        if let Err(Admission(error)) = &attempted {
+            return Poll::Ready(Err(WriteError::Admission(*error)));
+        }
+        if let Some(error) = &conn.error {
+            return Poll::Ready(Err(WriteError::ConnectionLost(error.clone())));
+        }
+        let result = match attempted {
             Ok(result) => result,
+            Err(Admission(error)) => return Poll::Ready(Err(WriteError::Admission(error))),
             Err(Blocked) => {
                 conn.blocked_writers.insert(self.stream, cx.waker().clone());
                 return Poll::Pending;
@@ -201,14 +210,17 @@ impl SendStream {
     /// May fail if [`finish()`](Self::finish) or [`reset()`](Self::reset) was previously
     /// called. This error is harmless and serves only to indicate that the caller may have
     /// incorrect assumptions about the stream's state.
-    pub fn finish(&mut self) -> Result<(), ClosedStream> {
+    pub fn finish(&mut self) -> Result<(), WriteError> {
         let mut conn = self.conn.state.lock("finish");
-        match conn.inner.send_stream(self.stream).finish() {
+        let result = conn.send_stream(self.stream).finish();
+        conn.settle_local_failure(&self.conn.shared);
+        match result {
             Ok(()) => {
                 conn.wake();
                 Ok(())
             }
-            Err(FinishError::ClosedStream) => Err(ClosedStream::default()),
+            Err(FinishError::ClosedStream) => Err(WriteError::ClosedStream),
+            Err(FinishError::Admission(error)) => Err(WriteError::Admission(error)),
             // Harmless. If the application needs to know about stopped streams at this point, it
             // should call `stopped`.
             Err(FinishError::Stopped(_)) => Ok(()),
@@ -229,9 +241,10 @@ impl SendStream {
         if self.is_0rtt && conn.check_0rtt().is_err() {
             return Ok(());
         }
-        conn.inner.send_stream(self.stream).reset(error_code)?;
+        let result = conn.send_stream(self.stream).reset(error_code);
+        conn.settle_local_failure(&self.conn.shared);
         conn.wake();
-        Ok(())
+        result
     }
 
     /// Set the priority of the send stream
@@ -241,16 +254,21 @@ impl SendStream {
     /// the priority of a stream with pending data may only take effect after that data has been
     /// transmitted. Using many different priority levels per connection may have a negative
     /// impact on performance.
-    pub fn set_priority(&self, priority: i32) -> Result<(), ClosedStream> {
+    pub fn set_priority(&self, priority: i32) -> Result<(), WriteError> {
         let mut conn = self.conn.state.lock("SendStream::set_priority");
-        conn.inner.send_stream(self.stream).set_priority(priority)?;
-        Ok(())
+        let result = conn.send_stream(self.stream).set_priority(priority);
+        conn.settle_local_failure(&self.conn.shared);
+        match result {
+            Ok(()) => Ok(()),
+            Err(proto::PriorityError::Admission(error)) => Err(WriteError::Admission(error)),
+            Err(proto::PriorityError::ClosedStream) => Err(WriteError::ClosedStream),
+        }
     }
 
     /// Get the priority of the send stream
     pub fn priority(&self) -> Result<i32, ClosedStream> {
         let mut conn = self.conn.state.lock("SendStream::priority");
-        conn.inner.send_stream(self.stream).priority()
+        conn.send_stream(self.stream).priority()
     }
 
     /// Completes when the peer stops the stream or reads the stream to completion
@@ -352,7 +370,7 @@ fn send_stream_stopped(
     if is_0rtt && conn.check_0rtt().is_err() {
         return Some(Err(StoppedError::ZeroRttRejected));
     }
-    match conn.inner.send_stream(stream).stopped() {
+    match conn.send_stream(stream).stopped() {
         Err(ClosedStream { .. }) => Some(Ok(None)),
         Ok(Some(error_code)) => Some(Ok(Some(error_code))),
         Ok(None) => conn.error.clone().map(|error| Err(error.into())),
@@ -399,18 +417,22 @@ impl Drop for SendStream {
         // clean up any previously registered wakers
         conn.blocked_writers.remove(&self.stream);
 
+        let retired = conn.send_stream(self.stream).retire_closed();
+        if retired != Ok(false) { conn.settle_local_failure(&self.conn.shared); return; }
         if conn.error.is_some() || (self.is_0rtt && conn.check_0rtt().is_err()) {
             return;
         }
-        match conn.inner.send_stream(self.stream).finish() {
+        let result = conn.send_stream(self.stream).finish();
+        conn.settle_local_failure(&self.conn.shared);
+        match result {
             Ok(()) => conn.wake(),
             Err(FinishError::Stopped(reason)) => {
-                if conn.inner.send_stream(self.stream).reset(reason).is_ok() {
-                    conn.wake();
-                }
+                let _ = conn.send_stream(self.stream).reset(reason);
+                conn.settle_local_failure(&self.conn.shared);
+                conn.wake();
             }
             // Already finished or reset, which is fine.
-            Err(FinishError::ClosedStream) => {}
+            Err(FinishError::ClosedStream) | Err(FinishError::Admission(_)) => {}
         }
     }
 }
@@ -418,6 +440,9 @@ impl Drop for SendStream {
 /// Errors that arise from writing to a stream
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum WriteError {
+    /// The original Native inventory refused admission before consuming input.
+    #[error("native stream admission: {0:?}")]
+    Admission(bytes::MeteredCopyError),
     /// The peer is no longer accepting data on this stream
     ///
     /// Carries an application-defined error code.
@@ -459,6 +484,7 @@ impl From<WriteError> for io::Error {
     fn from(x: WriteError) -> Self {
         use WriteError::*;
         let kind = match x {
+            Admission(error) => return crate::owned_events::AdmissionError(error).into(),
             Stopped(_) | ZeroRttRejected => io::ErrorKind::ConnectionReset,
             ConnectionLost(_) | ClosedStream => io::ErrorKind::NotConnected,
         };

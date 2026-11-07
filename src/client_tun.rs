@@ -1,4 +1,12 @@
 mod dns_hijack;
+
+#[cfg(feature = "harness")]
+pub(crate) use downlink_custody::{D16HarnessCycle, D16HarnessFlow, D16HarnessFlowSnapshot};
+use downlink_custody::{
+    TunFlushPermitRelease, capture_dirty_send_queues, drop_d16_owned_for_terminal, flush_downlink,
+    release_dirty_downlink_inflight_permits_for_send_queue_drain,
+};
+
 #[cfg(test)]
 use dns_hijack::forge_dns_reply;
 use dns_hijack::handle_dns_hijack;
@@ -13,8 +21,6 @@ use crate::owned_upstream::{
 };
 use crate::resumable::{FlowFinishReason, LocalFlow, MAX_DATA_PAYLOAD_BYTES, ResetReason};
 use crate::shared::{ClientError, TargetAddr};
-#[cfg(feature = "harness")]
-use crate::tcp_downlink_pump::ByteQueueConfigError;
 use crate::tcp_downlink_pump::{
     AsyncByteBoundedFlowQueue, AsyncLeasedByteFlowQueue, ByteQueuePushError,
     D16_GLOBAL_BYTE_BUDGET_DEFAULT_BYTES, D16GlobalByteBudget, DownstreamBytePermit,
@@ -277,12 +283,17 @@ macro_rules! tcp_diag_log {
         }
     };
 }
-
 mod compatibility_runtime;
+mod d16_reader;
+mod downlink_custody;
 pub(crate) use compatibility_runtime::run_owned_event_loop;
+pub use compatibility_runtime::tuic_service::{
+    Handle as TuicServiceControl, Phase as TuicServicePhase, Report as TuicServiceReport,
+    TunService, prepare_failover_service, prepare_tuic_service,
+};
 use compatibility_runtime::{
     GenericLaunchRequest, HandshakeNotice, OpenDispatch, OpenEvent, RearmGate, RearmIntent,
-    RemotePayloadRequest, SessionControl, flush_tx_and_release_downlink_permits, gate_legacy_rearm,
+    RemotePayloadRequest, SessionControl, flush_tx_and_release_downlink_permits, poll_egress_cycle, gate_legacy_rearm,
     launch_generic_relay, legacy_bare_rearm_from_loop, legacy_reasoned_rearm_from_loop,
     legacy_reasoned_rearm_with_gate, legacy_reasoned_rearm_with_snapshot_and_gate,
     reap_dead_slots_from_loop, run_relay, run_relay_ordered_egress_permit, run_relay_thin,
@@ -296,7 +307,8 @@ use compatibility_runtime::{
 #[cfg(test)]
 use compatibility_runtime::{ReadyReadRequest, drain_ready_remote_reads};
 pub use compatibility_runtime::{run_event_loop, start_tun_proxy};
-
+use d16_reader::{run_d16_native_reader, run_relay_d16};
+use downlink_custody::drain_d16_owned_queue_into_pending;
 mod legacy_event_loop;
 use legacy_event_loop::activity::{HandshakeCompletion, ListenerActivity};
 use legacy_event_loop::ingress::{drain_ready_tun_rx, process_ready_tun_rx_packet};
@@ -312,10 +324,13 @@ use legacy_event_loop::remote_payload::{
     handle_remote_payload_from_loop, handle_remote_payload_with_gate,
 };
 mod listener_registry;
+mod native_chunk_assembler;
+mod legacy_native_readers;
 mod native_permit_supervision;
-
-pub(in crate::client_tun) use native_permit_supervision::run_relay_native_permit;
-
+mod native_chunk_supervision;
+mod runtime_environment;
+mod relay_channel;
+use native_chunk_supervision::run_relay_native_chunk;
 use legacy_event_loop::relay_events::{
     RelayEventIngressState, RelayEventLane, RelayEventSocketState, RelayEventTurn,
 };
@@ -340,7 +355,8 @@ use listener_registry::{
     ListenerSpec, MAX_INTERCEPTED_PORTS, MAX_TOTAL_LISTENERS, RegistryError, build_listener_socket,
     build_listener_socket_with_buffers, inspect_inbound_tcp,
 };
-
+use native_chunk_assembler::NativeTcpChunkAssembler;
+pub(in crate::client_tun) use native_permit_supervision::run_relay_native_permit;
 /// 主循环分段插桩接缝（knife1：并发压测定位瓶颈）。
 ///
 /// 中文要点：生产传 [`NoopSink`]（空方法，单态化内联后**零开销**，热路径无 `Instant::now()`）；
@@ -1461,7 +1477,7 @@ fn should_poll_relay_remote_read_probe(diag: &RelayTaskDiag, read_credit: RelayR
         && relay_remote_read_probe_has_serviceable_payload(diag)
 }
 
-fn note_global_rx_channel_occupancy<T>(diag: &mut RelayTaskDiag, tx: &mpsc::Sender<T>) {
+fn note_global_rx_channel_occupancy<T: relay_channel::Value>(diag: &mut RelayTaskDiag, tx: &relay_channel::Sender<T>) {
     let max_capacity = tx.max_capacity();
     let used = max_capacity.saturating_sub(tx.capacity());
     diag.note_global_rx_queue(used, max_capacity);
@@ -1497,7 +1513,7 @@ fn relay_remote_ready_batch_byte_limit_for_queue(used: usize, max_capacity: usiz
     RELAY_REMOTE_READ_MIN_BATCH_BYTES + (elastic.saturating_mul(remaining) / span)
 }
 
-fn relay_remote_ready_batch_byte_limit<T>(tx: &mpsc::Sender<T>) -> usize {
+fn relay_remote_ready_batch_byte_limit<T: relay_channel::Value>(tx: &relay_channel::Sender<T>) -> usize {
     let max_capacity = tx.max_capacity();
     let used = max_capacity.saturating_sub(tx.capacity());
     relay_remote_ready_batch_byte_limit_for_queue(used, max_capacity)
@@ -1699,11 +1715,9 @@ fn format_tcp_reverse_window_diag(handle: SocketHandle, diag: TcpReverseWindowDi
     )
 }
 
-#[derive(Debug)]
-enum RelayCommand {
-    Data(Vec<u8>),
-    Finish,
-}
+
+mod uplink;
+use uplink::{RelayCommand, EstablishedUplink, extract_socket_payload, pump_established_uplink, coalesce_relay_payload};
 
 #[derive(Debug)]
 enum RelayWriterSignal {
@@ -1807,47 +1821,6 @@ impl RelayCloseTimer {
     }
 }
 
-struct CoalescedRelayWrite {
-    payload: Vec<u8>,
-    finish_after: bool,
-    deferred: Option<RelayCommand>,
-}
-
-fn coalesce_relay_payload(
-    mut payload: Vec<u8>,
-    rx: &mut mpsc::Receiver<RelayCommand>,
-) -> CoalescedRelayWrite {
-    let mut messages = 1usize;
-    let mut finish_after = false;
-    while messages < RELAY_WRITER_COALESCE_MAX_MESSAGES
-        && payload.len() < RELAY_WRITER_COALESCE_MAX_BYTES
-    {
-        match rx.try_recv() {
-            Ok(RelayCommand::Data(mut next)) => {
-                if payload.len().saturating_add(next.len()) > RELAY_WRITER_COALESCE_MAX_BYTES {
-                    return CoalescedRelayWrite {
-                        payload,
-                        finish_after,
-                        deferred: Some(RelayCommand::Data(next)),
-                    };
-                }
-                payload.append(&mut next);
-                messages += 1;
-            }
-            Ok(RelayCommand::Finish) => {
-                finish_after = true;
-                break;
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-            | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-        }
-    }
-    CoalescedRelayWrite {
-        payload,
-        finish_after,
-        deferred: None,
-    }
-}
 
 #[derive(Debug, Clone, Copy)]
 struct SocketCloseSnapshot {
@@ -2284,7 +2257,7 @@ struct SocketCtx {
     /// Current lifecycle state for this listener slot.
     state: SocketState,
     /// Sender used to push local payloads into the remote relay task for this slot only.
-    uplink_tx: Option<mpsc::Sender<RelayCommand>>,
+    uplink_tx: Option<crate::client_tun::uplink::Sender>,
     /// Knife16 Task 3: mutually exclusive protocol-owned uplink. Its byte
     /// reservation is acquired before smoltcp `recv`, unlike the legacy
     /// message-only relay channel above.
@@ -2335,12 +2308,12 @@ struct SocketCtx {
     /// Downlink bytes not yet accepted by the smoltcp tx buffer.
     /// 中文要点：smoltcp send_slice 可能只写一部分（tx buffer 受 TCP ACK 释放制约），
     /// 写不下的字节必须留在这里、由后续 poll 持续 flush，否则丢字节 → TLS bad decrypt。
-    downlink_pending: Vec<u8>,
+    downlink_pending: downlink_custody::PendingBytes,
     /// D2.3: byte-capacity permits tied to prefixes of `downlink_pending`.
     /// Permits are released when bytes are accepted by smoltcp or explicitly dropped.
-    downlink_pending_permits: VecDeque<DownstreamBytePermit>,
+    downlink_pending_permits: downlink_custody::PermitStock,
     /// D6: permits for bytes accepted by smoltcp but not yet observed as local egress drain.
-    downlink_inflight_permits: VecDeque<DownstreamBytePermit>,
+    downlink_inflight_permits: downlink_custody::EgressPermitLedger,
     /// D6: this flow carries permits that must release on egress drain, not smoltcp admission.
     downlink_delay_permit_release_until_egress: bool,
     /// Relay has ended, but downlink bytes still need to be flushed before the slot can be rearmed.
@@ -2418,9 +2391,9 @@ impl SocketCtx {
             owned_terminal_wait_since_secs: None,
             local_fin_pending_since_secs: None,
             local_fin_last_remote_progress_secs: None,
-            downlink_pending: Vec::new(),
-            downlink_pending_permits: VecDeque::new(),
-            downlink_inflight_permits: VecDeque::new(),
+            downlink_pending: Default::default(),
+            downlink_pending_permits: Default::default(),
+            downlink_inflight_permits: Default::default(),
             downlink_delay_permit_release_until_egress: false,
             pending_relay_close: None,
             pending_relay_close_since_secs: None,
@@ -2483,147 +2456,6 @@ impl SocketCtx {
             && self.local_fin_sent
             && self.local_eof_sent
             && self.resumable_terminal.is_none()
-    }
-
-    fn append_downlink_pending_with_permit(
-        &mut self,
-        payload: &[u8],
-        permit: Option<DownstreamBytePermit>,
-    ) {
-        if permit.as_ref().is_some_and(|permit| {
-            permit.release_mode() == DownstreamPermitReleaseMode::OnEgressDrain
-        }) {
-            self.downlink_delay_permit_release_until_egress = true;
-        }
-        let outcome = {
-            let mut pending = TcpEgressPendingQueueView::new(
-                &mut self.downlink_pending,
-                &mut self.downlink_pending_permits,
-            );
-            pending.append(payload, permit)
-        };
-        if outcome.retained_lease_bytes > 0 {
-            self.downlink_diag
-                .note_downstream_permit(outcome.retained_lease_bytes, outcome.leased_bytes_after);
-        }
-    }
-
-    fn admit_downlink_pending_prefix(&mut self, bytes: usize) -> usize {
-        let before = self.downlink_pending.len();
-        let released = if self.downlink_delay_permit_release_until_egress {
-            self.move_downlink_pending_prefix_to_inflight(bytes)
-        } else {
-            self.release_downlink_permits(bytes)
-        };
-        if let Some(mirror) = &mut self.flow_mirror {
-            mirror.admit_pending(
-                before,
-                self.downlink_pending.len(),
-                bytes,
-                self.d16_downlink_queue.is_none()
-                    && !self.downlink_delay_permit_release_until_egress,
-            );
-        }
-        released
-    }
-
-    fn move_downlink_pending_prefix_to_inflight(&mut self, bytes: usize) -> usize {
-        let outcome = {
-            let mut pending = TcpEgressPendingQueueView::new(
-                &mut self.downlink_pending,
-                &mut self.downlink_pending_permits,
-            );
-            pending.transfer_prefix_to(bytes, &mut self.downlink_inflight_permits)
-        };
-        if outcome.transferred_lease_bytes > 0 {
-            self.downlink_diag.note_downstream_permit_inflight(
-                outcome.transferred_lease_bytes,
-                outcome.inflight_leased_bytes_after,
-            );
-        }
-        outcome.transferred_lease_bytes
-    }
-
-    fn release_downlink_permits(&mut self, bytes: usize) -> usize {
-        let outcome = {
-            let mut pending = TcpEgressPendingQueueView::new(
-                &mut self.downlink_pending,
-                &mut self.downlink_pending_permits,
-            );
-            pending.consume_prefix(bytes)
-        };
-        if outcome.released_lease_bytes > 0 {
-            self.downlink_diag.note_downstream_permit_release(
-                outcome.released_lease_bytes,
-                outcome.leased_bytes_after,
-            );
-        }
-        outcome.released_lease_bytes
-    }
-
-    fn release_downlink_inflight_permits(&mut self, mut bytes: usize) -> usize {
-        let mut released = 0usize;
-        while bytes > 0 {
-            let Some(front) = self.downlink_inflight_permits.front_mut() else {
-                break;
-            };
-            let n = front.release(bytes);
-            if n == 0 {
-                break;
-            }
-            released = released.saturating_add(n);
-            bytes = bytes.saturating_sub(n);
-            if front.remaining_bytes() == 0 {
-                self.downlink_inflight_permits.pop_front();
-            }
-        }
-        if released > 0 {
-            self.downlink_diag
-                .note_downstream_permit_release(released, self.downlink_inflight_permit_bytes());
-        }
-        released
-    }
-
-    fn clear_downlink_inflight_permits(&mut self) -> usize {
-        let mut released = 0usize;
-        while let Some(mut permit) = self.downlink_inflight_permits.pop_front() {
-            released = released.saturating_add(permit.release(usize::MAX));
-        }
-        if released > 0 {
-            self.downlink_diag
-                .note_downstream_permit_release(released, 0);
-        }
-        released
-    }
-
-    fn downlink_inflight_permit_bytes(&self) -> usize {
-        self.downlink_inflight_permits
-            .iter()
-            .map(DownstreamBytePermit::remaining_bytes)
-            .sum()
-    }
-
-    #[cfg(test)]
-    fn consume_downlink_pending_prefix(&mut self, bytes: usize) {
-        self.release_downlink_permits(bytes);
-    }
-
-    fn clear_downlink_pending(&mut self) {
-        let outcome = {
-            let mut pending = TcpEgressPendingQueueView::new(
-                &mut self.downlink_pending,
-                &mut self.downlink_pending_permits,
-            );
-            pending.clear()
-        };
-        if outcome.released_lease_bytes > 0 {
-            self.downlink_diag.note_downstream_permit_release(
-                outcome.released_lease_bytes,
-                outcome.leased_bytes_after,
-            );
-        }
-        self.clear_downlink_inflight_permits();
-        self.downlink_delay_permit_release_until_egress = false;
     }
 }
 
@@ -2858,58 +2690,6 @@ fn recover_all_eligible_d16_flows_after_clean_tun_rx_edge(
     transitioned
 }
 
-fn drain_d16_owned_queue_into_pending(ctx: &mut SocketCtx, max_bytes: usize) -> D16OwnedQueueDrain {
-    let Some(queue) = ctx.d16_downlink_queue.clone() else {
-        return D16OwnedQueueDrain::default();
-    };
-    let mut outcome = D16OwnedQueueDrain::default();
-    while outcome.bytes < max_bytes {
-        match queue.try_recv_up_to(max_bytes.saturating_sub(outcome.bytes)) {
-            LeasedQueuePoll::Data(leased) => {
-                let (bytes, permit) = leased.into_parts();
-                outcome.bytes = outcome.bytes.saturating_add(bytes.len());
-                ctx.append_downlink_pending_with_permit(&bytes, Some(permit));
-            }
-            LeasedQueuePoll::Empty => break,
-            LeasedQueuePoll::Closed => {
-                outcome.queue_closed = true;
-                break;
-            }
-        }
-    }
-    if !outcome.queue_closed && matches!(queue.try_recv_up_to(0), LeasedQueuePoll::Closed) {
-        outcome.queue_closed = true;
-    }
-    outcome
-}
-
-fn drop_d16_owned_for_terminal(
-    ctx: &mut SocketCtx,
-    direction: &'static str,
-    reason: &'static str,
-) -> usize {
-    let Some(queue) = ctx.d16_downlink_queue.clone() else {
-        return 0;
-    };
-    let before = queue.snapshot_now();
-    let dropped_queued_bytes = queue.close_and_drop_queued_for_terminal(direction, reason);
-    ctx.clear_downlink_pending();
-    let after = queue.snapshot_now();
-    let released_leased_bytes = before.leased_bytes.saturating_sub(after.leased_bytes);
-    let dropped = dropped_queued_bytes.saturating_add(released_leased_bytes);
-    if dropped > 0 {
-        ctx.downlink_diag.permit_terminal_drop_bytes = ctx
-            .downlink_diag
-            .permit_terminal_drop_bytes
-            .saturating_add(dropped as u64);
-        ctx.downlink_diag.permit_terminal_drop_events = ctx
-            .downlink_diag
-            .permit_terminal_drop_events
-            .saturating_add(1);
-    }
-    dropped
-}
-
 fn d16_terminal_cause_for_rearm(
     ctx: &SocketCtx,
     snapshot: SocketCloseSnapshot,
@@ -2923,174 +2703,6 @@ fn d16_terminal_cause_for_rearm(
         return Some(("local_to_remote", "local_socket_terminal"));
     }
     Some((close_direction, close_reason))
-}
-
-#[cfg(feature = "harness")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct D16HarnessCycle {
-    pub admitted_bytes: usize,
-    pub drained_bytes: usize,
-    pub queue_to_pending_bytes: usize,
-    pub phase: EgressPhase,
-    pub allow_read: bool,
-    pub allow_admission: bool,
-}
-
-#[cfg(feature = "harness")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct D16HarnessFlowSnapshot {
-    pub queue: crate::tcp_downlink_pump::LeasedByteQueueSnapshot,
-    pub pending_bytes: usize,
-    pub inflight_bytes: usize,
-    pub actor_admitted_bytes: u64,
-    pub actor_bypass_admitted_bytes: u64,
-    pub committed_tun_bytes: u64,
-    pub phase: EgressPhase,
-    pub eof_ready: bool,
-}
-
-#[cfg(feature = "harness")]
-pub(crate) struct D16HarnessFlow {
-    ctx: SocketCtx,
-    queue: AsyncLeasedByteFlowQueue,
-    committed_tun_bytes: u64,
-}
-
-#[cfg(feature = "harness")]
-impl D16HarnessFlow {
-    pub(crate) fn new(global_budget: D16GlobalByteBudget) -> Result<Self, ByteQueueConfigError> {
-        let queue = AsyncLeasedByteFlowQueue::new_with_global_budget(
-            512 * 1024,
-            DownstreamPermitReleaseMode::OnEgressDrain,
-            global_budget,
-        )?;
-        let mut ctx = SocketCtx::new(443);
-        ctx.state = SocketState::Relaying;
-        ctx.d16_downlink_queue = Some(queue.clone());
-        Ok(Self {
-            ctx,
-            queue,
-            committed_tun_bytes: 0,
-        })
-    }
-
-    pub(crate) fn permissions(&self) -> EgressPermissions {
-        EgressPermissions::for_phase(self.ctx.d16_egress_phase)
-    }
-
-    pub(crate) async fn enqueue_remote_chunk(
-        &self,
-        bytes: usize,
-    ) -> Result<bool, ByteQueuePushError> {
-        let reservation = self
-            .queue
-            .reserve_read_up_to(bytes)
-            .await
-            .map_err(|_| ByteQueuePushError::Closed)?;
-        if reservation.max_len() != bytes {
-            return Err(ByteQueuePushError::Full {
-                len: bytes,
-                available: reservation.max_len(),
-            });
-        }
-        reservation.commit(Bytes::from(vec![0; bytes]))
-    }
-
-    pub(crate) async fn close_remote(&self) -> bool {
-        self.queue.close_for_remote_eof_and_mark_ready().await
-    }
-
-    pub(crate) fn cycle(
-        &mut self,
-        hard_pressure: bool,
-        drop_debt: bool,
-        tun_drain_bytes: usize,
-    ) -> D16HarnessCycle {
-        let drained_bytes = self.ctx.release_downlink_inflight_permits(tun_drain_bytes);
-        self.committed_tun_bytes = self
-            .committed_tun_bytes
-            .saturating_add(drained_bytes as u64);
-
-        let previous = self.ctx.d16_egress_phase;
-        let before_permissions = EgressPermissions::for_phase(previous);
-        let before = self.queue.snapshot_now();
-        let below_low = self.ctx.downlink_inflight_permit_bytes() <= 128 * 1024;
-        let phase = transition_egress_phase(previous, hard_pressure, drop_debt, below_low, false);
-        self.ctx
-            .downlink_diag
-            .note_d16_egress_phase(previous, phase, None);
-        self.ctx.d16_egress_phase = phase;
-        let permissions = EgressPermissions::for_phase(phase);
-
-        let mut queue_to_pending_bytes = 0usize;
-        let mut admitted_bytes = 0usize;
-        if permissions.allow_admission {
-            let drained = drain_d16_owned_queue_into_pending(
-                &mut self.ctx,
-                permissions.max_admit_quantum_bytes,
-            );
-            queue_to_pending_bytes = drained.bytes;
-            let outcome = with_downlink_admission(
-                &mut self.ctx,
-                DownlinkAdmissionOrigin::EgressActor,
-                |ctx, _| {
-                    let accepted = ctx
-                        .downlink_pending
-                        .len()
-                        .min(permissions.max_admit_quantum_bytes);
-                    ctx.admit_downlink_pending_prefix(accepted);
-                    if accepted > 0 {
-                        ctx.downlink_diag
-                            .note_send_slice_ok(accepted, ctx.downlink_pending.len());
-                    }
-                    DownlinkFlushOutcome {
-                        accepted_bytes: accepted,
-                        headroom_limited: false,
-                    }
-                },
-            );
-            admitted_bytes = outcome.accepted_bytes;
-        }
-        let _ = install_d16_remote_eof_if_ready(&mut self.ctx, 0);
-
-        let previous = self.ctx.d16_egress_phase;
-        let next = transition_egress_phase(previous, hard_pressure, drop_debt, below_low, true);
-        self.ctx
-            .downlink_diag
-            .note_d16_egress_phase(previous, next, Some(drained_bytes));
-        self.ctx.d16_egress_phase = next;
-        debug_assert!(before.owned_bytes() <= 512 * 1024);
-        debug_assert!(before_permissions.allow_drain);
-
-        D16HarnessCycle {
-            admitted_bytes,
-            drained_bytes,
-            queue_to_pending_bytes,
-            phase: next,
-            allow_read: permissions.allow_read,
-            allow_admission: permissions.allow_admission,
-        }
-    }
-
-    pub(crate) fn snapshot(&self) -> D16HarnessFlowSnapshot {
-        let queue = self.queue.snapshot_now();
-        let (queue_closed, queue_empty) = d16_remote_eof_queue_state(&self.ctx).unwrap_or_default();
-        D16HarnessFlowSnapshot {
-            queue,
-            pending_bytes: self.ctx.downlink_pending.len(),
-            inflight_bytes: self.ctx.downlink_inflight_permit_bytes(),
-            actor_admitted_bytes: self.ctx.downlink_diag.actor_admitted_bytes,
-            actor_bypass_admitted_bytes: self.ctx.downlink_diag.actor_bypass_admitted_bytes,
-            committed_tun_bytes: self.committed_tun_bytes,
-            phase: self.ctx.d16_egress_phase,
-            eof_ready: remote_eof_ready_for_local_close(
-                queue_closed,
-                queue_empty,
-                self.ctx.downlink_pending.len(),
-                self.ctx.downlink_inflight_permit_bytes(),
-            ),
-        }
-    }
 }
 
 /// Async remote-open 在飞期间 `uplink_buffer` 字节上限（防 OOM）。1000 连接×此上限 ≈ 256MB 上界，
@@ -4099,149 +3711,6 @@ impl DownlinkAdmissionOrigin {
 
     fn for_flow(self, d16_flow: bool) -> Self {
         if d16_flow { self } else { Self::Legacy }
-    }
-}
-
-fn flush_downlink(
-    handle: SocketHandle,
-    tcp_socket: &mut TcpSocket,
-    ctx: &mut SocketCtx,
-    max_bytes_per_flush: usize,
-    downlink_backpressure: DownlinkBackpressureConfig,
-    tun_mtu: usize,
-    downlink_egress_drop_debt: &mut DownlinkEgressDropDebt,
-) -> DownlinkFlushOutcome {
-    if ctx.downlink_pending.is_empty() {
-        return DownlinkFlushOutcome {
-            accepted_bytes: 0,
-            headroom_limited: false,
-        };
-    }
-    let send_window = TcpSendWindowSnapshot::from_socket(tcp_socket);
-    ctx.downlink_diag
-        .note_send_window(send_window, ctx.downlink_pending.len());
-    if !send_window.can_send {
-        ctx.downlink_diag
-            .note_flush_attempt(ctx.downlink_pending.len(), max_bytes_per_flush);
-        ctx.downlink_diag
-            .note_no_send_capacity(ctx.downlink_pending.len());
-        return DownlinkFlushOutcome {
-            accepted_bytes: 0,
-            headroom_limited: false,
-        };
-    }
-    let controlled_max_bytes_per_flush = ctx.downlink_credit_controller.flush_budget(
-        max_bytes_per_flush,
-        downlink_backpressure,
-        tun_mtu,
-    );
-    let flush_policy = downlink_flush_policy_for_ctx(ctx);
-    let mut flush_limit = bounded_downlink_flush_limit_for_window_with_clock_drop_and_policy(
-        ctx.downlink_pending.len(),
-        controlled_max_bytes_per_flush,
-        send_window,
-        downlink_backpressure,
-        &mut ctx.downlink_egress_clock,
-        downlink_egress_drop_debt,
-        flush_policy,
-    );
-    if ctx.pending_relay_close.is_some()
-        && !ctx.local_eof_sent
-        && flush_policy.allows_close_drain_expansion()
-    {
-        let expanded = close_drain_terminal_pending_flush_limit(
-            ctx.downlink_pending.len(),
-            max_bytes_per_flush,
-            send_window,
-            downlink_backpressure,
-            flush_limit,
-        );
-        if expanded.len > flush_limit.len {
-            tcp_diag_log!(
-                "🔎 tcp-close-drain-flush-credit handle={:?} pending={} send_queue={} len={} clean_high={} target_high={} credit_high={} pause_high={} target_deferred={}",
-                handle,
-                ctx.downlink_pending.len(),
-                send_window.send_queue,
-                expanded.len,
-                tx_queue_flush_threshold(downlink_backpressure),
-                tx_queue_egress_target_threshold(downlink_backpressure),
-                tx_queue_credit_spend_threshold(downlink_backpressure),
-                tx_queue_pause_threshold(downlink_backpressure),
-                expanded.hard_edge_guard_deferred_bytes
-            );
-            flush_limit = expanded;
-        }
-    }
-    ctx.downlink_diag.note_flush_limit(
-        ctx.downlink_pending.len(),
-        controlled_max_bytes_per_flush,
-        flush_limit,
-    );
-    if flush_limit.len == 0 {
-        let used =
-            ctx.downlink_egress_clock
-                .note_flush_result(send_window.send_queue, 0, flush_limit);
-        ctx.downlink_diag.note_drain_credit_used(used);
-        ctx.downlink_credit_controller
-            .note_flush_feedback_with_accepted(flush_limit, 0, downlink_backpressure, tun_mtu);
-        return DownlinkFlushOutcome {
-            accepted_bytes: 0,
-            headroom_limited: flush_limit.headroom_limited,
-        };
-    }
-    let flush_len = flush_limit.len;
-    match tcp_socket.send_slice(&ctx.downlink_pending[..flush_len]) {
-        Ok(0) => {
-            let used =
-                ctx.downlink_egress_clock
-                    .note_flush_result(send_window.send_queue, 0, flush_limit);
-            ctx.downlink_diag.note_drain_credit_used(used);
-            ctx.downlink_diag
-                .note_send_slice_ok(0, ctx.downlink_pending.len());
-            ctx.downlink_credit_controller
-                .note_flush_feedback_with_accepted(flush_limit, 0, downlink_backpressure, tun_mtu);
-            DownlinkFlushOutcome {
-                accepted_bytes: 0,
-                headroom_limited: flush_limit.headroom_limited,
-            }
-        }
-        Ok(n) => {
-            let used =
-                ctx.downlink_egress_clock
-                    .note_flush_result(send_window.send_queue, n, flush_limit);
-            ctx.downlink_diag.note_drain_credit_used(used);
-            ctx.admit_downlink_pending_prefix(n);
-            ctx.downlink_diag
-                .note_send_slice_ok(n, ctx.downlink_pending.len());
-            ctx.downlink_credit_controller
-                .note_flush_feedback_with_accepted(flush_limit, n, downlink_backpressure, tun_mtu);
-            DownlinkFlushOutcome {
-                accepted_bytes: n,
-                headroom_limited: flush_limit.headroom_limited,
-            }
-        }
-        Err(_) => {
-            let used =
-                ctx.downlink_egress_clock
-                    .note_flush_result(send_window.send_queue, 0, flush_limit);
-            ctx.downlink_diag.note_drain_credit_used(used);
-            tcp_diag_log!(
-                "🔎 tcp-send-slice-error handle={:?} pending={} state={:?} → clear",
-                handle,
-                ctx.downlink_pending.len(),
-                ctx.state
-            );
-            ctx.downlink_diag.note_send_slice_error();
-            // socket 不可发（已关闭/复位）：丢弃残留，避免无限堆积。
-            ctx.clear_downlink_pending();
-            ctx.downlink_diag.note_pending(0);
-            ctx.downlink_credit_controller
-                .note_flush_feedback_with_accepted(flush_limit, 0, downlink_backpressure, tun_mtu);
-            DownlinkFlushOutcome {
-                accepted_bytes: 0,
-                headroom_limited: flush_limit.headroom_limited,
-            }
-        }
     }
 }
 
@@ -5984,131 +5453,6 @@ impl LocalEgressPressureSnapshot {
     }
 }
 
-fn release_downlink_inflight_permits_for_observed_drain(
-    ctx: &mut SocketCtx,
-    send_queue_before: usize,
-    send_queue_after: usize,
-) -> usize {
-    let drained = send_queue_before.saturating_sub(send_queue_after);
-    if drained == 0 {
-        return 0;
-    }
-    ctx.release_downlink_inflight_permits(drained)
-}
-
-fn capture_dirty_send_queues(
-    dirty: &HashSet<SocketHandle>,
-    sockets: &SocketSet<'static>,
-) -> Vec<(SocketHandle, usize)> {
-    dirty
-        .iter()
-        .copied()
-        .map(|handle| {
-            let send_queue = sockets.get::<TcpSocket>(handle).send_queue();
-            (handle, send_queue)
-        })
-        .collect()
-}
-
-fn release_dirty_downlink_inflight_permits_for_send_queue_drain(
-    before: &[(SocketHandle, usize)],
-    sockets: &SocketSet<'static>,
-    socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
-) -> usize {
-    let mut released = 0usize;
-    for (handle, send_queue_before) in before {
-        let send_queue_after = sockets.get::<TcpSocket>(*handle).send_queue();
-        let Some(ctx) = socket_ctxs.get_mut(handle) else {
-            continue;
-        };
-        released = released.saturating_add(release_downlink_inflight_permits_for_observed_drain(
-            ctx,
-            *send_queue_before,
-            send_queue_after,
-        ));
-    }
-    released
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct TunFlushPermitRelease {
-    flushed_tcp_payload_bytes: usize,
-    released_inflight_permit_bytes: usize,
-}
-
-fn endpoint_ipv4(endpoint: IpEndpoint) -> Option<(Ipv4Addr, u16)> {
-    let std::net::IpAddr::V4(addr) = std::net::IpAddr::from(endpoint.addr) else {
-        return None;
-    };
-    Some((addr, endpoint.port))
-}
-
-fn flushed_tcp_packet_matches_endpoint_pair(
-    packet: TunFlushedTcpPacket,
-    local: Option<IpEndpoint>,
-    remote: Option<IpEndpoint>,
-) -> bool {
-    let Some((local_addr, local_port)) = local.and_then(endpoint_ipv4) else {
-        return false;
-    };
-    let Some((remote_addr, remote_port)) = remote.and_then(endpoint_ipv4) else {
-        return false;
-    };
-    packet.src_addr == local_addr
-        && packet.src_port == local_port
-        && packet.dst_addr == remote_addr
-        && packet.dst_port == remote_port
-}
-
-fn flushed_tcp_packet_matches_socket(packet: TunFlushedTcpPacket, socket: &TcpSocket<'_>) -> bool {
-    flushed_tcp_packet_matches_endpoint_pair(
-        packet,
-        socket.local_endpoint(),
-        socket.remote_endpoint(),
-    )
-}
-
-fn release_downlink_inflight_permits_for_flushed_tcp_packets(
-    packets: Vec<TunFlushedTcpPacket>,
-    sockets: &SocketSet<'_>,
-    socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
-) -> TunFlushPermitRelease {
-    let mut release = TunFlushPermitRelease::default();
-    if packets.is_empty() {
-        return release;
-    }
-    let handles_with_inflight: Vec<SocketHandle> = socket_ctxs
-        .iter()
-        .filter_map(|(handle, ctx)| (ctx.downlink_inflight_permit_bytes() > 0).then_some(*handle))
-        .collect();
-    if handles_with_inflight.is_empty() {
-        release.flushed_tcp_payload_bytes = packets
-            .iter()
-            .map(|packet| packet.payload_bytes)
-            .sum::<usize>();
-        return release;
-    }
-
-    for packet in packets {
-        release.flushed_tcp_payload_bytes = release
-            .flushed_tcp_payload_bytes
-            .saturating_add(packet.payload_bytes);
-        let Some(handle) = handles_with_inflight.iter().copied().find(|handle| {
-            let socket = sockets.get::<TcpSocket>(*handle);
-            flushed_tcp_packet_matches_socket(packet, socket)
-        }) else {
-            continue;
-        };
-        let Some(ctx) = socket_ctxs.get_mut(&handle) else {
-            continue;
-        };
-        release.released_inflight_permit_bytes = release
-            .released_inflight_permit_bytes
-            .saturating_add(ctx.release_downlink_inflight_permits(packet.payload_bytes));
-    }
-    release
-}
-
 #[derive(Debug, Default, Clone)]
 struct LocalEgressServiceDiag {
     windows: u64,
@@ -6955,6 +6299,7 @@ fn endpoint_window_v1_local_uplink_window_bytes() -> usize {
 /// TUIC 出口配置走 `MINI_VPN_TUIC_*`（见 tuic.rs），不在这里。
 #[derive(Debug, Clone)]
 pub struct TunRuntimeConfig {
+    native_limits: Option<runtime_environment::NativeLimits>,
     relay_policy: Arc<RelayFamilyPolicy>,
     pub listener: TunListenerConfig,
     /// 刀14c：本进程创建 TUN 时使用的 IP MTU，同时喂给 smoltcp DeviceCapabilities。
@@ -6999,6 +6344,7 @@ impl TunRuntimeConfig {
         );
         let listener_pool_size = listener.pool_size;
         Ok(Self {
+            native_limits: None,
             relay_policy: Arc::new(RelayFamilyPolicy::default()),
             listener,
             tun_mtu: DEFAULT_TUN_MTU,
@@ -7073,95 +6419,7 @@ impl TunRuntimeConfig {
         )
     }
 
-    /// Read config from process environment
-    /// （`MINI_VPN_TUN_POOL_SIZE` + `MINI_VPN_METRICS_SECS` + `MINI_VPN_PROFILE_LOOP`
-    /// + downlink backpressure watermarks + TCP socket buffers）。
-    fn from_env_with_relay_policy(policy: Arc<RelayFamilyPolicy>) -> Result<Self, ClientError> {
-        let mut cfg = Self::from_sources(std::env::var("MINI_VPN_TUN_POOL_SIZE").ok().as_deref())?;
-        cfg.tun_mtu = parse_tun_mtu(std::env::var("MINI_VPN_TUN_MTU").ok().as_deref());
-        cfg.tun_tx_queue_len =
-            parse_tun_tx_queue_len(std::env::var("MINI_VPN_TUN_TX_QUEUE_LEN").ok().as_deref());
-        cfg.metrics_secs =
-            parse_metrics_secs(std::env::var("MINI_VPN_METRICS_SECS").ok().as_deref());
-        cfg.profile_loop =
-            parse_profile_loop(std::env::var("MINI_VPN_PROFILE_LOOP").ok().as_deref());
-        let tcp_rx_buffer = std::env::var("MINI_VPN_TCP_RX_BUFFER_BYTES").ok();
-        let tcp_tx_buffer = std::env::var("MINI_VPN_TCP_TX_BUFFER_BYTES").ok();
-        cfg.tcp_socket_buffers =
-            parse_tcp_socket_buffer_config(tcp_rx_buffer.as_deref(), tcp_tx_buffer.as_deref());
-        let downlink_backpressure_high =
-            std::env::var("MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES").ok();
-        let downlink_backpressure_low =
-            std::env::var("MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES").ok();
-        cfg.downlink_backpressure = parse_downlink_backpressure_config_for_tx_buffer(
-            downlink_backpressure_high.as_deref(),
-            downlink_backpressure_low.as_deref(),
-            cfg.tcp_socket_buffers.tx_bytes,
-            cfg.tun_mtu,
-            cfg.tun_tx_queue_len,
-        );
-        cfg.downlink_flush_max_bytes = parse_downlink_flush_max_bytes(
-            std::env::var("MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES")
-                .ok()
-                .as_deref(),
-        );
-        cfg.downlink_egress_immediate_bytes = parse_downlink_egress_immediate_bytes(
-            std::env::var("MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES")
-                .ok()
-                .as_deref(),
-        );
-        cfg.tun_rx_drain_budget = parse_tun_rx_drain_budget(
-            std::env::var("MINI_VPN_TUN_RX_DRAIN_BUDGET")
-                .ok()
-                .as_deref(),
-        );
-        cfg.tun_rx_active_flow_timer_ms = parse_tun_rx_active_flow_timer_ms(
-            std::env::var("MINI_VPN_TUN_RX_ACTIVE_FLOW_TIMER_MS")
-                .ok()
-                .as_deref(),
-        );
-        cfg.bounded_global_rx_receive_window = parse_trace(
-            std::env::var("MINI_VPN_BOUNDED_GLOBAL_RX_RECEIVE_WINDOW")
-                .ok()
-                .as_deref(),
-        );
-        let buffered_downlink_enabled =
-            parse_trace(std::env::var("MINI_VPN_BUFFERED_DOWNLINK").ok().as_deref());
-        cfg.buffered_downlink = BufferedDownlinkConfig::from_backpressure(
-            buffered_downlink_enabled,
-            cfg.downlink_backpressure,
-            cfg.listener.pool_size,
-        );
-        cfg.d3_egress_actor =
-            parse_d3_egress_actor(std::env::var("MINI_VPN_D3_EGRESS_ACTOR").ok().as_deref());
-        cfg.d3_egress_actor_adaptive_credit = parse_d3_egress_actor_adaptive_credit(
-            std::env::var("MINI_VPN_D3_EGRESS_ACTOR_ADAPTIVE_CREDIT")
-                .ok()
-                .as_deref(),
-        );
-        cfg.d3_egress_actor_legacy_credit = parse_d3_egress_actor_legacy_credit(
-            std::env::var("MINI_VPN_D3_EGRESS_ACTOR_LEGACY_CREDIT")
-                .ok()
-                .as_deref(),
-        );
-        cfg.d3_egress_actor_self_wake = parse_d3_egress_actor_self_wake(
-            std::env::var("MINI_VPN_D3_EGRESS_ACTOR_SELF_WAKE")
-                .ok()
-                .as_deref(),
-        );
-        cfg.d4_stalled_read_service = parse_d4_stalled_read_service(
-            std::env::var("MINI_VPN_D4_STALLED_READ_SERVICE")
-                .ok()
-                .as_deref(),
-        );
-        cfg.d5_capacity_backpressure = parse_d5_capacity_backpressure(
-            std::env::var("MINI_VPN_D5_CAPACITY_BACKPRESSURE")
-                .ok()
-                .as_deref(),
-        );
-        cfg = cfg.with_relay_policy(policy);
-        Ok(cfg)
-    }
+
 }
 
 /// 解析 `MINI_VPN_METRICS_SECS`：默认 [`METRICS_SNAPSHOT_SECS`]；**0/非数字一律回落默认**
@@ -7238,7 +6496,7 @@ async fn process_dirty_relay<U, M>(
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
     upstream: &Arc<U>,
     handshake_done_tx: &OpenDispatch,
-    global_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
+    global_tx: &crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
     owned_action_tx: &mpsc::Sender<OwnedActionEvent>,
     fake_pool: &mut FakeIpPool,
     now_secs: u64,
@@ -7646,75 +6904,6 @@ fn resolve_target(endpoint: smoltcp::wire::IpEndpoint, fake_pool: &FakeIpPool) -
     }
 }
 
-/// Drain the currently available local payload from one listener slot.
-/// 中文要点：这里只负责把 smoltcp 缓冲区里的数据取出来，不做任何异步外联动作。
-fn extract_socket_payload(socket: &mut TcpSocket<'_>) -> Option<Vec<u8>> {
-    if !socket.can_recv() {
-        return None;
-    }
-
-    let mut payload = None;
-    socket
-        .recv(|data| {
-            payload = Some(data.to_vec());
-            (data.len(), ())
-        })
-        .unwrap();
-    payload
-}
-
-enum EstablishedUplink {
-    NotEstablished,
-    Handled,
-    Closed,
-}
-
-fn pump_established_uplink(
-    ctx: &mut SocketCtx,
-    tcp_state: TcpState,
-    now_secs: u64,
-    mut next_payload: impl FnMut() -> Option<Vec<u8>>,
-) -> EstablishedUplink {
-    let Some(tx) = ctx.uplink_tx.as_mut() else {
-        return EstablishedUplink::NotEstablished;
-    };
-
-    for _ in 0..MAX_ESTABLISHED_UPLINK_BATCH {
-        match tx.try_reserve() {
-            Ok(permit) => {
-                if let Some(payload) = next_payload() {
-                    permit.send(RelayCommand::Data(payload));
-                    ctx.state = SocketState::Relaying;
-                } else {
-                    if tcp_state == TcpState::CloseWait && !ctx.local_fin_sent {
-                        let pending_since =
-                            *ctx.local_fin_pending_since_secs.get_or_insert(now_secs);
-                        let deadline_base = ctx
-                            .local_fin_last_remote_progress_secs
-                            .unwrap_or(pending_since)
-                            .max(pending_since);
-                        if now_secs.saturating_sub(deadline_base) >= LOCAL_FINISH_DEFER_SECS {
-                            permit.send(RelayCommand::Finish);
-                            ctx.local_fin_sent = true;
-                            ctx.local_fin_pending_since_secs = None;
-                            ctx.local_fin_last_remote_progress_secs = None;
-                        }
-                    }
-                    return EstablishedUplink::Handled;
-                }
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                return EstablishedUplink::Handled;
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                return EstablishedUplink::Closed;
-            }
-        }
-    }
-
-    EstablishedUplink::Handled
-}
-
 /// Protocol-owned uplink pump. `peek` determines the exact contiguous extent
 /// without consuming it; the flow port then reserves both its message slot
 /// and exact replay bytes before the extractor dequeues anything from smoltcp.
@@ -7877,7 +7066,7 @@ fn handle_handshake_done(
     done: HandshakeDone,
     sockets: &mut SocketSet<'_>,
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
-    global_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
+    global_tx: &crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
     owned_action_tx: &mpsc::Sender<OwnedActionEvent>,
     fake_pool: &mut FakeIpPool,
     now_secs: u64,
@@ -8389,8 +7578,8 @@ fn spawn_remote_relay(
     handle: SocketHandle,
     epoch: u64,
     relay: OpenedTcpRelay,
-    rx: mpsc::Receiver<RelayCommand>,
-    back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
+    rx: crate::client_tun::uplink::Receiver,
+    back_tx: crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
     metrics_handle: &Metrics,
     downlink_backpressure: DownlinkBackpressureConfig,
     initial_read_credit: RelayReadCredit,
@@ -8430,8 +7619,7 @@ fn spawn_remote_relay(
             tokio::spawn(run_relay_d16(
                 handle,
                 epoch,
-                native.reader,
-                native.writer,
+                native,
                 rx,
                 back_tx,
                 read_credit_rx,
@@ -8448,8 +7636,7 @@ fn spawn_remote_relay(
                     tokio::spawn(run_relay_native_chunk(
                         handle,
                         epoch,
-                        native.reader,
-                        native.writer,
+                        native,
                         rx,
                         back_tx,
                         read_credit_rx,
@@ -8463,8 +7650,7 @@ fn spawn_remote_relay(
                     tokio::spawn(run_relay_native_permit(
                         handle,
                         epoch,
-                        native.reader,
-                        native.writer,
+                        native,
                         rx,
                         back_tx,
                         read_credit_rx,
@@ -8571,7 +7757,7 @@ struct ThinRelayPayload {
 async fn dispatch_thin_payload_to_main(
     handle: SocketHandle,
     payload: ThinRelayPayload,
-    back_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
+    back_tx: &crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
     diag: &mut RelayTaskDiag,
     global_rx_pressure_threshold: std::time::Duration,
 ) -> Result<(), RelayCloseReason> {
@@ -8581,8 +7767,8 @@ async fn dispatch_thin_payload_to_main(
     let permit_result = back_tx.reserve().await;
     let waited = wait_started.elapsed();
     diag.note_global_rx_wait(waited, global_rx_pressure_threshold);
-    let Ok(permit) = permit_result else {
-        return Err(("remote_to_local", "global_rx_closed"));
+    let permit = match permit_result {
+        Ok(permit) => permit, Err(error) => return Err(("remote_to_local", error.reason())),
     };
     note_global_rx_channel_occupancy(diag, back_tx);
     let mut stream_service_window = payload.stream_service_window;
@@ -8593,7 +7779,7 @@ async fn dispatch_thin_payload_to_main(
         handle,
         RelayEvent::Data {
             epoch: payload.epoch,
-            bytes: payload.payload,
+            bytes: payload.payload.into(),
             stream_service_window,
             downstream_permit: None,
         },
@@ -8920,7 +8106,7 @@ async fn run_relay_thin_reader(
 
 async fn run_thin_relay_dispatcher(
     handle: SocketHandle,
-    back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
+    back_tx: crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
     mut thin_rx: mpsc::Receiver<ThinRelayPayload>,
 ) {
     let mut diag = RelayTaskDiag::default();
@@ -8943,6 +8129,7 @@ async fn run_thin_relay_dispatcher(
 
 fn continuous_queue_push_close_reason(err: ByteQueuePushError) -> RelayCloseReason {
     match err {
+        ByteQueuePushError::Capacity(_) => ("remote_to_local", "continuous_queue_capacity"),
         ByteQueuePushError::Closed => ("remote_to_local", "continuous_queue_closed"),
         ByteQueuePushError::Full { .. } => ("remote_to_local", "continuous_queue_full"),
         ByteQueuePushError::EmptyChunk => ("remote_to_local", "continuous_queue_empty_chunk"),
@@ -8953,144 +8140,6 @@ fn continuous_queue_push_close_reason(err: ByteQueuePushError) -> RelayCloseReas
 }
 
 const NATIVE_TCP_REASSEMBLY_MAX_BYTES: usize = 4 * 1024 * 1024;
-const NATIVE_TCP_GAP_LOG_MS: u128 = 1_000;
-
-#[derive(Debug, Default)]
-struct NativeTcpChunkAssembler {
-    next_offset: u64,
-    chunks: BTreeMap<u64, Bytes>,
-    buffered_bytes: usize,
-    max_buffered_bytes: usize,
-    raw_chunks: u64,
-    raw_bytes: u64,
-    out_of_order_chunks: u64,
-    max_gap_bytes: u64,
-    cap_hits: u64,
-    last_gap_log_at: Option<std::time::Instant>,
-}
-
-impl NativeTcpChunkAssembler {
-    fn buffered_bytes(&self) -> usize {
-        self.buffered_bytes
-    }
-
-    fn push_chunk(&mut self, chunk: NativeTcpChunk) {
-        let mut offset = chunk.offset;
-        let mut bytes = chunk.bytes;
-        if bytes.is_empty() {
-            return;
-        }
-        let end = offset.saturating_add(bytes.len() as u64);
-        if end <= self.next_offset {
-            return;
-        }
-        if offset < self.next_offset {
-            let trim = (self.next_offset - offset) as usize;
-            bytes = bytes.slice(trim..);
-            offset = self.next_offset;
-        }
-        let gap = offset.saturating_sub(self.next_offset);
-        self.raw_chunks = self.raw_chunks.saturating_add(1);
-        self.raw_bytes = self.raw_bytes.saturating_add(bytes.len() as u64);
-        if gap > 0 {
-            self.out_of_order_chunks = self.out_of_order_chunks.saturating_add(1);
-            self.max_gap_bytes = self.max_gap_bytes.max(gap);
-        }
-        if let Some(old) = self.chunks.get(&offset)
-            && old.len() >= bytes.len()
-        {
-            return;
-        }
-        if let Some(old) = self.chunks.insert(offset, bytes.clone()) {
-            self.buffered_bytes = self.buffered_bytes.saturating_sub(old.len());
-        }
-        self.buffered_bytes = self.buffered_bytes.saturating_add(bytes.len());
-        self.max_buffered_bytes = self.max_buffered_bytes.max(self.buffered_bytes);
-    }
-
-    fn drain_ordered_up_to(&mut self, limit: usize) -> Option<Bytes> {
-        if limit == 0 {
-            return None;
-        }
-        let mut remaining = limit;
-        let mut out = BytesMut::new();
-        while remaining > 0 {
-            let Some((&offset, _)) = self.chunks.first_key_value() else {
-                break;
-            };
-            if offset > self.next_offset {
-                break;
-            }
-            let Some((_, mut bytes)) = self.chunks.remove_entry(&offset) else {
-                break;
-            };
-            self.buffered_bytes = self.buffered_bytes.saturating_sub(bytes.len());
-            if offset < self.next_offset {
-                let trim = (self.next_offset - offset) as usize;
-                if trim >= bytes.len() {
-                    continue;
-                }
-                bytes = bytes.slice(trim..);
-            }
-            let n = bytes.len().min(remaining);
-            out.extend_from_slice(&bytes[..n]);
-            self.next_offset = self.next_offset.saturating_add(n as u64);
-            remaining -= n;
-            if n < bytes.len() {
-                let rest = bytes.slice(n..);
-                self.buffered_bytes = self.buffered_bytes.saturating_add(rest.len());
-                self.chunks.insert(self.next_offset, rest);
-                break;
-            }
-        }
-        if out.is_empty() {
-            None
-        } else {
-            Some(out.freeze())
-        }
-    }
-
-    fn note_cap_hit(&mut self) {
-        self.cap_hits = self.cap_hits.saturating_add(1);
-    }
-
-    fn maybe_log_gap(&mut self, handle: SocketHandle, epoch: u64, reason: &'static str) {
-        let Some((&chunk_offset, chunk)) = self.chunks.first_key_value() else {
-            return;
-        };
-        if chunk_offset <= self.next_offset {
-            return;
-        }
-        let now = std::time::Instant::now();
-        if self
-            .last_gap_log_at
-            .map(|last| now.saturating_duration_since(last).as_millis() < NATIVE_TCP_GAP_LOG_MS)
-            .unwrap_or(false)
-        {
-            return;
-        }
-        self.last_gap_log_at = Some(now);
-        tcp_diag_log!(
-            "🔎 tcp-native-chunk-gap handle={:?} epoch={} reason={} next_offset={} first_chunk_offset={} first_chunk_bytes={} gap_bytes={} max_gap_bytes={} buffered={}B buffered_chunks={} max_buffered={}B raw_chunks={} raw_bytes={} out_of_order_chunks={} cap_hits={} cap={}B",
-            handle,
-            epoch,
-            reason,
-            self.next_offset,
-            chunk_offset,
-            chunk.len(),
-            chunk_offset.saturating_sub(self.next_offset),
-            self.max_gap_bytes,
-            self.buffered_bytes,
-            self.chunks.len(),
-            self.max_buffered_bytes,
-            self.raw_chunks,
-            self.raw_bytes,
-            self.out_of_order_chunks,
-            self.cap_hits,
-            NATIVE_TCP_REASSEMBLY_MAX_BYTES
-        );
-    }
-}
 
 async fn poll_native_tcp_chunk(
     remote_reader: &mut NativeTcpReadHalf,
@@ -9137,712 +8186,9 @@ async fn push_native_ordered_leased_payload(
     Ok(send_relay_reader_progress(signal_tx, diag))
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_relay_native_chunk_reader(
-    handle: SocketHandle,
-    epoch: u64,
-    mut remote_reader: NativeTcpReadHalf,
-    queue: AsyncByteBoundedFlowQueue,
-    mut read_credit_rx: watch::Receiver<RelayReadCredit>,
-    signal_tx: mpsc::Sender<RelayReaderSignal>,
-    local_finish_seen: Arc<std::sync::atomic::AtomicBool>,
-    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
-    native_read_service_floor: bool,
-) {
-    let mut diag = RelayTaskDiag::default();
-    let mut read_credit = *read_credit_rx.borrow();
-    diag.note_read_credit(read_credit);
-    let mut assembler = NativeTcpChunkAssembler::default();
-    let queue_wait_threshold = std::time::Duration::from_millis(5);
-    loop {
-        note_reader_local_finish_if_needed(&local_finish_seen, &mut diag);
-        drain_relay_read_credit_updates(&mut read_credit_rx, &mut read_credit, &mut diag);
-        let read_credit_limit =
-            native_tcp_read_service_limit(read_credit, native_read_service_floor);
-        if read_credit_limit == 0 {
-            if read_credit.paused {
-                log_native_tcp_read_credit_pause(handle, epoch, "native_chunk_pump", &diag);
-            }
-            let update = tokio::select! {
-                _ = &mut stop_rx => {
-                    queue.close().await;
-                    return;
-                }
-                update = read_credit_rx.changed() => update,
-            };
-            if update.is_err() {
-                queue.close().await;
-                return;
-            }
-            read_credit = *read_credit_rx.borrow_and_update();
-            diag.note_read_credit(read_credit);
-            continue;
-        }
-        let queue_wait_started = std::time::Instant::now();
-        let read_len = tokio::select! {
-            _ = &mut stop_rx => {
-                queue.close().await;
-                return;
-            }
-            result = queue.wait_read_len(read_credit_limit) => {
-                match result {
-                    Ok(read_len) => {
-                        let waited = queue_wait_started.elapsed();
-                        diag.note_continuous_queue_wait(waited, queue_wait_threshold);
-                        if waited >= queue_wait_threshold {
-                            tcp_diag_log!(
-                                "🔎 tcp-native-queue-wait handle={:?} epoch={} wait_us={} read_len={} wait_events={}",
-                                handle,
-                                epoch,
-                                waited.as_micros(),
-                                read_len,
-                                diag.continuous_queue_wait_events
-                            );
-                        }
-                        read_len
-                    }
-                    Err(_) => return,
-                }
-            }
-        };
-        if read_len == 0 {
-            continue;
-        }
-        if let Some(payload) = assembler.drain_ordered_up_to(read_len) {
-            match push_native_ordered_payload(handle, epoch, payload, &queue, &signal_tx, &mut diag)
-                .await
-            {
-                Ok(true) => continue,
-                Ok(false) => {
-                    queue.close().await;
-                    return;
-                }
-                Err((direction, reason)) => {
-                    send_relay_reader_close(&signal_tx, direction, reason, diag).await;
-                    return;
-                }
-            }
-        }
 
-        let available_reassembly = NATIVE_TCP_REASSEMBLY_MAX_BYTES
-            .saturating_sub(assembler.buffered_bytes())
-            .max(1);
-        let native_read_len = read_len.min(available_reassembly);
-        if assembler.buffered_bytes() >= NATIVE_TCP_REASSEMBLY_MAX_BYTES {
-            assembler.note_cap_hit();
-            assembler.maybe_log_gap(handle, epoch, "cap");
-        }
-        diag.note_remote_read_service_tick(native_read_len);
-        let chunk = tokio::select! {
-            _ = &mut stop_rx => {
-                queue.close().await;
-                return;
-            }
-            chunk = poll_native_tcp_chunk(&mut remote_reader, native_read_len) => chunk,
-        };
-        match chunk {
-            Ok(Some(chunk)) => {
-                diag.note_remote_raw_read(chunk.bytes.len());
-                assembler.push_chunk(chunk);
-                if let Some(payload) = assembler.drain_ordered_up_to(read_len) {
-                    match push_native_ordered_payload(
-                        handle, epoch, payload, &queue, &signal_tx, &mut diag,
-                    )
-                    .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            queue.close().await;
-                            return;
-                        }
-                        Err((direction, reason)) => {
-                            send_relay_reader_close(&signal_tx, direction, reason, diag).await;
-                            return;
-                        }
-                    }
-                } else {
-                    assembler.maybe_log_gap(handle, epoch, "gap");
-                }
-            }
-            Ok(None) => {
-                println!("远端服务器关闭了车厢 {:?}", handle);
-                if let Some(payload) = assembler.drain_ordered_up_to(read_len) {
-                    let _ = push_native_ordered_payload(
-                        handle, epoch, payload, &queue, &signal_tx, &mut diag,
-                    )
-                    .await;
-                }
-                queue.close().await;
-                send_relay_reader_close(&signal_tx, "remote_to_local", "remote_eof", diag).await;
-                return;
-            }
-            Err(e) => {
-                println!(
-                    "读取上游流失败 direction=remote_to_local handle={:?} err={:?}",
-                    handle, e
-                );
-                queue.close().await;
-                send_relay_reader_close(&signal_tx, "remote_to_local", "remote_read_failed", diag)
-                    .await;
-                return;
-            }
-        }
-    }
-}
 
-#[allow(clippy::too_many_arguments)]
-async fn run_relay_native_permit_reader(
-    handle: SocketHandle,
-    epoch: u64,
-    mut remote_reader: NativeTcpReadHalf,
-    queue: AsyncLeasedByteFlowQueue,
-    mut read_credit_rx: watch::Receiver<RelayReadCredit>,
-    signal_tx: mpsc::Sender<RelayReaderSignal>,
-    local_finish_seen: Arc<std::sync::atomic::AtomicBool>,
-    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
-    native_read_service_floor: bool,
-) {
-    let mut diag = RelayTaskDiag::default();
-    let mut read_credit = *read_credit_rx.borrow();
-    diag.note_read_credit(read_credit);
-    let mut assembler = NativeTcpChunkAssembler::default();
-    let queue_wait_threshold = std::time::Duration::from_millis(5);
-    loop {
-        note_reader_local_finish_if_needed(&local_finish_seen, &mut diag);
-        drain_relay_read_credit_updates(&mut read_credit_rx, &mut read_credit, &mut diag);
-        let read_credit_limit =
-            native_tcp_read_service_limit(read_credit, native_read_service_floor);
-        if read_credit_limit == 0 {
-            if read_credit.paused {
-                log_native_tcp_read_credit_pause(handle, epoch, "native_permit_pump", &diag);
-            }
-            let update = tokio::select! {
-                _ = &mut stop_rx => {
-                    queue.close().await;
-                    return;
-                }
-                update = read_credit_rx.changed() => update,
-            };
-            if update.is_err() {
-                queue.close().await;
-                return;
-            }
-            read_credit = *read_credit_rx.borrow_and_update();
-            diag.note_read_credit(read_credit);
-            continue;
-        }
-        let queue_wait_started = std::time::Instant::now();
-        let read_len = tokio::select! {
-            _ = &mut stop_rx => {
-                queue.close().await;
-                return;
-            }
-            result = queue.wait_read_len(read_credit_limit) => {
-                match result {
-                    Ok(read_len) => {
-                        let waited = queue_wait_started.elapsed();
-                        diag.note_continuous_queue_wait(waited, queue_wait_threshold);
-                        if waited >= queue_wait_threshold {
-                            let snapshot = queue.snapshot().await;
-                            tcp_diag_log!(
-                                "🔎 tcp-native-permit-queue-wait handle={:?} epoch={} wait_us={} read_len={} queued_bytes={} leased_bytes={} capacity_bytes={} wait_events={}",
-                                handle,
-                                epoch,
-                                waited.as_micros(),
-                                read_len,
-                                snapshot.queued_bytes,
-                                snapshot.leased_bytes,
-                                snapshot.capacity_bytes,
-                                diag.continuous_queue_wait_events
-                            );
-                        }
-                        read_len
-                    }
-                    Err(_) => return,
-                }
-            }
-        };
-        if read_len == 0 {
-            continue;
-        }
-        if let Some(payload) = assembler.drain_ordered_up_to(read_len) {
-            match push_native_ordered_leased_payload(
-                handle, epoch, payload, &queue, &signal_tx, &mut diag,
-            )
-            .await
-            {
-                Ok(true) => continue,
-                Ok(false) => {
-                    queue.close().await;
-                    return;
-                }
-                Err((direction, reason)) => {
-                    send_relay_reader_close(&signal_tx, direction, reason, diag).await;
-                    return;
-                }
-            }
-        }
 
-        let available_reassembly = NATIVE_TCP_REASSEMBLY_MAX_BYTES
-            .saturating_sub(assembler.buffered_bytes())
-            .max(1);
-        let native_read_len = read_len.min(available_reassembly);
-        if assembler.buffered_bytes() >= NATIVE_TCP_REASSEMBLY_MAX_BYTES {
-            assembler.note_cap_hit();
-            assembler.maybe_log_gap(handle, epoch, "permit_cap");
-        }
-        diag.note_remote_read_service_tick(native_read_len);
-        let chunk = tokio::select! {
-            _ = &mut stop_rx => {
-                queue.close().await;
-                return;
-            }
-            chunk = poll_native_tcp_chunk(&mut remote_reader, native_read_len) => chunk,
-        };
-        match chunk {
-            Ok(Some(chunk)) => {
-                diag.note_remote_raw_read(chunk.bytes.len());
-                assembler.push_chunk(chunk);
-                if let Some(payload) = assembler.drain_ordered_up_to(read_len) {
-                    match push_native_ordered_leased_payload(
-                        handle, epoch, payload, &queue, &signal_tx, &mut diag,
-                    )
-                    .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            queue.close().await;
-                            return;
-                        }
-                        Err((direction, reason)) => {
-                            send_relay_reader_close(&signal_tx, direction, reason, diag).await;
-                            return;
-                        }
-                    }
-                } else {
-                    assembler.maybe_log_gap(handle, epoch, "permit_gap");
-                }
-            }
-            Ok(None) => {
-                println!("远端服务器关闭了车厢 {:?}", handle);
-                if let Some(payload) = assembler.drain_ordered_up_to(read_len) {
-                    let _ = push_native_ordered_leased_payload(
-                        handle, epoch, payload, &queue, &signal_tx, &mut diag,
-                    )
-                    .await;
-                }
-                queue.close().await;
-                send_relay_reader_close(&signal_tx, "remote_to_local", "remote_eof", diag).await;
-                return;
-            }
-            Err(e) => {
-                println!(
-                    "读取上游流失败 direction=remote_to_local handle={:?} err={:?}",
-                    handle, e
-                );
-                queue.close().await;
-                send_relay_reader_close(&signal_tx, "remote_to_local", "remote_read_failed", diag)
-                    .await;
-                return;
-            }
-        }
-    }
-}
-
-async fn send_d16_data_ready(
-    handle: SocketHandle,
-    epoch: u64,
-    back_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
-) -> bool {
-    back_tx
-        .send((handle, RelayEvent::DataReady { epoch }))
-        .await
-        .is_ok()
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_relay_d16(
-    handle: SocketHandle,
-    epoch: u64,
-    remote_reader: NativeTcpReadHalf,
-    remote_writer: NativeTcpWriteHalf,
-    rx: mpsc::Receiver<RelayCommand>,
-    back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
-    read_credit_rx: watch::Receiver<RelayReadCredit>,
-    queue: AsyncLeasedByteFlowQueue,
-) {
-    let (writer_signal_tx, mut writer_signal_rx) = mpsc::channel(8);
-    let (writer_stop_tx, writer_stop_rx) = tokio::sync::oneshot::channel();
-    let (reader_stop_tx, reader_stop_rx) = tokio::sync::oneshot::channel();
-    let (activity_tx, mut activity_rx) = mpsc::channel(1);
-    let mut reader_task = tokio::spawn(run_d16_native_reader(
-        handle,
-        epoch,
-        remote_reader,
-        queue.clone(),
-        read_credit_rx,
-        back_tx.clone(),
-        Some(activity_tx),
-        reader_stop_rx,
-    ));
-    let mut writer_task = tokio::spawn(run_relay_writer(
-        handle,
-        remote_writer,
-        rx,
-        writer_signal_tx,
-        writer_stop_rx,
-    ));
-    let mut close_timer = RelayCloseTimer::new();
-    let mut reader_done = false;
-    let mut writer_done = false;
-    let mut activity_open = true;
-    let mut writer_progress_events = 0u64;
-    let mut writer_progress_bytes = 0u64;
-    let mut writer_wait_max_us = 0u128;
-    let mut half_closed_idle_blocked_events = 0u64;
-    let mut half_closed_idle_blocked_max_payload_bytes = 0usize;
-    let mut half_closed_local_progress_bytes = None;
-    let terminal_error = loop {
-        tokio::select! {
-            activity = activity_rx.recv(), if !reader_done && activity_open => {
-                match activity {
-                    Some(()) => {
-                        close_timer.note_read_progress();
-                    }
-                    None => activity_open = false,
-                }
-            }
-            signal = writer_signal_rx.recv(), if !writer_done => {
-                match signal {
-                    Some(RelayWriterSignal::WritePending) => {
-                        close_timer.arm_stalled_write();
-                    }
-                    Some(RelayWriterSignal::Progress { bytes, write_wait }) => {
-                        writer_progress_events = writer_progress_events.saturating_add(1);
-                        writer_progress_bytes =
-                            writer_progress_bytes.saturating_add(bytes as u64);
-                        writer_wait_max_us = writer_wait_max_us.max(write_wait.as_micros());
-                        close_timer.note_write_progress();
-                    }
-                    Some(RelayWriterSignal::WriteCompleted) => {
-                        close_timer.complete_write();
-                    }
-                    Some(RelayWriterSignal::WriteHalfClosed { .. }) => {
-                        writer_done = true;
-                        half_closed_local_progress_bytes = None;
-                        close_timer.arm_half_closed();
-                        if reader_done {
-                            break None;
-                        }
-                    }
-                    Some(RelayWriterSignal::Closed { direction, reason }) => {
-                        writer_done = true;
-                        if reason == "local_channel_closed" {
-                            let queue_snapshot = queue.snapshot_now();
-                            if let Some(cause) = queue_snapshot.closure.terminal_cause() {
-                                break Some((cause.direction, cause.reason));
-                            }
-                            if queue_snapshot.closure.is_closed() {
-                                if reader_done {
-                                    break None;
-                                }
-                            } else {
-                                break Some((direction, reason));
-                            }
-                        } else {
-                            break Some((direction, reason));
-                        }
-                    }
-                    None => {
-                        break Some(("local_to_remote", "writer_task_closed"));
-                    }
-                }
-            }
-            result = &mut reader_task, if !reader_done => {
-                reader_done = true;
-                if result.is_err() {
-                    break Some(("remote_to_local", "reader_task_failed"));
-                }
-                if writer_done {
-                    break None;
-                }
-            }
-            _ = close_timer.wait(), if close_timer.is_armed() => {
-                if close_timer.is_half_closed() {
-                    let queue_snapshot = queue.snapshot_now();
-                    let payload_owned_bytes = queue_snapshot
-                        .queued_bytes
-                        .saturating_add(queue_snapshot.leased_bytes);
-                    if queue_snapshot.closure.terminal_cause().is_none()
-                        && payload_owned_bytes > 0
-                    {
-                        let previous_local_progress_bytes =
-                            half_closed_local_progress_bytes.unwrap_or(0);
-                        let first_owned_window = half_closed_local_progress_bytes.is_none();
-                        let made_local_progress = queue_snapshot.local_progress_bytes
-                            > previous_local_progress_bytes;
-                        if first_owned_window || made_local_progress {
-                            half_closed_local_progress_bytes =
-                                Some(queue_snapshot.local_progress_bytes);
-                            half_closed_idle_blocked_events =
-                                half_closed_idle_blocked_events.saturating_add(1);
-                            half_closed_idle_blocked_max_payload_bytes =
-                                half_closed_idle_blocked_max_payload_bytes.max(payload_owned_bytes);
-                            tcp_diag_log!(
-                                "🔎 tcp-d16-half-closed-idle-blocked handle={:?} epoch={} blocked_events={} payload_owned_bytes={} local_progress_bytes={} previous_local_progress_bytes={} queue_queued={} queue_leased={} queue_reserved={} queue_closed={}",
-                                handle,
-                                epoch,
-                                half_closed_idle_blocked_events,
-                                payload_owned_bytes,
-                                queue_snapshot.local_progress_bytes,
-                                previous_local_progress_bytes,
-                                queue_snapshot.queued_bytes,
-                                queue_snapshot.leased_bytes,
-                                queue_snapshot.reserved_bytes,
-                                queue_snapshot.closure.is_closed(),
-                            );
-                            close_timer.arm_half_closed();
-                            continue;
-                        }
-                    }
-                }
-                break Some(("timer", close_timer.terminal_reason()));
-            }
-        }
-    };
-
-    if let Some((direction, reason)) = terminal_error {
-        let _ = queue
-            .close_for_terminal_and_mark_ready(direction, reason)
-            .await;
-    }
-    let _ = reader_stop_tx.send(());
-    if terminal_error.is_some() && !reader_done {
-        if tokio::time::timeout(RELAY_WRITER_STOP_TIMEOUT, &mut reader_task)
-            .await
-            .is_err()
-        {
-            reader_task.abort();
-            let _ = (&mut reader_task).await;
-        }
-        reader_done = true;
-    }
-
-    if let Some((direction, reason)) = terminal_error {
-        let _ = back_tx
-            .send((
-                handle,
-                RelayEvent::Closed(RelayClose {
-                    epoch,
-                    direction,
-                    reason,
-                }),
-            ))
-            .await;
-    }
-    let _ = writer_stop_tx.send(());
-    if !reader_done
-        && tokio::time::timeout(RELAY_WRITER_STOP_TIMEOUT, &mut reader_task)
-            .await
-            .is_err()
-    {
-        reader_task.abort();
-        let _ = reader_task.await;
-    }
-    if tokio::time::timeout(RELAY_WRITER_STOP_TIMEOUT, &mut writer_task)
-        .await
-        .is_err()
-    {
-        writer_task.abort();
-        let _ = writer_task.await;
-    }
-    let queue_snapshot = queue.snapshot_now();
-    let (terminal_direction, terminal_reason) =
-        terminal_error.unwrap_or(("none", "clean_queue_lifecycle"));
-    tcp_diag_log!(
-        "🔎 tcp-d16-relay-close handle={:?} epoch={} terminal_direction={} terminal_reason={} writer_progress_events={} writer_progress_bytes={} writer_wait_max_us={} half_closed_idle_blocked_events={} half_closed_idle_blocked_max_payload_bytes={} queue_queued={} queue_leased={} queue_reserved={} queue_closed={}",
-        handle,
-        epoch,
-        terminal_direction,
-        terminal_reason,
-        writer_progress_events,
-        writer_progress_bytes,
-        writer_wait_max_us,
-        half_closed_idle_blocked_events,
-        half_closed_idle_blocked_max_payload_bytes,
-        queue_snapshot.queued_bytes,
-        queue_snapshot.leased_bytes,
-        queue_snapshot.reserved_bytes,
-        queue_snapshot.closure.is_closed(),
-    );
-}
-
-async fn run_d16_native_reader(
-    handle: SocketHandle,
-    epoch: u64,
-    mut remote_reader: NativeTcpReadHalf,
-    queue: AsyncLeasedByteFlowQueue,
-    mut read_credit_rx: watch::Receiver<RelayReadCredit>,
-    back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
-    activity_tx: Option<mpsc::Sender<()>>,
-    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
-) {
-    let mut read_credit = *read_credit_rx.borrow_and_update();
-    'reader: loop {
-        if read_credit.paused || read_credit.max_batch_bytes == 0 {
-            let update = tokio::select! {
-                _ = &mut stop_rx => {
-                    queue
-                        .close_for_terminal_and_mark_ready("local_to_remote", "reader_stopped")
-                        .await;
-                    return;
-                }
-                update = read_credit_rx.changed() => update,
-            };
-            if update.is_err() {
-                queue
-                    .close_for_terminal_and_mark_ready("local_to_remote", "read_credit_closed")
-                    .await;
-                return;
-            }
-            read_credit = *read_credit_rx.borrow_and_update();
-            continue;
-        }
-
-        let reservation = tokio::select! {
-            _ = &mut stop_rx => {
-                queue
-                    .close_for_terminal_and_mark_ready("local_to_remote", "reader_stopped")
-                    .await;
-                return;
-            }
-            update = read_credit_rx.changed() => {
-                if update.is_err() {
-                    queue
-                        .close_for_terminal_and_mark_ready(
-                            "local_to_remote",
-                            "read_credit_closed",
-                        )
-                        .await;
-                    return;
-                }
-                read_credit = *read_credit_rx.borrow_and_update();
-                continue;
-            }
-            reservation = queue.reserve_read_up_to(read_credit.max_batch_bytes) => {
-                match reservation {
-                    Ok(reservation) => reservation,
-                    Err(_) => return,
-                }
-            }
-        };
-        let max_len = reservation.max_len();
-        if max_len == 0 {
-            drop(reservation);
-            continue;
-        }
-
-        let chunk = loop {
-            let result = tokio::select! {
-                _ = &mut stop_rx => {
-                    drop(reservation);
-                    queue
-                        .close_for_terminal_and_mark_ready("local_to_remote", "reader_stopped")
-                        .await;
-                    return;
-                }
-                update = read_credit_rx.changed() => {
-                    if update.is_err() {
-                        drop(reservation);
-                        queue
-                            .close_for_terminal_and_mark_ready(
-                                "local_to_remote",
-                                "read_credit_closed",
-                            )
-                            .await;
-                        return;
-                    }
-                    read_credit = *read_credit_rx.borrow_and_update();
-                    if read_credit.paused || read_credit.max_batch_bytes == 0 {
-                        drop(reservation);
-                        continue 'reader;
-                    }
-                    continue;
-                }
-                chunk = poll_native_tcp_chunk(&mut remote_reader, max_len) => chunk,
-            };
-            break result;
-        };
-        match chunk {
-            Ok(Some(chunk)) => match reservation.commit(chunk.bytes) {
-                Ok(should_wake) => {
-                    if let Some(activity_tx) = &activity_tx {
-                        let _ = activity_tx.try_send(());
-                    }
-                    if should_wake && !send_d16_data_ready(handle, epoch, &back_tx).await {
-                        queue
-                            .close_for_terminal_and_mark_ready(
-                                "remote_to_local",
-                                "global_rx_closed",
-                            )
-                            .await;
-                        return;
-                    }
-                }
-                Err(_) => {
-                    let should_wake = queue
-                        .close_for_terminal_and_mark_ready(
-                            "remote_to_local",
-                            "d16_queue_commit_failed",
-                        )
-                        .await;
-                    if should_wake {
-                        let _ = send_d16_data_ready(handle, epoch, &back_tx).await;
-                    }
-                    let _ = back_tx
-                        .send((
-                            handle,
-                            RelayEvent::Closed(RelayClose {
-                                epoch,
-                                direction: "remote_to_local",
-                                reason: "d16_queue_commit_failed",
-                            }),
-                        ))
-                        .await;
-                    return;
-                }
-            },
-            Ok(None) => {
-                drop(reservation);
-                let should_wake = queue.close_for_remote_eof_and_mark_ready().await;
-                if should_wake {
-                    let _ = send_d16_data_ready(handle, epoch, &back_tx).await;
-                }
-                return;
-            }
-            Err(_) => {
-                drop(reservation);
-                let should_wake = queue
-                    .close_for_terminal_and_mark_ready("remote_to_local", "remote_read_failed")
-                    .await;
-                if should_wake {
-                    let _ = send_d16_data_ready(handle, epoch, &back_tx).await;
-                }
-                let _ = back_tx
-                    .send((
-                        handle,
-                        RelayEvent::Closed(RelayClose {
-                            epoch,
-                            direction: "remote_to_local",
-                            reason: "remote_read_failed",
-                        }),
-                    ))
-                    .await;
-                return;
-            }
-        }
-    }
-}
 
 #[allow(clippy::too_many_arguments)]
 async fn run_relay_continuous_reader(
@@ -9963,7 +8309,7 @@ async fn run_continuous_relay_dispatcher(
     handle: SocketHandle,
     epoch: u64,
     queue: AsyncByteBoundedFlowQueue,
-    back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
+    back_tx: crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
 ) {
     let mut diag = RelayTaskDiag::default();
     let global_rx_pressure_threshold = std::time::Duration::from_millis(5);
@@ -9975,7 +8321,7 @@ async fn run_continuous_relay_dispatcher(
         if send_remote_payload_batch_to_main(
             handle,
             epoch,
-            payload.to_vec(),
+            crate::tcp_downlink_pump::OwnedPayload::from_ingress_segment(&payload, 0..payload.len()),
             1,
             &back_tx,
             &mut diag,
@@ -10127,7 +8473,7 @@ async fn dispatch_leased_payload_to_main(
     handle: SocketHandle,
     epoch: u64,
     payload: LeasedBytes,
-    back_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
+    back_tx: &crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
     diag: &mut RelayTaskDiag,
     global_rx_pressure_threshold: std::time::Duration,
 ) -> Result<(), RelayCloseReason> {
@@ -10139,15 +8485,15 @@ async fn dispatch_leased_payload_to_main(
     let permit_result = back_tx.reserve().await;
     let waited = wait_started.elapsed();
     diag.note_global_rx_wait(waited, global_rx_pressure_threshold);
-    let Ok(permit) = permit_result else {
-        return Err(("remote_to_local", "global_rx_closed"));
+    let permit = match permit_result {
+        Ok(permit) => permit, Err(error) => return Err(("remote_to_local", error.reason())),
     };
     note_global_rx_channel_occupancy(diag, back_tx);
     permit.send((
         handle,
         RelayEvent::Data {
             epoch,
-            bytes: bytes.to_vec(),
+            bytes: crate::tcp_downlink_pump::OwnedPayload::from_ingress_segment(&bytes, 0..bytes.len()),
             stream_service_window: diag.stream_service_window(),
             downstream_permit: Some(downstream_permit),
         },
@@ -10169,7 +8515,7 @@ async fn run_permit_relay_dispatcher(
     handle: SocketHandle,
     epoch: u64,
     queue: AsyncLeasedByteFlowQueue,
-    back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
+    back_tx: crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
 ) {
     let mut diag = RelayTaskDiag::default();
     let global_rx_pressure_threshold = std::time::Duration::from_millis(5);
@@ -10193,249 +8539,6 @@ async fn run_permit_relay_dispatcher(
             return;
         }
     }
-}
-
-async fn run_relay_native_chunk(
-    handle: SocketHandle,
-    epoch: u64,
-    remote_reader: NativeTcpReadHalf,
-    remote_writer: NativeTcpWriteHalf,
-    rx: mpsc::Receiver<RelayCommand>,
-    back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
-    read_credit_rx: watch::Receiver<RelayReadCredit>,
-    native_read_service_floor: bool,
-) {
-    let (writer_signal_tx, mut writer_signal_rx) =
-        mpsc::channel::<RelayWriterSignal>(RELAY_CHANNEL_CAPACITY);
-    let (writer_stop_tx, writer_stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let (reader_signal_tx, mut reader_signal_rx) =
-        mpsc::channel::<RelayReaderSignal>(RELAY_CHANNEL_CAPACITY);
-    let (reader_stop_tx, reader_stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let local_finish_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let read_credit_probe_rx = read_credit_rx.clone();
-    tcp_diag_log!(
-        "🔎 tcp-relay-engine handle={:?} epoch={} engine=native_chunk_pump queue_bytes={} reassembly_cap={} native_read_floor={}",
-        handle,
-        epoch,
-        CONTINUOUS_TCP_RELAY_QUEUE_BYTES,
-        NATIVE_TCP_REASSEMBLY_MAX_BYTES,
-        native_read_service_floor
-    );
-    let Ok(queue) = AsyncByteBoundedFlowQueue::new(CONTINUOUS_TCP_RELAY_QUEUE_BYTES) else {
-        let _ = back_tx
-            .send((
-                handle,
-                RelayEvent::Closed(RelayClose {
-                    epoch,
-                    direction: "remote_to_local",
-                    reason: "native_queue_config_failed",
-                }),
-            ))
-            .await;
-        return;
-    };
-    let mut dispatcher_task = tokio::spawn(run_continuous_relay_dispatcher(
-        handle,
-        epoch,
-        queue.clone(),
-        back_tx.clone(),
-    ));
-    let mut reader_task = tokio::spawn(run_relay_native_chunk_reader(
-        handle,
-        epoch,
-        remote_reader,
-        queue,
-        read_credit_rx,
-        reader_signal_tx,
-        local_finish_seen.clone(),
-        reader_stop_rx,
-        native_read_service_floor,
-    ));
-    let mut writer_task = tokio::spawn(run_relay_writer(
-        handle,
-        remote_writer,
-        rx,
-        writer_signal_tx,
-        writer_stop_rx,
-    ));
-    let mut diag = RelayTaskDiag::default();
-    let local_write_pressure_threshold = std::time::Duration::from_millis(5);
-    let mut close_timer = RelayCloseTimer::new();
-    let mut diag_tick = tokio::time::interval(std::time::Duration::from_secs(RELAY_LIVE_DIAG_SECS));
-    diag_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    diag_tick.tick().await;
-    let mut remote_read_probe_tick = tokio::time::interval(std::time::Duration::from_millis(
-        RELAY_REMOTE_READ_PROBE_INTERVAL_MS,
-    ));
-    remote_read_probe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    remote_read_probe_tick.tick().await;
-    let mut writer_done = false;
-    let mut read_only_after_local_finish = false;
-    let mut last_ack_drain_hint_at = None;
-    let (close_direction, close_reason) = loop {
-        tokio::select! {
-            _ = diag_tick.tick(), if tcp_diag_enabled() => {
-                tcp_diag_log!(
-                    "{}",
-                    format_relay_live_diag(
-                        handle,
-                        epoch,
-                        writer_done,
-                        read_only_after_local_finish,
-                        &diag
-                    )
-                );
-            }
-            _ = remote_read_probe_tick.tick(), if should_poll_relay_remote_read_probe(&diag, *read_credit_probe_rx.borrow()) => {
-                diag.note_remote_read_probe_tick();
-                let now = std::time::Instant::now();
-                if should_poll_relay_ack_drain_hint(&diag, writer_done)
-                    && let Some(hint) = relay_ack_drain_hint_due(&diag, now, last_ack_drain_hint_at)
-                {
-                    last_ack_drain_hint_at = Some(now);
-                    diag.note_ack_drain_hint_due();
-                    match back_tx.try_send((
-                        handle,
-                        RelayEvent::AckDrainHint {
-                            epoch,
-                            gap_ms: hint.gap_ms,
-                            remote_to_global_rx_bytes: hint.remote_to_global_rx_bytes,
-                        },
-                    )) {
-                        Ok(()) => diag.note_ack_drain_hint_sent(),
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            diag.note_ack_drain_hint_dropped();
-                            tcp_diag_log!(
-                                "🔎 tcp-relay-ack-drain-hint-drop handle={:?} epoch={} reason=global_rx_full gap_ms={} remote_to_global_rx_bytes={} dropped={}",
-                                handle,
-                                epoch,
-                                hint.gap_ms,
-                                hint.remote_to_global_rx_bytes,
-                                diag.ack_drain_hint_dropped
-                            );
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                            diag.note_ack_drain_hint_dropped();
-                            tcp_diag_log!(
-                                "🔎 tcp-relay-ack-drain-hint-drop handle={:?} epoch={} reason=global_rx_closed gap_ms={} remote_to_global_rx_bytes={} dropped={}",
-                                handle,
-                                epoch,
-                                hint.gap_ms,
-                                hint.remote_to_global_rx_bytes,
-                                diag.ack_drain_hint_dropped
-                            );
-                        }
-                    }
-                }
-            }
-            signal = writer_signal_rx.recv(), if !writer_done => {
-                match signal {
-                    Some(RelayWriterSignal::WritePending) => {
-                        close_timer.arm_stalled_write();
-                    }
-                    Some(RelayWriterSignal::Progress { bytes, write_wait }) => {
-                        diag.note_uplink_write(bytes);
-                        diag.note_local_write_wait(write_wait, local_write_pressure_threshold);
-                        if write_wait >= local_write_pressure_threshold {
-                            tcp_diag_log!(
-                                "🔎 tcp-local-write-pressure handle={:?} wait_us={} payload_bytes={} pressure_events={}",
-                                handle,
-                                write_wait.as_micros(),
-                                bytes,
-                                diag.local_write_pressure_events
-                            );
-                        }
-                        close_timer.note_write_progress();
-                    }
-                    Some(RelayWriterSignal::WriteCompleted) => {
-                        close_timer.complete_write();
-                    }
-                    Some(RelayWriterSignal::WriteHalfClosed { reason }) => {
-                        diag.note_local_finish();
-                        local_finish_seen.store(true, std::sync::atomic::Ordering::SeqCst);
-                        tcp_diag_log!(
-                            "🔎 tcp-relay-write-half-closed handle={:?} reason={}",
-                            handle,
-                            reason
-                        );
-                        writer_done = true;
-                        read_only_after_local_finish = true;
-                        close_timer.arm_half_closed();
-                    }
-                    Some(RelayWriterSignal::Closed { direction, reason }) => {
-                        break (direction, reason);
-                    }
-                    None => {
-                        break ("local_to_remote", "writer_task_closed");
-                    }
-                }
-            }
-            reader_signal = reader_signal_rx.recv() => {
-                match reader_signal {
-                    Some(RelayReaderSignal::Progress { diag: reader_diag }) => {
-                        diag.copy_reader_fields_from(&reader_diag);
-                        close_timer.note_read_progress();
-                    }
-                    Some(RelayReaderSignal::Closed { direction, reason, diag: reader_diag }) => {
-                        diag.copy_reader_fields_from(&reader_diag);
-                        break (direction, reason);
-                    }
-                    None => {
-                        break ("remote_to_local", "reader_task_closed");
-                    }
-                }
-            }
-            _ = close_timer.wait(), if close_timer.is_armed() => {
-                let timeout = close_timer.timeout().unwrap_or_default();
-                let reason = close_timer.terminal_reason();
-                println!("⏱️ relay {:?} lifecycle guard {}s expired reason={}", handle, timeout.as_secs(), reason);
-                break ("timer", reason);
-            }
-        }
-    };
-    let _ = reader_stop_tx.send(());
-    let _ = writer_stop_tx.send(());
-    if reader_task.is_finished() {
-        let _ = reader_task.await;
-    } else if tokio::time::timeout(RELAY_WRITER_STOP_TIMEOUT, &mut reader_task)
-        .await
-        .is_err()
-    {
-        reader_task.abort();
-        let _ = reader_task.await;
-    }
-    if writer_task.is_finished() {
-        let _ = writer_task.await;
-    } else if tokio::time::timeout(RELAY_WRITER_STOP_TIMEOUT, &mut writer_task)
-        .await
-        .is_err()
-    {
-        writer_task.abort();
-        let _ = writer_task.await;
-    }
-    if dispatcher_task.is_finished() {
-        let _ = dispatcher_task.await;
-    } else if tokio::time::timeout(RELAY_WRITER_STOP_TIMEOUT, &mut dispatcher_task)
-        .await
-        .is_err()
-    {
-        dispatcher_task.abort();
-        let _ = dispatcher_task.await;
-    }
-    tcp_diag_log!(
-        "{}",
-        format_relay_close_diag(handle, close_direction, close_reason, &diag)
-    );
-    let _ = back_tx
-        .send((
-            handle,
-            RelayEvent::Closed(RelayClose {
-                epoch,
-                direction: close_direction,
-                reason: close_reason,
-            }),
-        ))
-        .await;
 }
 
 /// rx 热路径分流结果。

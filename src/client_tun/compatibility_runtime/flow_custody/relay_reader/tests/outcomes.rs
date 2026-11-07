@@ -81,7 +81,7 @@ impl AsyncWrite for Stream {
 
 struct Fixture {
     request: ReaderRequest,
-    back: mpsc::Receiver<(SocketHandle, RelayEvent)>,
+    back: crate::client_tun::relay_channel::Receiver<(SocketHandle, RelayEvent)>,
     signals: mpsc::Receiver<RelayReaderSignal>,
     stop: oneshot::Sender<()>,
     credit: watch::Sender<RelayReadCredit>,
@@ -111,7 +111,7 @@ fn fixture_with_writer(
         panic_drop,
     });
     let (remote_reader, writer) = tokio::io::split(stream);
-    let (back_tx, back) = mpsc::channel(capacity);
+    let (back_tx, back) = crate::client_tun::relay_channel::channel(capacity);
     let (signal_tx, signals) = mpsc::channel(8);
     let (credit, read_credit_rx) = watch::channel(RelayReadCredit::default());
     let (stop, stop_rx) = oneshot::channel();
@@ -121,7 +121,7 @@ fn fixture_with_writer(
                 handle,
                 epoch: 7,
                 remote_reader,
-                back_tx,
+                back_tx: ReaderOutput::Main(back_tx),
                 read_credit_rx,
                 signal_tx,
                 local_finish_seen: Arc::new(AtomicBool::new(false)),
@@ -141,7 +141,7 @@ fn data(event: (SocketHandle, RelayEvent)) -> Vec<u8> {
     match event.1 {
         RelayEvent::Data {
             epoch: 7, bytes, ..
-        } => bytes,
+        } => bytes.to_vec(),
         _ => panic!("expected actual reader DATA"),
     }
 }
@@ -450,7 +450,7 @@ async fn publication_counter_overflow_preserves_pending_vec_without_sending() {
     let mut f = fixture(vec![], 8, false);
     for (messages, bytes) in [(usize::MAX, 0), (0, usize::MAX)] {
         let mut publication = Publication {
-            pending: Some(vec![1]),
+            pending: Some(vec![1].into()),
             messages,
             bytes,
             ..Publication::default()
@@ -462,7 +462,7 @@ async fn publication_counter_overflow_preserves_pending_vec_without_sending() {
                     &mut Dispatch {
                         handle: f.request.handle,
                         epoch: 7,
-                        back_tx: &f.request.back_tx,
+                        back_tx: f.request.back_tx.borrowed(),
                         diag: &mut diag,
                         stop: None,
                         threshold: std::time::Duration::from_millis(5),
@@ -472,7 +472,7 @@ async fn publication_counter_overflow_preserves_pending_vec_without_sending() {
                 .await,
             Err(ReaderTerminal::AccountingFailed)
         );
-        assert_eq!(publication.pending, Some(vec![1]));
+        assert_eq!(publication.pending.as_ref().map(AsRef::as_ref), Some([1u8].as_slice()));
         assert_eq!(publication.in_flight, None);
         assert_eq!(publication.cursor, 0);
         assert_eq!((publication.messages, publication.bytes), (messages, bytes));

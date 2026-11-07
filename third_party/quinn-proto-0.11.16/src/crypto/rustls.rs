@@ -9,20 +9,21 @@ pub use rustls::Error;
 #[cfg(feature = "__rustls-post-quantum-test")]
 use rustls::NamedGroup;
 use rustls::{
-    self, CipherSuite,
+    self,
     client::danger::ServerCertVerifier,
     pki_types::{CertificateDer, PrivateKeyDer, ServerName},
     quic::{Connection, HeaderProtectionKey, KeyChange, PacketKey, Secrets, Suite, Version},
+    CipherSuite,
 };
 #[cfg(feature = "platform-verifier")]
 use rustls_platform_verifier::BuilderVerifierExt;
 
 use crate::{
-    ConnectError, ConnectionId, Side, TransportError, TransportErrorCode,
     crypto::{
         self, CryptoError, ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, UnsupportedVersion,
     },
     transport_parameters::TransportParameters,
+    ConnectError, ConnectionId, Side, TransportError, TransportErrorCode,
 };
 
 impl From<Side> for rustls::Side {
@@ -44,6 +45,27 @@ pub struct TlsSession {
 }
 
 impl TlsSession {
+    fn convert_key_change(&mut self, change: Option<KeyChange>) -> Option<Keys> {
+        let keys = match change? {
+            KeyChange::Handshake { keys } => keys,
+            KeyChange::OneRtt { keys, next } => {
+                self.next_secrets = Some(next);
+                keys
+            }
+        };
+
+        Some(Keys {
+            header: KeyPair {
+                local: Box::new(keys.local.header),
+                remote: Box::new(keys.remote.header),
+            },
+            packet: KeyPair {
+                local: Box::new(keys.local.packet),
+                remote: Box::new(keys.remote.packet),
+            },
+        })
+    }
+
     fn side(&self) -> Side {
         match self.inner {
             Connection::Client(_) => Side::Client,
@@ -142,24 +164,30 @@ impl crypto::Session for TlsSession {
     }
 
     fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<Keys> {
-        let keys = match self.inner.write_hs(buf)? {
-            KeyChange::Handshake { keys } => keys,
-            KeyChange::OneRtt { keys, next } => {
-                self.next_secrets = Some(next);
-                keys
-            }
-        };
+        let change = self.inner.write_hs(buf);
+        self.convert_key_change(change)
+    }
 
-        Some(Keys {
-            header: KeyPair {
-                local: Box::new(keys.local.header),
-                remote: Box::new(keys.remote.header),
-            },
-            packet: KeyPair {
-                local: Box::new(keys.local.packet),
-                remote: Box::new(keys.remote.packet),
-            },
-        })
+    fn write_handshake_bounded(
+        &mut self,
+        output: &mut [u8],
+    ) -> Result<(usize, Option<Keys>), crypto::HandshakeOutputError> {
+        let (written, change) =
+            self.inner
+                .write_hs_bounded(output)
+                .map_err(|error| match error {
+                    rustls::quic::HandshakeOutputError::Insufficient { required } => {
+                        crypto::HandshakeOutputError::Insufficient { required }
+                    }
+                    rustls::quic::HandshakeOutputError::LengthOverflow => {
+                        crypto::HandshakeOutputError::LengthOverflow
+                    }
+                })?;
+        Ok((written, self.convert_key_change(change)))
+    }
+
+    fn handshake_output_is_idle(&self) -> Option<bool> {
+        Some(self.inner.handshake_output_is_idle())
     }
 
     fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn crypto::PacketKey>>> {

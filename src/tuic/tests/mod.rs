@@ -1,4 +1,5 @@
 use super::*;
+mod native_combine;
 use crate::shared::TargetAddr;
 use crate::tcp_downlink_pump::{AsyncLeasedByteFlowQueue, DownstreamPermitReleaseMode};
 use std::sync::Arc;
@@ -1526,153 +1527,6 @@ fn d16_read_reservation_counts_before_remote_read() {
     assert_eq!(queue.blocking_snapshot_for_test().reserved_bytes, 0);
 }
 
-struct PendingOnceOrderedSource {
-    calls: Arc<AtomicU64>,
-    entered: Arc<tokio::sync::Notify>,
-    release: Arc<tokio::sync::Notify>,
-    payload: bytes::Bytes,
-}
-
-#[async_trait::async_trait]
-impl TuicOrderedNativeChunkSource for PendingOnceOrderedSource {
-    async fn read_ordered_native_chunk(
-        &mut self,
-        _max_len: usize,
-    ) -> io::Result<Option<NativeTcpChunk>> {
-        let call = self.calls.fetch_add(1, Ordering::SeqCst);
-        if call == 0 {
-            self.entered.notify_one();
-            self.release.notified().await;
-            return Ok(Some(NativeTcpChunk {
-                offset: 0,
-                bytes: self.payload.clone(),
-            }));
-        }
-        std::future::pending::<io::Result<Option<NativeTcpChunk>>>().await
-    }
-}
-
-struct SequenceOrderedSource {
-    calls: Arc<AtomicU64>,
-    chunks: Vec<NativeTcpChunk>,
-}
-
-#[async_trait::async_trait]
-impl TuicOrderedNativeChunkSource for SequenceOrderedSource {
-    async fn read_ordered_native_chunk(
-        &mut self,
-        _max_len: usize,
-    ) -> io::Result<Option<NativeTcpChunk>> {
-        let call = self.calls.fetch_add(1, Ordering::SeqCst) as usize;
-        if call < self.chunks.len() {
-            Ok(Some(self.chunks[call].clone()))
-        } else {
-            Ok(None)
-        }
-    }
-}
-
-#[tokio::test]
-async fn native_ordered_pump_holds_pending_read_until_ready() {
-    let calls = Arc::new(AtomicU64::new(0));
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let release = Arc::new(tokio::sync::Notify::new());
-    let source = PendingOnceOrderedSource {
-        calls: calls.clone(),
-        entered: entered.clone(),
-        release: release.clone(),
-        payload: bytes::Bytes::from_static(b"ordered-pump"),
-    };
-    let active = Arc::new(AtomicU64::new(0));
-    let (lease, reserved) = TcpPoolSlotLease::reserve(active.clone());
-    assert!(reserved);
-    let mut reader = TuicNativeOrderedPumpReader::spawn_from_source(source, lease, None, None);
-
-    tokio::time::timeout(Duration::from_millis(200), entered.notified())
-        .await
-        .expect("read pump should enter the first source read");
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "the pump must hold the pending read future instead of starting another read"
-    );
-
-    release.notify_one();
-    let chunk = tokio::time::timeout(Duration::from_millis(200), async {
-        std::future::poll_fn(|cx| reader.poll_read_chunk(cx, 4096)).await
-    })
-    .await
-    .expect("released ordered read should reach the native reader")
-    .expect("pump read should succeed")
-    .expect("released read should produce a chunk");
-    assert_eq!(chunk.offset, 0);
-    assert_eq!(&chunk.bytes[..], b"ordered-pump");
-
-    drop(reader);
-    assert_eq!(
-        active.load(Ordering::SeqCst),
-        0,
-        "dropping the ordered pump reader must release its TCP pool lease"
-    );
-}
-
-#[tokio::test]
-async fn native_ordered_pump_reader_batches_ready_chunks_to_max_len() {
-    let calls = Arc::new(AtomicU64::new(0));
-    let source = SequenceOrderedSource {
-        calls: calls.clone(),
-        chunks: vec![
-            NativeTcpChunk {
-                offset: 0,
-                bytes: bytes::Bytes::from_static(b"ab"),
-            },
-            NativeTcpChunk {
-                offset: 2,
-                bytes: bytes::Bytes::from_static(b"cdef"),
-            },
-            NativeTcpChunk {
-                offset: 6,
-                bytes: bytes::Bytes::from_static(b"gh"),
-            },
-        ],
-    };
-    let active = Arc::new(AtomicU64::new(0));
-    let (lease, reserved) = TcpPoolSlotLease::reserve(active.clone());
-    assert!(reserved);
-    let mut reader = TuicNativeOrderedPumpReader::spawn_from_source(source, lease, None, None);
-
-    tokio::time::timeout(Duration::from_millis(200), async {
-        while calls.load(Ordering::SeqCst) < 4 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("source should publish all ready chunks and EOF");
-
-    let first = std::future::poll_fn(|cx| reader.poll_read_chunk(cx, 5))
-        .await
-        .expect("first batched read should succeed")
-        .expect("first batched read should produce data");
-    assert_eq!(first.offset, 0);
-    assert_eq!(&first.bytes[..], b"abcde");
-
-    let second = std::future::poll_fn(|cx| reader.poll_read_chunk(cx, 16))
-        .await
-        .expect("second batched read should succeed")
-        .expect("second batched read should produce stashed remainder");
-    assert_eq!(second.offset, 5);
-    assert_eq!(&second.bytes[..], b"fgh");
-
-    let eof = std::future::poll_fn(|cx| reader.poll_read_chunk(cx, 16))
-        .await
-        .expect("EOF read should succeed");
-    assert!(eof.is_none(), "EOF must be delivered after stashed bytes");
-
-    drop(reader);
-    assert_eq!(active.load(Ordering::SeqCst), 0);
-}
-
 struct RecordingDirectOrderedRecv {
     max_lens: Arc<std::sync::Mutex<Vec<usize>>>,
     chunk: Option<NativeTcpChunk>,
@@ -2004,32 +1858,6 @@ fn d16_direct_ordered_reader_rejects_offset_discontinuity() {
     let err = result.expect_err("direct ordered reader must reject a gap");
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     assert!(err.to_string().contains("expected=0 actual=7"), "{err}");
-}
-
-#[test]
-fn native_ordered_chunk_batch_combines_contiguous_bytes_and_advances_offset() {
-    let mut next_offset = 41;
-    let first = combine_ordered_native_chunks(
-        &mut next_offset,
-        &[
-            bytes::Bytes::from_static(b"ab"),
-            bytes::Bytes::from_static(b"cde"),
-        ],
-    )
-    .expect("nonempty chunk batch should combine");
-    assert_eq!(first.offset, 41);
-    assert_eq!(&first.bytes[..], b"abcde");
-    assert_eq!(next_offset, 46);
-
-    let second =
-        combine_ordered_native_chunks(&mut next_offset, &[bytes::Bytes::from_static(b"fg")])
-            .expect("single chunk batch should pass through");
-    assert_eq!(second.offset, 46);
-    assert_eq!(&second.bytes[..], b"fg");
-    assert_eq!(next_offset, 48);
-
-    assert!(combine_ordered_native_chunks(&mut next_offset, &[]).is_none());
-    assert_eq!(next_offset, 48);
 }
 
 #[test]
@@ -2771,70 +2599,6 @@ fn tuic_tcp_stream_pending_event_reports_since_last_pending_delta() {
         transport.since_last_pending.rx_stream_frames, 0,
         "connection stream frames may be stale even when the since-read cause remains stream-frame-pending"
     );
-}
-
-#[test]
-fn ordered_quic_chunk_assembler_buffers_gap_then_drains_contiguously() {
-    let mut assembler = OrderedQuicChunkAssembler::default();
-    let mut out = [0u8; 6];
-    let mut read_buf = ReadBuf::new(&mut out);
-
-    assembler.push_chunk(3, bytes::Bytes::from_static(b"def"));
-    assert_eq!(assembler.drain_into(&mut read_buf), 0);
-    assert_eq!(read_buf.filled(), b"");
-
-    assembler.push_chunk(0, bytes::Bytes::from_static(b"abc"));
-    assert_eq!(assembler.drain_into(&mut read_buf), 6);
-    assert_eq!(read_buf.filled(), b"abcdef");
-    assert_eq!(assembler.next_offset(), 6);
-    assert_eq!(assembler.buffered_bytes(), 0);
-}
-
-#[test]
-fn ordered_quic_chunk_assembler_trims_already_delivered_prefix() {
-    let mut assembler = OrderedQuicChunkAssembler::default();
-    let mut first_out = [0u8; 3];
-    let mut first = ReadBuf::new(&mut first_out);
-    assembler.push_chunk(0, bytes::Bytes::from_static(b"abc"));
-    assert_eq!(assembler.drain_into(&mut first), 3);
-
-    let mut second_out = [0u8; 3];
-    let mut second = ReadBuf::new(&mut second_out);
-    assembler.push_chunk(1, bytes::Bytes::from_static(b"bcdef"));
-    assert_eq!(assembler.drain_into(&mut second), 3);
-    assert_eq!(second.filled(), b"def");
-    assert_eq!(assembler.next_offset(), 6);
-    assert_eq!(assembler.buffered_bytes(), 0);
-}
-
-#[test]
-fn ordered_quic_chunk_assembler_keeps_longer_duplicate_at_same_offset() {
-    let mut assembler = OrderedQuicChunkAssembler::default();
-    let mut out = [0u8; 6];
-    let mut read_buf = ReadBuf::new(&mut out);
-
-    assembler.push_chunk(0, bytes::Bytes::from_static(b"abcdef"));
-    assembler.push_chunk(0, bytes::Bytes::from_static(b"ab"));
-
-    assert_eq!(assembler.drain_into(&mut read_buf), 6);
-    assert_eq!(read_buf.filled(), b"abcdef");
-    assert_eq!(assembler.next_offset(), 6);
-    assert_eq!(assembler.buffered_bytes(), 0);
-}
-
-#[test]
-fn ordered_quic_chunk_assembler_replaces_short_duplicate_with_longer() {
-    let mut assembler = OrderedQuicChunkAssembler::default();
-    let mut out = [0u8; 6];
-    let mut read_buf = ReadBuf::new(&mut out);
-
-    assembler.push_chunk(0, bytes::Bytes::from_static(b"ab"));
-    assembler.push_chunk(0, bytes::Bytes::from_static(b"abcdef"));
-
-    assert_eq!(assembler.drain_into(&mut read_buf), 6);
-    assert_eq!(read_buf.filled(), b"abcdef");
-    assert_eq!(assembler.next_offset(), 6);
-    assert_eq!(assembler.buffered_bytes(), 0);
 }
 
 #[derive(Debug)]
@@ -4482,7 +4246,7 @@ async fn tcp_pool_liveness_probe_reuses_an_acked_quinn_connection() {
         .await
         .unwrap();
     let stable_id = connection.stable_id();
-    let outcome = probe_tcp_pool_connection(&connection, Duration::from_secs(1)).await;
+    let outcome = probe_tcp_pool_connection(&connection, Duration::from_secs(1)).await.unwrap();
 
     assert!(matches!(outcome, TcpPoolProbeOutcome::Alive { .. }));
     assert_eq!(connection.stable_id(), stable_id);
@@ -5145,110 +4909,6 @@ fn heartbeat_only_while_udp_active() {
     assert!(should_send_heartbeat(100, 160, w)); // 边界 now-last==window
     // 超出活跃窗口 → 停发(此时也无活跃 flow 需要保活)。
     assert!(!should_send_heartbeat(100, 161, w));
-}
-
-fn tuple(p: u16) -> FourTuple {
-    FourTuple {
-        src_ip: std::net::Ipv4Addr::new(10, 0, 0, 1),
-        src_port: p,
-        dst_ip: std::net::Ipv4Addr::new(198, 18, 0, 5),
-        dst_port: 443,
-    }
-}
-
-#[test]
-fn assoc_intern_stable_and_unique() {
-    let mut t = AssocTable::new();
-    let a = t.intern(tuple(1000));
-    assert_eq!(a, t.intern(tuple(1000)));
-    assert_ne!(a, t.intern(tuple(1001)));
-}
-
-#[test]
-fn assoc_intern_skips_live_id_on_wraparound() {
-    // u16 回绕后 next_id 可能落到仍在册的 id 上：intern 必须跳过，绝不覆盖活跃 flow。
-    let mut t = AssocTable::with_cap(8);
-    let keep = t.intern(tuple(1)); // 一条长寿命 flow 占住 id=keep
-    t.next_id = keep; // 把分配游标强行推回 keep（模拟回绕撞上活跃 id）
-    let other = t.intern(tuple(2));
-    assert_ne!(other, keep, "intern 覆盖了仍在册的 flow");
-    assert!(t.resolve(keep).is_some(), "长寿命 flow 被覆盖丢失");
-    assert!(t.resolve(other).is_some());
-    // 两条 flow 各自映射独立，未发生 tuple_to_id 泄漏/串号。
-    assert_eq!(t.intern(tuple(1)), keep);
-    assert_eq!(t.intern(tuple(2)), other);
-}
-
-#[test]
-fn assoc_contains_tracks_membership() {
-    let mut t = AssocTable::new();
-    assert!(!t.contains(&tuple(1000)));
-    t.intern(tuple(1000));
-    assert!(t.contains(&tuple(1000)));
-    assert!(!t.contains(&tuple(1001)));
-}
-
-#[test]
-fn assoc_resolve_endpoints_and_sweep() {
-    let mut t = AssocTable::new();
-    let id = t.intern(tuple(1000));
-    let e = t.resolve(id).expect("entry");
-    assert_eq!(
-        e.app_endpoint(),
-        (std::net::Ipv4Addr::new(10, 0, 0, 1), 1000)
-    );
-    assert_eq!(
-        e.target_src(),
-        (std::net::Ipv4Addr::new(198, 18, 0, 5), 443)
-    );
-    t.sweep(61, 60);
-    assert!(t.resolve(id).is_none());
-}
-
-/// 刀2：sweep 回收带 fake-IP 的 assoc 时，直接返回该 fake-IP（review #8：自包含返回）。
-#[test]
-fn assoc_sweep_reclaims_fake_ip() {
-    let mut t = AssocTable::new();
-    let id = t.intern(tuple(1000));
-    t.set_fake_ip(id, Ipv4Addr::new(198, 18, 0, 5));
-    t.touch(id, 0);
-    // 未过期：不回收，返回空。
-    assert!(t.sweep(30, 60).is_empty());
-    // 过期：回收，返回含该 fake-IP。
-    assert_eq!(t.sweep(61, 60), vec![Ipv4Addr::new(198, 18, 0, 5)]);
-}
-
-/// 刀2：LRU 驱逐带 fake-IP 的 assoc 时也累积 reclaimed（intern 到 cap 触发 evict）。
-#[test]
-fn assoc_evict_reclaims_fake_ip() {
-    let mut t = AssocTable::with_cap(1);
-    let id1 = t.intern(tuple(1));
-    t.set_fake_ip(id1, Ipv4Addr::new(198, 18, 0, 9));
-    // 再 intern 一条 → cap=1 触发 evict id1。
-    let _id2 = t.intern(tuple(2));
-    assert_eq!(
-        t.take_reclaimed_fake_ips(),
-        vec![Ipv4Addr::new(198, 18, 0, 9)]
-    );
-}
-
-#[test]
-fn assoc_touch_keeps_alive() {
-    let mut t = AssocTable::new();
-    let id = t.intern(tuple(1000));
-    t.touch(id, 50);
-    t.sweep(100, 60);
-    assert!(t.resolve(id).is_some());
-}
-
-#[test]
-fn assoc_lru_evicts_at_cap() {
-    let mut t = AssocTable::with_cap(2);
-    let a = t.intern(tuple(1));
-    let _b = t.intern(tuple(2));
-    let _c = t.intern(tuple(3));
-    assert!(t.resolve(a).is_none());
-    assert_eq!(t.len(), 2);
 }
 
 #[test]

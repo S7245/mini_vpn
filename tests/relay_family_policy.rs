@@ -184,8 +184,17 @@ fn family_env_readers_and_actual_consumers_have_one_source() {
         runtime
             .matches("TuicClientConfig::from_env_with_relay_policy(Arc::clone(&relay_policy))")
             .count(),
-        2
+        1
     );
+    let service = include_str!("../src/client_tun/compatibility_runtime/tuic_service.rs");
+    assert!(service.contains("tuic.relay_policy().generic_tuic_transport()"));
+    assert!(service.contains("Startup::Failover(tuic, reality)"));
+    assert!(service.contains("Configuration::failover(tuic, reality)"));
+    let pre_tun = &runtime[..runtime.find("let raw_tun =").unwrap()];
+    assert!(pre_tun.contains("RealityUpstream::from_env()"));
+    assert!(pre_tun.contains("Startup::Failover(config, reality)"));
+    assert!(!runtime.contains("TuicUpstream::connect("));
+    assert!(!runtime.contains("spawn_health_probe()"));
     assert!(
         driver.contains(
             "handshake_done_tx.with_relay_policy(Arc::clone(&runtime_config.relay_policy))"

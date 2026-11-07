@@ -610,3 +610,32 @@ async fn stats_capacity_rejects_before_spawning_and_joins_all_reserved_roles() {
     assert_eq!(host.resources.state().tasks_started, 6);
     assert_eq!(host.resources.state().tasks_joined, 6);
 }
+
+#[tokio::test]
+async fn shared_service_budget_keeps_node_meter_independent_of_live_app_backing() {
+    let budget = bytes::BackingBudget::new(65536).unwrap();
+    let app = bytes::BackingMeter::with_budget(&budget);
+    let held = bytes::Bytes::copy_from_slice_metered(b"app storage", &app).unwrap();
+    let mut host = NodeHost::prepare_with_budget(
+        config("127.0.0.1:9".parse().unwrap()),
+        Arc::new(Metrics::default()),
+        Some(&budget),
+    );
+    let node = host.resources.state().backing_meter.clone();
+    assert!(!app.same_authority(&node));
+    let remaining = budget.try_reserve(budget.limit() - budget.used()).unwrap();
+    assert!(matches!(
+        node.reserve_cold_layout(1),
+        Err(bytes::MeteredCopyError::BudgetFull)
+    ));
+    drop(remaining);
+    assert_eq!(
+        host.observe_shutdown().await,
+        NodeShutdown::StartupResourcesSettled
+    );
+    assert_eq!(node.snapshot().physical_bytes, 0);
+    assert!(app.snapshot().physical_bytes > 0 && budget.used() > 0);
+    drop((host, held));
+    assert_eq!(budget.used(), 0);
+    assert!(!budget.quarantined());
+}

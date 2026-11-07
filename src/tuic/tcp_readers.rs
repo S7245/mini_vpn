@@ -123,6 +123,7 @@ impl DirectOrderedNativeChunkRecv for QuinnDirectOrderedNativeChunkRecv {
 
 pub(super) struct TuicNativeOrderedReader<R = QuinnDirectOrderedNativeChunkRecv> {
     recv: R,
+    backing_meter: Option<bytes::BackingMeter>,
     tcp_diag: Option<TuicTcpStreamDiag>,
     transport_conn: Option<Connection>,
     next_offset: u64,
@@ -139,13 +140,16 @@ impl TuicNativeOrderedReader<QuinnDirectOrderedNativeChunkRecv> {
         transport_conn: Connection,
         read_pressure: Option<TcpOrderedReadPressureReader>,
     ) -> Self {
-        Self::from_recv(
+        let backing_meter = recv.receive_backing_meter();
+        let mut reader = Self::from_recv(
             QuinnDirectOrderedNativeChunkRecv::new(recv),
             lease,
             tcp_diag,
             Some(transport_conn),
             read_pressure,
-        )
+        );
+        reader.backing_meter = backing_meter;
+        reader
     }
 }
 
@@ -159,6 +163,7 @@ impl<R> TuicNativeOrderedReader<R> {
     ) -> Self {
         Self {
             recv,
+            backing_meter: None,
             tcp_diag,
             transport_conn,
             next_offset: 0,
@@ -268,6 +273,10 @@ impl<R> NativeTcpReader for TuicNativeOrderedReader<R>
 where
     R: DirectOrderedNativeChunkRecv,
 {
+    fn receive_backing_meter(&self) -> Option<bytes::BackingMeter> {
+        self.backing_meter.clone()
+    }
+
     fn poll_read_chunk(
         &mut self,
         cx: &mut Context<'_>,
@@ -340,346 +349,62 @@ impl<R> Drop for TuicNativeOrderedReader<R> {
     }
 }
 
-#[async_trait::async_trait]
-pub(super) trait TuicOrderedNativeChunkSource: Send + 'static {
-    async fn read_ordered_native_chunk(
-        &mut self,
-        max_len: usize,
-    ) -> io::Result<Option<NativeTcpChunk>>;
-}
+mod ordered_pump;
+pub(super) use ordered_pump::{
+    TuicNativeOrderedPumpReader, TuicOrderedNativeChunkSource, combine_ordered_native_chunks,
+    preflight_native_ordered_source,
+};
 
-struct QuinnOrderedNativeChunkSource {
-    recv: quinn::RecvStream,
-    next_offset: u64,
-}
-
-impl QuinnOrderedNativeChunkSource {
-    fn new(recv: quinn::RecvStream) -> Self {
-        Self {
-            recv,
-            next_offset: 0,
+pub(in crate::tuic) fn preflight_native_direct_source(
+    recv: &quinn::RecvStream,
+    expected: Option<&bytes::BackingMeter>,
+) -> io::Result<bytes::BackingMeter> {
+    let actual = recv.receive_backing_meter();
+    match (expected, actual) {
+        (Some(expected), Some(actual)) if expected.same_authority(&actual) => Ok(actual),
+        (expected, actual) => {
+            if let Some(expected) = expected {
+                expected.quarantine();
+            }
+            if let Some(actual) = actual {
+                actual.quarantine();
+            }
+            Err(io::Error::other(
+                "Native direct source backing authority mismatch",
+            ))
         }
     }
 }
 
-pub(super) fn combine_ordered_native_chunks(
-    next_offset: &mut u64,
-    chunks: &[bytes::Bytes],
-) -> Option<NativeTcpChunk> {
-    let total_len = chunks.iter().map(bytes::Bytes::len).sum::<usize>();
-    if total_len == 0 {
-        return None;
-    }
-    let offset = *next_offset;
-    *next_offset = next_offset.saturating_add(total_len as u64);
-    if chunks.len() == 1 {
-        return Some(NativeTcpChunk {
-            offset,
-            bytes: chunks[0].clone(),
-        });
-    }
-    let mut combined = bytes::BytesMut::with_capacity(total_len);
-    for chunk in chunks {
-        combined.extend_from_slice(chunk);
-    }
-    Some(NativeTcpChunk {
-        offset,
-        bytes: combined.freeze(),
-    })
-}
-
-#[async_trait::async_trait]
-impl TuicOrderedNativeChunkSource for QuinnOrderedNativeChunkSource {
-    async fn read_ordered_native_chunk(
-        &mut self,
-        _max_len: usize,
-    ) -> io::Result<Option<NativeTcpChunk>> {
-        let mut chunks = vec![bytes::Bytes::new(); TUIC_TCP_NATIVE_ORDERED_PUMP_READ_CHUNKS];
-        match self.recv.read_chunks(&mut chunks).await {
-            Ok(Some(n)) => Ok(combine_ordered_native_chunks(
-                &mut self.next_offset,
-                &chunks[..n],
-            )),
-            Ok(None) => Ok(None),
-            Err(err) => Err(io::Error::other(format!("tuic native ordered read: {err}"))),
-        }
-    }
-}
-
-pub(super) struct TuicNativeOrderedPumpReader {
-    rx: mpsc::Receiver<io::Result<Option<NativeTcpChunk>>>,
-    task: tokio::task::JoinHandle<()>,
-    tcp_diag: Option<TuicTcpStreamDiag>,
-    transport_conn: Option<Connection>,
-    pending_self_wake: PendingReadWake,
-    pending_chunk: Option<NativeTcpChunk>,
-    pending_eof: bool,
-    pending_error: Option<io::Error>,
-    _lease: TcpPoolSlotLease,
-}
-
-impl TuicNativeOrderedPumpReader {
-    pub(super) fn spawn(
-        recv: quinn::RecvStream,
-        lease: TcpPoolSlotLease,
-        tcp_diag: Option<TuicTcpStreamDiag>,
-        transport_conn: Connection,
-    ) -> Self {
-        Self::spawn_from_source(
-            QuinnOrderedNativeChunkSource::new(recv),
-            lease,
-            tcp_diag,
-            Some(transport_conn),
-        )
-    }
-
-    pub(super) fn spawn_from_source<S>(
-        mut source: S,
-        lease: TcpPoolSlotLease,
-        tcp_diag: Option<TuicTcpStreamDiag>,
-        transport_conn: Option<Connection>,
-    ) -> Self
-    where
-        S: TuicOrderedNativeChunkSource,
+fn validate_native_direct_chunk(
+    expected: Option<&bytes::BackingMeter>,
+    bytes: &bytes::Bytes,
+) -> io::Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let actual = bytes.backing_meter();
+    if bytes.is_empty()
+        || bytes.allocation_identity().is_none()
+        || !actual
+            .as_ref()
+            .is_some_and(|actual| expected.same_authority(actual))
     {
-        let (tx, rx) = mpsc::channel::<io::Result<Option<NativeTcpChunk>>>(
-            TUIC_TCP_NATIVE_ORDERED_PUMP_CHANNEL_CHUNKS,
-        );
-        let task = tokio::spawn(async move {
-            loop {
-                let result = source
-                    .read_ordered_native_chunk(TUIC_TCP_UNORDERED_CHUNK_READ_MAX_BYTES)
-                    .await;
-                let terminal = !matches!(result, Ok(Some(_)));
-                if tx.send(result).await.is_err() || terminal {
-                    break;
-                }
-            }
-        });
-        Self {
-            rx,
-            task,
-            tcp_diag,
-            transport_conn,
-            pending_self_wake: PendingReadWake::default(),
-            pending_chunk: None,
-            pending_eof: false,
-            pending_error: None,
-            _lease: lease,
+        expected.quarantine();
+        if let Some(actual) = actual {
+            actual.quarantine();
         }
+        return Err(io::Error::other(
+            "Native direct chunk backing authority mismatch",
+        ));
     }
-
-    fn arm_pending_self_wake(&mut self, cx: &mut Context<'_>, now: Instant) {
-        self.pending_self_wake.arm_and_poll(cx, now);
-        if let Some(diag) = self.tcp_diag.as_mut() {
-            diag.note_self_wake_armed();
-        }
-    }
-
-    fn note_pending(&mut self, cx: &mut Context<'_>, now: Instant) {
-        let transport = self
-            .transport_conn
-            .as_ref()
-            .map(sample_tuic_stream_transport);
-        let pending_cause =
-            if let (Some(diag), Some(transport)) = (self.tcp_diag.as_ref(), transport) {
-                classify_tuic_stream_pending_cause(Some(TuicStreamTransportPending {
-                    sample: transport,
-                    since_last_read: transport_delta(
-                        diag.last_read_transport_sample.unwrap_or_default(),
-                        transport,
-                    ),
-                    since_last_pending: transport_delta(
-                        diag.last_pending_transport_sample.unwrap_or_default(),
-                        transport,
-                    ),
-                }))
-            } else {
-                TuicTcpStreamPendingCause::NoTransportSample
-            };
-        if should_arm_tuic_stream_pending_self_wake(
-            pending_cause,
-            self.pending_self_wake.deadline(),
-            now,
-        ) {
-            self.arm_pending_self_wake(cx, now);
-        }
-        if let Some(diag) = self.tcp_diag.as_mut()
-            && let Some(event) = diag.note_pending_at(now, transport)
-        {
-            let meta = diag.meta.clone();
-            println!(
-                "{}",
-                format_tuic_tcp_stream_pending_line(
-                    &meta,
-                    event.pending_gap_ms,
-                    event.pending_polls,
-                    event.polls,
-                    event.max_poll_gap_ms,
-                    event.rx_bytes,
-                    event.reads,
-                    event.pending_cause,
-                    event.transport,
-                    event.self_wake_armed,
-                    event.self_wake_fired,
-                )
-            );
-        }
-    }
-
-    fn note_chunk_read(&mut self, bytes: usize, now: Instant) {
-        self.pending_self_wake.cancel();
-        let transport = self
-            .transport_conn
-            .as_ref()
-            .map(sample_tuic_stream_transport);
-        if let Some(diag) = self.tcp_diag.as_mut() {
-            let event = diag.note_read_at(bytes, now, transport);
-            let meta = diag.meta.clone();
-            if let Some(first_rx_ms) = event.first_rx_ms {
-                println!(
-                    "{}",
-                    format_tuic_tcp_stream_first_rx_line(
-                        &meta,
-                        first_rx_ms,
-                        event.read_bytes,
-                        event.reads,
-                    )
-                );
-            }
-            if let Some(gap_ms) = event.gap_ms
-                && gap_ms >= TUIC_TCP_STREAM_READ_GAP_LOG_MS
-            {
-                println!(
-                    "{}",
-                    format_tuic_tcp_stream_read_gap_line(
-                        &meta,
-                        gap_ms,
-                        event.read_bytes,
-                        event.reads,
-                        event.rx_bytes,
-                    )
-                );
-            }
-        }
-    }
-}
-
-impl NativeTcpReader for TuicNativeOrderedPumpReader {
-    fn poll_read_chunk(
-        &mut self,
-        cx: &mut Context<'_>,
-        max_len: usize,
-    ) -> Poll<io::Result<Option<NativeTcpChunk>>> {
-        let now = Instant::now();
-        if self.pending_self_wake.poll_fired(cx) {
-            if let Some(diag) = self.tcp_diag.as_mut() {
-                diag.note_self_wake_fired();
-            }
-        }
-        if let Some(diag) = self.tcp_diag.as_mut() {
-            diag.note_poll_at(now);
-        }
-
-        if let Some(err) = self.pending_error.take() {
-            self.pending_self_wake.cancel();
-            return Poll::Ready(Err(err));
-        }
-        if self.pending_eof {
-            self.pending_self_wake.cancel();
-            self.pending_eof = false;
-            return Poll::Ready(Ok(None));
-        }
-
-        let max_len = max_len.max(1);
-        let first = if let Some(chunk) = self.pending_chunk.take() {
-            chunk
-        } else {
-            match self.rx.poll_recv(cx) {
-                Poll::Ready(Some(Ok(Some(chunk)))) => chunk,
-                Poll::Ready(Some(Ok(None))) | Poll::Ready(None) => {
-                    self.pending_self_wake.cancel();
-                    return Poll::Ready(Ok(None));
-                }
-                Poll::Ready(Some(Err(err))) => {
-                    self.pending_self_wake.cancel();
-                    return Poll::Ready(Err(err));
-                }
-                Poll::Pending => {
-                    self.note_pending(cx, now);
-                    return Poll::Pending;
-                }
-            }
-        };
-
-        let offset = first.offset;
-        let mut next_offset = offset;
-        let mut combined = bytes::BytesMut::with_capacity(max_len.min(first.bytes.len().max(1)));
-        let mut chunk = first;
-
-        loop {
-            if !chunk.bytes.is_empty() && chunk.offset == next_offset {
-                let remaining = max_len.saturating_sub(combined.len());
-                let take = remaining.min(chunk.bytes.len());
-                combined.extend_from_slice(&chunk.bytes[..take]);
-                next_offset = next_offset.saturating_add(take as u64);
-                if take < chunk.bytes.len() {
-                    self.pending_chunk = Some(NativeTcpChunk {
-                        offset: chunk.offset.saturating_add(take as u64),
-                        bytes: chunk.bytes.slice(take..),
-                    });
-                    break;
-                }
-            } else if !chunk.bytes.is_empty() {
-                self.pending_chunk = Some(chunk);
-                break;
-            }
-
-            if combined.len() >= max_len {
-                break;
-            }
-
-            match self.rx.poll_recv(cx) {
-                Poll::Ready(Some(Ok(Some(next)))) => {
-                    chunk = next;
-                }
-                Poll::Ready(Some(Ok(None))) | Poll::Ready(None) => {
-                    self.pending_eof = true;
-                    break;
-                }
-                Poll::Ready(Some(Err(err))) => {
-                    self.pending_error = Some(err);
-                    break;
-                }
-                Poll::Pending => break,
-            }
-        }
-
-        if combined.is_empty() {
-            self.note_pending(cx, now);
-            return Poll::Pending;
-        }
-        let bytes = combined.freeze();
-        self.note_chunk_read(bytes.len(), now);
-        Poll::Ready(Ok(Some(NativeTcpChunk { offset, bytes })))
-    }
-}
-
-impl Drop for TuicNativeOrderedPumpReader {
-    fn drop(&mut self) {
-        self.task.abort();
-        if let Some(diag) = &self.tcp_diag {
-            let snapshot = diag.close_snapshot();
-            println!(
-                "{}",
-                format_tuic_tcp_stream_close_line(&diag.meta, &snapshot)
-            );
-        }
-    }
+    Ok(())
 }
 
 pub(super) struct TuicNativeTcpReader {
     recv: quinn::RecvStream,
+    backing_meter: Option<bytes::BackingMeter>,
+    source_read_bytes: Option<usize>,
     tcp_diag: Option<TuicTcpStreamDiag>,
     transport_conn: Connection,
     pending_self_wake: PendingReadWake,
@@ -693,8 +418,31 @@ impl TuicNativeTcpReader {
         tcp_diag: Option<TuicTcpStreamDiag>,
         transport_conn: Connection,
     ) -> Self {
+        let backing_meter = recv.receive_backing_meter();
+        Self::with_backing_meter(recv, lease, tcp_diag, transport_conn, backing_meter)
+    }
+
+    pub(super) fn new_preflighted(
+        recv: quinn::RecvStream,
+        lease: TcpPoolSlotLease,
+        tcp_diag: Option<TuicTcpStreamDiag>,
+        transport_conn: Connection,
+        backing_meter: bytes::BackingMeter,
+    ) -> Self {
+        Self::with_backing_meter(recv, lease, tcp_diag, transport_conn, Some(backing_meter))
+    }
+
+    fn with_backing_meter(
+        recv: quinn::RecvStream,
+        lease: TcpPoolSlotLease,
+        tcp_diag: Option<TuicTcpStreamDiag>,
+        transport_conn: Connection,
+        backing_meter: Option<bytes::BackingMeter>,
+    ) -> Self {
         Self {
             recv,
+            backing_meter,
+            source_read_bytes: Some(0),
             tcp_diag,
             transport_conn,
             pending_self_wake: PendingReadWake::default(),
@@ -796,6 +544,14 @@ impl TuicNativeTcpReader {
 }
 
 impl NativeTcpReader for TuicNativeTcpReader {
+    fn receive_backing_meter(&self) -> Option<bytes::BackingMeter> {
+        self.backing_meter.clone()
+    }
+
+    fn source_read_bytes(&self) -> Option<usize> {
+        self.source_read_bytes
+    }
+
     fn poll_read_chunk(
         &mut self,
         cx: &mut Context<'_>,
@@ -829,8 +585,26 @@ impl NativeTcpReader for TuicNativeTcpReader {
         };
         match chunk {
             Some(chunk) => {
+                if let Err(error) =
+                    validate_native_direct_chunk(self.backing_meter.as_ref(), &chunk.bytes)
+                {
+                    self.pending_self_wake.cancel();
+                    return Poll::Ready(Err(error));
+                }
                 let bytes_len = chunk.bytes.len();
                 if bytes_len > 0 {
+                    self.source_read_bytes = self
+                        .source_read_bytes
+                        .and_then(|bytes| bytes.checked_add(bytes_len));
+                    if self.source_read_bytes.is_none() {
+                        if let Some(meter) = &self.backing_meter {
+                            meter.quarantine();
+                        }
+                        self.pending_self_wake.cancel();
+                        return Poll::Ready(Err(io::Error::other(
+                            "Native direct source byte count overflow",
+                        )));
+                    }
                     self.note_chunk_read(bytes_len, now);
                 }
                 Poll::Ready(Ok(Some(NativeTcpChunk {
@@ -1089,4 +863,4 @@ impl<S> Drop for TrackedRelayStream<S> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

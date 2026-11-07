@@ -1,5 +1,5 @@
 use std::{
-    collections::{BinaryHeap, hash_map},
+    collections::{hash_map, BinaryHeap},
     io,
 };
 
@@ -7,12 +7,15 @@ use bytes::Bytes;
 use thiserror::Error;
 use tracing::trace;
 
-use super::spaces::{Retransmits, ThinRetransmits};
+use super::control_inventory::{Retransmits, ThinRetransmits};
 use crate::{
-    Dir, StreamId, VarInt,
     connection::streams::state::{get_or_insert_recv, get_or_insert_send},
-    frame,
+    frame, Dir, StreamId, VarInt,
 };
+
+mod closed;
+mod owner;
+pub(super) use owner::StreamOwner;
 
 mod recv;
 use recv::Recv;
@@ -23,8 +26,9 @@ pub(crate) use send::{ByteSlice, BytesArray};
 use send::{BytesSource, Send, SendState};
 pub use send::{FinishError, WriteError, Written};
 
-mod state;
+pub(in crate::connection) mod state;
 use state::StreamRecv;
+pub(super) use state::inventory_reason;
 #[allow(unreachable_pub)] // fuzzing only
 pub use state::StreamsState;
 
@@ -121,8 +125,7 @@ impl<'a> Streams<'a> {
 /// Access to streams
 pub struct RecvStream<'a> {
     pub(super) id: StreamId,
-    pub(super) state: &'a mut StreamsState,
-    pub(super) pending: &'a mut Retransmits,
+    pub(super) owner: StreamOwner<'a>,
 }
 
 /// Read-only ordered-delivery progress for one receive stream.
@@ -144,7 +147,8 @@ impl RecvStream<'_> {
     /// Return a read-only snapshot of ordered receive progress.
     pub fn progress(&self) -> Result<RecvStreamProgress, ClosedStream> {
         let stream = self
-            .state
+            .owner
+            .streams()
             .recv
             .get(&self.id)
             .and_then(|stream| stream.as_ref())
@@ -177,7 +181,7 @@ impl RecvStream<'_> {
     /// reads, but ordered reads on streams that have seen previous unordered reads will return
     /// `ReadError::IllegalOrderedRead`.
     pub fn read(&mut self, ordered: bool) -> Result<Chunks<'_>, ReadableError> {
-        Chunks::new(self.id, ordered, self.state, self.pending)
+        Chunks::new(self.id, ordered, self.owner.reborrow())
     }
 
     /// Stop accepting data on the given receive stream
@@ -185,18 +189,59 @@ impl RecvStream<'_> {
     /// Discards unread data and notifies the peer to stop transmitting. Once stopped, further
     /// attempts to operate on a stream will yield `ClosedStream` errors.
     pub fn stop(&mut self, error_code: VarInt) -> Result<(), ClosedStream> {
-        let mut entry = match self.state.recv.entry(self.id) {
+        if !self.owner.admit() {
+            return Err(ClosedStream { _private: () });
+        }
+        // Qualify either actual cached or open Box before materialization,
+        // record reservation, or any credit/STOP publication. Preserve the
+        // already-stopped rejection before inspecting otherwise-unused stock.
+        let receiving = {
+            let (state, _, _) = self.owner.parts();
+            match state.recv.get(&self.id) {
+                None => return Err(ClosedStream { _private: () }),
+                Some(None) => Some(true),
+                Some(Some(state::StreamRecv::Open(stream) | state::StreamRecv::Free(stream))) => {
+                    if stream.stopped { return Err(ClosedStream { _private: () }); }
+                    stream.check_inventory(state.native_meter()).is_ok().then(|| stream.is_receiving())
+                }
+            }
+        };
+        let Some(receiving) = receiving else {
+            self.owner.fail_receive_inventory("receive inventory mismatch before STOP_SENDING");
+            return Err(ClosedStream { _private: () });
+        };
+        let prepared = if receiving {
+            self.owner.parts().1.stop_sending.prepare(frame::StopSending {
+                id: self.id, error_code,
+            }).map(Some)
+        } else { Ok(None) };
+        let mut record = match prepared {
+            Ok(record) => record,
+            Err(()) => {
+                self.owner
+                    .fail("control record capacity exhausted before STOP_SENDING");
+                return Err(ClosedStream { _private: () });
+            }
+        };
+        let (state, pending, _conn_state) = self.owner.parts();
+        let mut entry = match state.recv.entry(self.id) {
             hash_map::Entry::Occupied(s) => s,
             hash_map::Entry::Vacant(_) => return Err(ClosedStream { _private: () }),
         };
-        let stream = get_or_insert_recv(self.state.stream_receive_window)(entry.get_mut());
+        let stream = get_or_insert_recv(state.stream_receive_window)(entry.get_mut());
 
-        let (read_credits, stop_sending) = stream.stop()?;
-        if stop_sending.should_transmit() {
-            self.pending.stop_sending.push(frame::StopSending {
-                id: self.id,
-                error_code,
-            });
+        if let Some(record) = &mut record {
+            record.begin_mutation();
+        }
+        let (read_credits, _stop_sending) = match stream.stop() {
+            Ok(value) => value,
+            Err(error) => {
+                self.owner.fail_receive_inventory("receive inventory mismatch during STOP_SENDING");
+                return Err(error);
+            }
+        };
+        if let Some(record) = record {
+            pending.stop_sending.push(record);
         }
 
         // We need to keep stopped streams around until they're finished or reset so we can update
@@ -204,11 +249,14 @@ impl RecvStream<'_> {
         // state immediately.
         if !stream.final_offset_unknown() {
             let recv = entry.remove().expect("must have recv when stopping");
-            self.state.stream_recv_freed(self.id, recv);
+            if state.stream_recv_freed(self.id, recv).is_err() {
+                self.owner.fail_receive_inventory("receive inventory mismatch during stopped retirement");
+                return Err(ClosedStream { _private: () });
+            }
         }
 
-        if self.state.add_read_credits(read_credits).should_transmit() {
-            self.pending.max_data = true;
+        if state.add_read_credits(read_credits).should_transmit() {
+            pending.max_data = true;
         }
 
         Ok(())
@@ -219,7 +267,12 @@ impl RecvStream<'_> {
     /// After returning `Ok(Some(_))` once, stream state will be discarded and all future calls will
     /// return `Err(ClosedStream)`.
     pub fn received_reset(&mut self) -> Result<Option<VarInt>, ClosedStream> {
-        let hash_map::Entry::Occupied(entry) = self.state.recv.entry(self.id) else {
+        if !self.owner.admit() {
+            return Err(ClosedStream { _private: () });
+        }
+        let (state, pending, _conn_state) = self.owner.parts();
+        let expected = state.native_meter().cloned();
+        let hash_map::Entry::Occupied(entry) = state.recv.entry(self.id) else {
             return Err(ClosedStream { _private: () });
         };
         let Some(s) = entry.get().as_ref().and_then(|s| s.as_open_recv()) else {
@@ -232,12 +285,18 @@ impl RecvStream<'_> {
             return Ok(None);
         };
 
+        if s.check_inventory(expected.as_ref()).is_err() {
+            self.owner.fail_receive_inventory("receive inventory mismatch before reset observation");
+            return Err(ClosedStream { _private: () });
+        }
         // Clean up state after application observes the reset, since there's no reason for the
         // application to attempt to read or stop the stream once it knows it's reset
         let (_, recv) = entry.remove_entry();
-        self.state
-            .stream_recv_freed(self.id, recv.expect("must have recv on reset"));
-        self.state.queue_max_stream_id(self.pending);
+        if state.stream_recv_freed(self.id, recv.expect("must have recv on reset")).is_err() {
+            self.owner.fail_receive_inventory("receive inventory mismatch during reset observation");
+            return Err(ClosedStream { _private: () });
+        }
+        state.queue_max_stream_id(pending);
 
         Ok(Some(code))
     }
@@ -246,9 +305,7 @@ impl RecvStream<'_> {
 /// Access to streams
 pub struct SendStream<'a> {
     pub(super) id: StreamId,
-    pub(super) state: &'a mut StreamsState,
-    pub(super) pending: &'a mut Retransmits,
-    pub(super) conn_state: &'a super::State,
+    pub(super) owner: StreamOwner<'a>,
 }
 
 /// Monotonic application-write and peer-acknowledgement progress for one send stream.
@@ -271,9 +328,11 @@ impl<'a> SendStream<'a> {
     ) -> Self {
         Self {
             id,
-            state,
-            pending,
-            conn_state,
+            owner: StreamOwner::Detached {
+                streams: state,
+                pending,
+                conn_state,
+            },
         }
     }
 
@@ -298,10 +357,7 @@ impl<'a> SendStream<'a> {
         priority_after: i32,
     ) -> Result<usize, WriteError> {
         Ok(self
-            .write_source(
-                &mut ByteSlice::from_slice(data),
-                Some(priority_after),
-            )?
+            .write_source(&mut ByteSlice::from_slice(data), Some(priority_after))?
             .bytes)
     }
 
@@ -318,7 +374,8 @@ impl<'a> SendStream<'a> {
     /// Returns monotonic write and acknowledgement progress for this stream.
     pub fn progress(&self) -> Result<SendStreamProgress, ClosedStream> {
         let stream = self
-            .state
+            .owner
+            .streams()
             .send
             .get(&self.id)
             .and_then(|stream| stream.as_ref())
@@ -331,75 +388,67 @@ impl<'a> SendStream<'a> {
     }
 
     fn write_source<B: BytesSource>(
-        &mut self,
-        source: &mut B,
-        priority_after: Option<i32>,
+        &mut self, source: &mut B, priority_after: Option<i32>,
     ) -> Result<Written, WriteError> {
-        if self.conn_state.is_closed() {
-            trace!(%self.id, "write blocked; connection draining");
-            return Err(WriteError::Blocked);
+        if !self.owner.admit() {
+            return Err(if self.owner.streams().native_meter().is_some() {
+                WriteError::Admission(bytes::MeteredCopyError::Quarantined)
+            } else { WriteError::Blocked });
         }
-
-        let limit = self.state.write_limit();
-
-        let max_send_data = self.state.max_send_data(self.id);
-
-        let stream = self
-            .state
-            .send
-            .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
-            .ok_or(WriteError::ClosedStream)?;
-
-        if limit == 0 {
-            trace!(
-                stream = %self.id, max_data = self.state.max_data, data_sent = self.state.data_sent,
-                "write blocked by connection-level flow control or send window"
-            );
-            if !stream.connection_blocked {
-                stream.connection_blocked = true;
-                self.state.connection_blocked.push(self.id);
-            }
-            if stream.note_transport_write_blocked() {
-                self.state.transport_write_demand_streams += 1;
-            }
-            return Err(WriteError::Blocked);
-        }
-
-        let was_pending = stream.is_pending();
-        let written = match stream.write(source, limit) {
-            Ok(written) => written,
-            Err(WriteError::Blocked) => {
-                if stream.note_transport_write_blocked() {
-                    self.state.transport_write_demand_streams += 1;
-                }
+        let result = (|| {
+            let (state, _pending, conn_state) = self.owner.parts();
+            if conn_state.is_closed() { return Err(WriteError::Blocked); }
+            let limit = state.write_limit();
+            let meter = state.native_meter().cloned();
+            let max_send_data = state.max_send_data(self.id);
+            let stream = state.send.get_mut(&self.id).map(get_or_insert_send(max_send_data))
+                .ok_or(WriteError::ClosedStream)?;
+            if limit == 0 {
+                let add = usize::from(!stream.connection_blocked);
+                state.reserve_operations(0, 0, add)?;
+                let stream = state.send.get_mut(&self.id).and_then(Option::as_mut).ok_or(WriteError::ClosedStream)?;
+                if add != 0 { stream.connection_blocked = true; state.connection_blocked.push(self.id); }
+                if stream.note_transport_write_blocked() { state.transport_write_demand_streams += 1; }
                 return Err(WriteError::Blocked);
             }
-            Err(error) => {
-                if stream.clear_transport_write_demand() {
-                    self.state.transport_write_demand_streams -= 1;
+            let was_pending = stream.is_pending();
+            let plan = match stream.prepare_write(source, limit, meter.as_ref()) {
+                Ok(plan) => plan,
+                Err(WriteError::Blocked) => {
+                    if stream.note_transport_write_blocked() { state.transport_write_demand_streams += 1; }
+                    return Err(WriteError::Blocked);
                 }
-                return Err(error);
+                Err(error) => {
+                    if !matches!(error, WriteError::Admission(_)) && stream.clear_transport_write_demand() {
+                        state.transport_write_demand_streams -= 1;
+                    }
+                    return Err(error);
+                }
+            };
+            let operations = state.prepare_operations(0, usize::from(!was_pending), 0)?;
+            if let Some(meter) = &meter { meter.admit_precharged()?; }
+            state.commit_operations(operations)?;
+            let stream = state.send.get_mut(&self.id).and_then(Option::as_mut).ok_or(WriteError::ClosedStream)?;
+            let written = stream.commit_write(source, plan)?;
+            state.data_sent += written.bytes as u64;
+            state.unacked_data += written.bytes as u64;
+            trace!(stream = %self.id, "wrote {} bytes", written.bytes);
+            if !was_pending { state.pending.push_pending(self.id, stream.priority); }
+            if written.bytes > 0 {
+                stream.note_transport_write_progress();
+                if let Some(priority_after) = priority_after { stream.priority = priority_after; }
             }
-        };
-        self.state.data_sent += written.bytes as u64;
-        self.state.unacked_data += written.bytes as u64;
-        trace!(stream = %self.id, "wrote {} bytes", written.bytes);
-        if !was_pending {
-            self.state.pending.push_pending(self.id, stream.priority);
+            Ok(written)
+        })();
+        if let Err(WriteError::Admission(error)) = &result {
+            self.owner.fail(state::inventory_reason(*error));
         }
-        if written.bytes > 0 {
-            stream.note_transport_write_progress();
-            if let Some(priority_after) = priority_after {
-                stream.priority = priority_after;
-            }
-        }
-        Ok(written)
+        result
     }
 
     /// Check if this stream was stopped, get the reason if it was
     pub fn stopped(&self) -> Result<Option<VarInt>, ClosedStream> {
-        match self.state.send.get(&self.id).as_ref() {
+        match self.owner.streams().send.get(&self.id).as_ref() {
             Some(Some(s)) => Ok(s.stop_reason),
             Some(None) => Ok(None),
             None => Err(ClosedStream { _private: () }),
@@ -412,22 +461,34 @@ impl<'a> SendStream<'a> {
     ///
     /// [`StreamEvent::Finished`]: crate::StreamEvent::Finished
     pub fn finish(&mut self) -> Result<(), FinishError> {
-        let max_send_data = self.state.max_send_data(self.id);
-        let stream = self
-            .state
+        if !self.owner.admit() {
+            return Err(if self.owner.parts().0.native_meter().is_some() {
+                FinishError::Admission(bytes::MeteredCopyError::Quarantined)
+            } else { FinishError::ClosedStream });
+        }
+        let (state, _pending, _conn_state) = self.owner.parts();
+        let max_send_data = state.max_send_data(self.id);
+        let stream = state
             .send
             .get_mut(&self.id)
             .map(get_or_insert_send(max_send_data))
             .ok_or(FinishError::ClosedStream)?;
 
+        stream.check_finish()?;
         let was_pending = stream.is_pending();
+        if let Err(error) = state.reserve_operations(0, usize::from(!was_pending), 0) {
+            self.owner.fail(inventory_reason(error));
+            return Err(FinishError::Admission(error));
+        }
+        let (state, _, _) = self.owner.parts();
+        let stream = state.send.get_mut(&self.id).and_then(Option::as_mut).ok_or(FinishError::ClosedStream)?;
         stream.finish()?;
         stream.transport_write_blocked = false;
         if stream.clear_satisfied_transport_write_demand() {
-            self.state.transport_write_demand_streams -= 1;
+            state.transport_write_demand_streams -= 1;
         }
         if !was_pending {
-            self.state.pending.push_pending(self.id, stream.priority);
+            state.pending.push_pending(self.id, stream.priority);
         }
 
         Ok(())
@@ -438,9 +499,32 @@ impl<'a> SendStream<'a> {
     /// # Panics
     /// - when applied to a receive stream
     pub fn reset(&mut self, error_code: VarInt) -> Result<(), ClosedStream> {
-        let max_send_data = self.state.max_send_data(self.id);
-        let stream = self
-            .state
+        if !self.owner.admit() {
+            return Err(ClosedStream { _private: () });
+        }
+        // Check whether there is a new obligation before consuming capacity.
+        let prepared = {
+            let (state, pending, _) = self.owner.parts();
+            match state.send.get(&self.id) {
+                None => return Err(ClosedStream { _private: () }),
+                Some(Some(stream)) if matches!(stream.state, SendState::ResetSent) => {
+                    return Err(ClosedStream { _private: () });
+                }
+                _ => {}
+            }
+            pending.reset_stream.prepare((self.id, error_code))
+        };
+        let mut record = match prepared {
+            Ok(record) => record,
+            Err(()) => {
+                self.owner
+                    .fail("control record capacity exhausted before RESET_STREAM");
+                return Err(ClosedStream { _private: () });
+            }
+        };
+        let (state, pending, _conn_state) = self.owner.parts();
+        let max_send_data = state.max_send_data(self.id);
+        let stream = state
             .send
             .get_mut(&self.id)
             .map(get_or_insert_send(max_send_data))
@@ -454,12 +538,13 @@ impl<'a> SendStream<'a> {
         // Restore the portion of the send window consumed by the data that we aren't about to
         // send. We leave flow control alone because the peer's responsible for issuing additional
         // credit based on the final offset communicated in the RESET_STREAM frame we send.
-        self.state.unacked_data -= stream.pending.unacked();
+        record.begin_mutation();
+        state.unacked_data -= stream.pending.unacked();
         stream.reset();
         if stream.clear_transport_write_demand() {
-            self.state.transport_write_demand_streams -= 1;
+            state.transport_write_demand_streams -= 1;
         }
-        self.pending.reset_stream.push((self.id, error_code));
+        pending.reset_stream.push(record);
 
         // Don't reopen an already-closed stream we haven't forgotten yet
         Ok(())
@@ -469,14 +554,17 @@ impl<'a> SendStream<'a> {
     ///
     /// # Panics
     /// - when applied to a receive stream
-    pub fn set_priority(&mut self, priority: i32) -> Result<(), ClosedStream> {
-        let max_send_data = self.state.max_send_data(self.id);
-        let stream = self
-            .state
+    pub fn set_priority(&mut self, priority: i32) -> Result<(), PriorityError> {
+        if !self.owner.admit() {
+            return Err(if self.owner.streams().native_meter().is_some() { PriorityError::Admission(bytes::MeteredCopyError::Quarantined) } else { PriorityError::ClosedStream });
+        }
+        let (state, _pending, _conn_state) = self.owner.parts();
+        let max_send_data = state.max_send_data(self.id);
+        let stream = state
             .send
             .get_mut(&self.id)
             .map(get_or_insert_send(max_send_data))
-            .ok_or(ClosedStream { _private: () })?;
+            .ok_or(PriorityError::ClosedStream)?;
 
         stream.priority = priority;
         Ok(())
@@ -488,7 +576,8 @@ impl<'a> SendStream<'a> {
     /// - when applied to a receive stream
     pub fn priority(&self) -> Result<i32, ClosedStream> {
         let stream = self
-            .state
+            .owner
+            .streams()
             .send
             .get(&self.id)
             .ok_or(ClosedStream { _private: () })?;
@@ -655,4 +744,13 @@ impl From<ClosedStream> for io::Error {
 enum StreamHalf {
     Send,
     Recv,
+}
+
+/// Failure of a synchronous priority mutation; no transport-credit wait occurs.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum PriorityError {
+    #[error("native stream inventory refused: {0:?}")]
+    Admission(bytes::MeteredCopyError),
+    #[error("closed stream")]
+    ClosedStream,
 }

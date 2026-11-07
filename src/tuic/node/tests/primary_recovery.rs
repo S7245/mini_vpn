@@ -5,6 +5,101 @@ use crate::owned_upstream::UdpDownlinkEvent;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test(flavor = "current_thread")]
+async fn guarded_udp_panic_keeps_error_but_proves_original_children_joined() {
+    for fault in [1, 2] {
+        let server = server(8);
+        let cfg = config(server.local_addr().unwrap());
+        let mut host = NodeHost::prepare(cfg.clone(), Arc::new(Metrics::default()));
+        let mut peers = Vec::new();
+        let result = guarded(async {
+            boot(&mut host, &server, &cfg, &mut peers).await;
+            let data = host.data().unwrap();
+            data.udp_runtime.fault.store(fault, Ordering::Relaxed);
+            let mut source = data.start_udp_source().unwrap();
+            let control = data.udp_runtime.generation.clone();
+            let mut uni = peers[0].open_uni().await.unwrap();
+            uni.write_all(b"pending").await.unwrap();
+            let clock = Instant::now();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while source.recv(&clock).await.is_some() {}
+            })
+            .await
+            .unwrap();
+            assert_eq!(data.udp_runtime.child_count.load(Ordering::Relaxed), 0);
+            assert!(!control.frozen(1));
+            drop(uni);
+            drop(data);
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(3), host.drive_shutdown())
+                    .await
+                    .unwrap(),
+                NodeShutdown::Quarantined
+            );
+            assert!(
+                control.sealed(1),
+                "guarded error retains actual subtree join proof"
+            );
+            assert!(control.valid());
+            assert!(control.prepare_publication(1, 2).is_none());
+            let state = host.resources.state();
+            assert!(state.first.is_some());
+            assert!(state.endpoint_drained);
+            drop(state);
+            drop(source);
+        })
+        .await;
+        finish(host, server, peers, result).await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn source_eof_before_cleanup_retires_without_another_poll_or_drop() {
+    let server = server(8);
+    let cfg = config(server.local_addr().unwrap());
+    let mut host = NodeHost::prepare(cfg.clone(), Arc::new(Metrics::default()));
+    let mut peers = Vec::new();
+    let result = guarded(async {
+        boot(&mut host, &server, &cfg, &mut peers).await;
+        let data = host.data().unwrap();
+        let mut source = data.start_udp_source().unwrap();
+        let control = data.udp_runtime.generation.clone();
+        let epoch = control.epoch();
+        let clock = Instant::now();
+        let target = TargetAddr::IpPort("192.0.2.1:443".parse().unwrap());
+        let mut fragment = encode_packet(7, &target, b"retained partial");
+        fragment[6] = 2;
+        peers[0].send_datagram(fragment.into()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), source.recv(&clock))
+                .await
+                .unwrap(),
+            Some(UdpDownlinkEvent::Ignored)
+        );
+        host.request_stop();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while source.recv(&clock).await.is_some() {}
+        })
+        .await
+        .unwrap();
+        assert!(!control.frozen(epoch), "EOF must precede cleanup freeze");
+        drop(data);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), host.drive_shutdown())
+                .await
+                .unwrap(),
+            NodeShutdown::RunningResourcesSettled
+        );
+        assert!(control.sealed(epoch));
+        assert!(control.prepare_publication(epoch, epoch + 1).is_none());
+        assert!(host.resources.state().endpoint_drained);
+        // An EOF consumer remains alive but never needs another poll to settle.
+        drop(source);
+    })
+    .await;
+    finish(host, server, peers, result).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn primary_reauth_seals_old_udp_and_preserves_auxiliary() {
     let server = server(8);
     let mut cfg = config(server.local_addr().unwrap());

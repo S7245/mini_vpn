@@ -331,3 +331,50 @@ impl TimeSource for FakeTimeSource {
         *self.0.lock().unwrap()
     }
 }
+
+#[test]
+fn bounded_reset_derivation_matches_original_and_refuses_before_provider_effects() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Key {
+        inner: Arc<dyn crypto::HmacKey>,
+        len: usize,
+        calls: AtomicUsize,
+    }
+    impl crypto::HmacKey for Key {
+        fn signature_len(&self) -> usize {
+            self.len
+        }
+        fn sign(&self, data: &[u8], out: &mut [u8]) {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.sign(data, out);
+        }
+        fn verify(&self, data: &[u8], signature: &[u8]) -> Result<(), crypto::CryptoError> {
+            self.inner.verify(data, signature)
+        }
+    }
+    let config = EndpointConfig::default();
+    let id = ConnectionId::new(&[0x93; 8]);
+    let expected = ResetToken::new(&*config.reset_key, id);
+    let key = Key {
+        len: config.reset_key.signature_len(),
+        inner: config.reset_key.clone(),
+        calls: AtomicUsize::new(0),
+    };
+    let mut scratch = [0; 64];
+    let mut actual = None;
+    let allocations = allocations_in(|| actual = ResetToken::new_bounded(&key, id, &mut scratch));
+    assert_eq!(actual, Some(expected));
+    assert_eq!(allocations, 0);
+    assert_eq!(key.calls.load(Ordering::Relaxed), 1);
+    assert!(ResetToken::new_bounded(&key, id, &mut [0; 15]).is_none());
+    assert_eq!(key.calls.load(Ordering::Relaxed), 1);
+    for len in [0, 15, 65, usize::MAX] {
+        let key = Key {
+            inner: config.reset_key.clone(),
+            len,
+            calls: AtomicUsize::new(0),
+        };
+        assert!(ResetToken::new_bounded(&key, id, &mut scratch).is_none());
+        assert_eq!(key.calls.load(Ordering::Relaxed), 0);
+    }
+}

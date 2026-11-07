@@ -1,7 +1,7 @@
 //! Compatibility composition and persistent control custody of the original DATA loop.
 //! The host session owns its saved outer future; the DATA future borrows its device.
 //! Control handles and observers never own either future. Device settlement is not flow or TUIC settlement;
-//! public startup remains on the legacy path until those owners are composed here.
+//! TUIC public startup composes those owners through the private service root.
 //! Custody tests live at `tests/compatibility_relay_custody.rs` via the private seam below.
 
 #[cfg(test)]
@@ -36,18 +36,26 @@ use tokio::sync::mpsc;
 #[cfg(all(test, feature = "harness"))]
 use super::legacy_event_loop::RelayEventTestBridge;
 
+mod business;
+mod failure;
+mod relay_lane;
 mod flow_custody;
+mod session_udp;
+pub(in crate::client_tun) mod tuic_service;
+#[cfg(test)]
+pub(in crate::client_tun) use flow_custody::ReceiveWindow;
+pub(in crate::client_tun) use flow_custody::{FailureClock, ReaderWindow, stamp_failure};
 #[cfg(test)]
 pub(in crate::client_tun) use flow_custody::{ReadyReadRequest, drain_ready_remote_reads};
 
 pub(in crate::client_tun) use flow_custody::{
     FatalPhysicalTurn, FatalStep, FlowAdmission, FlowMirror, GenericLaunchRequest, LocalReset,
-    RearmGate, RearmIntent, RemotePayloadRequest, flush_tx_and_release_downlink_permits,
-    gate_legacy_rearm, launch_generic_relay, legacy_bare_rearm_from_loop,
-    legacy_reasoned_rearm_from_loop, legacy_reasoned_rearm_with_gate,
-    legacy_reasoned_rearm_with_snapshot_and_gate, reap_dead_slots_from_loop, run_relay,
-    run_relay_ordered_egress_permit, run_relay_thin, run_relay_with_engine, run_relay_writer,
-    send_remote_payload_batch_to_main,
+    RearmGate, RearmIntent, RemotePayloadRequest, ResetProof,
+    flush_tx_and_release_downlink_permits, gate_legacy_rearm, launch_generic_relay,
+    legacy_bare_rearm_from_loop, legacy_reasoned_rearm_from_loop, legacy_reasoned_rearm_with_gate,
+    legacy_reasoned_rearm_with_snapshot_and_gate, poll_egress_cycle, reap_dead_slots_from_loop,
+    run_relay, run_relay_ordered_egress_permit, run_relay_thin, run_relay_with_engine,
+    run_relay_writer, send_remote_payload_batch_to_main,
 };
 
 #[cfg(test)]
@@ -74,16 +82,30 @@ enum SessionDeviceState {
     Incomplete,
     DeviceSettled,
     DeviceFailedSettled,
+    BusinessSettled,
+    BusinessFailedSettled,
 }
 
 #[derive(Default)]
 struct SessionLedger {
     first_egress_io: Option<Arc<std::io::Error>>,
+    first_ingress_io: Option<Arc<std::io::Error>>,
+    device_source_guards: [Option<crate::device::egress::CallbackSourceGuard>; 2],
+    device_source_disposal: bool,
     egress_failures: u64,
     first_failure: Option<RetainedFailure>,
     additional_failures: u64,
     shutdown_deadline: Option<tokio::time::Instant>,
     quarantined: bool,
+    unknown_panic_payloads: u64,
+}
+
+// Terminal unknown payload, owned by its original one-shot driver site. Never
+// invoke arbitrary destruction again, including forced destruction of a Q shell.
+// Count is bounded by the six original sites; payload bytes remain Unknown/Q.
+#[must_use = "retain terminal panic custody across the original Q driver"]
+struct PanicCustody {
+    _payload: std::mem::ManuallyDrop<Box<dyn std::any::Any + Send>>,
 }
 
 #[derive(Default)]
@@ -139,14 +161,23 @@ pub(super) struct ListenerOwnedCounts {
 
 #[derive(Default)]
 pub(super) struct SessionControl {
+    app_meter: Option<bytes::BackingMeter>,
+    egress_cold: Mutex<egress::deadline::ColdSlot>,
+    relay_lane: Mutex<Option<relay_lane::Observation>>,
+    relay_lane_prepared: AtomicBool,
+    business_only: bool,
     stop: Arc<SessionStop>,
     ledger: Mutex<SessionLedger>,
-    opens: Mutex<OpenCustody>,
+    parent_deadline: std::sync::OnceLock<Arc<Mutex<Option<tokio::time::Instant>>>>,
+    opens: flow_custody::OpenOwner,
     announced: [AtomicU64; 2],
     open_started: AtomicBool,
     control_remaining: AtomicUsize,
     driver_complete: AtomicBool,
+    business_complete: AtomicBool,
     state_changed: Notify,
+    #[cfg(test)]
+    shutdown_census_runs: AtomicUsize,
     #[cfg(test)]
     startup_profile_observation: Mutex<Option<StartupProfileObservation>>,
     #[cfg(test)]
@@ -218,11 +249,12 @@ impl SessionControl {
         }
     }
 
-    fn request_stop(&self) {
-        self.ledger().shutdown_deadline.get_or_insert_with(|| {
+    fn request_stop(&self) -> tokio::time::Instant {
+        let original = *self.ledger().shutdown_deadline.get_or_insert_with(|| {
             tokio::time::Instant::now() + std::time::Duration::from_secs(15)
         });
         self.stop.request_stop();
+        original
     }
 
     async fn stopped(&self) {
@@ -235,16 +267,55 @@ impl SessionControl {
     }
 
     pub(in crate::client_tun) fn note_loop_error(&self, error: &std::io::Error) {
-        self.record(RetainedFailure::from_io_ref(
-            Self::origin(FailurePhase::DeviceRead),
-            error,
-        ));
+        if let Some(report) = crate::device::egress::callback_report(error, Self::origin(FailurePhase::DeviceRead)) {
+            self.accept_device_report(report);
+        } else if !egress::is_recorded_error(error, self) && !egress::is_handled_refusal(error, self) {
+            self.record(RetainedFailure::from_io_ref(
+                Self::origin(FailurePhase::DeviceRead),
+                error,
+            ));
+        }
         self.request_stop();
     }
 
-    fn quarantine(&self, phase: FailurePhase, payload: Box<dyn std::any::Any + Send>) {
-        self.record(RetainedFailure::from_panic(Self::origin(phase), payload));
-        self.ledger().quarantined = true;
+    fn retain_panic(
+        &self,
+        phase: FailurePhase,
+        payload: Box<dyn std::any::Any + Send>,
+        quarantine: bool,
+    ) -> Option<PanicCustody> {
+        if quarantine {
+            if let Some(meter) = &self.app_meter {
+                meter.quarantine();
+            }
+            self.ledger().quarantined = true;
+        }
+        // Publish opaque first failure before any unknown destructor/reentrancy.
+        self.record(RetainedFailure::opaque_panic(Self::origin(phase)));
+        if let Err(secondary) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+            {
+                let mut ledger = self.ledger();
+                ledger.quarantined = true;
+                if let Some(meter) = &self.app_meter {
+                    meter.quarantine();
+                }
+                ledger.unknown_panic_payloads = ledger.unknown_panic_payloads.saturating_add(1);
+                // Primary is already retained; secondary cannot replace it.
+                ledger.additional_failures = ledger.additional_failures.saturating_add(1);
+            }
+            return Some(PanicCustody {
+                _payload: std::mem::ManuallyDrop::new(secondary),
+            });
+        }
+        None
+    }
+
+    fn quarantine(
+        &self,
+        phase: FailurePhase,
+        payload: Box<dyn std::any::Any + Send>,
+    ) -> Option<PanicCustody> {
+        self.retain_panic(phase, payload, true)
     }
 }
 
@@ -265,20 +336,35 @@ struct ClientTunHandle {
 }
 
 impl SessionControl {
+    fn execution_complete(&self) -> bool {
+        if self.business_only {
+            self.business_complete.load(Ordering::Acquire)
+        } else {
+            self.driver_complete.load(Ordering::Acquire)
+        }
+    }
+
     fn state(&self) -> SessionDeviceState {
-        let complete = self.driver_complete.load(Ordering::Acquire);
-        if !complete && !self.stop.stopping.load(Ordering::Acquire) {
+        let business = self.business_only && self.business_complete.load(Ordering::Acquire);
+        let device = self.driver_complete.load(Ordering::Acquire);
+        if !business && !device && !self.stop.stopping.load(Ordering::Acquire) {
             return SessionDeviceState::Running;
         }
         let ledger = self.ledger();
-        if complete {
+        if ledger.quarantined {
+            SessionDeviceState::Incomplete
+        } else if device {
             if ledger.first_failure.is_some() {
                 SessionDeviceState::DeviceFailedSettled
             } else {
                 SessionDeviceState::DeviceSettled
             }
-        } else if ledger.quarantined {
-            SessionDeviceState::Incomplete
+        } else if business {
+            if ledger.first_failure.is_some() {
+                SessionDeviceState::BusinessFailedSettled
+            } else {
+                SessionDeviceState::BusinessSettled
+            }
         } else {
             SessionDeviceState::Stopping
         }
@@ -345,10 +431,14 @@ impl<F: Future<Output = ()>> ClientTunSession<F> {
     }
 
     fn poll_driver(&mut self, cx: &mut std::task::Context<'_>) -> SessionDeviceState {
-        if !self.control.driver_complete.load(Ordering::Acquire)
-            && self.driver.as_mut().poll(cx).is_ready()
-        {
-            self.control.driver_complete.store(true, Ordering::Release);
+        if !self.control.execution_complete() && self.driver.as_mut().poll(cx).is_ready() {
+            if self.control.business_only {
+                self.control
+                    .business_complete
+                    .store(true, Ordering::Release);
+            } else {
+                self.control.driver_complete.store(true, Ordering::Release);
+            }
         }
         let state = self.state();
         if self.last_reported != state {
@@ -363,7 +453,7 @@ impl<F: Future<Output = ()>> ClientTunSession<F> {
     async fn drive_until_settled(&mut self) -> SessionDeviceState {
         std::future::poll_fn(|cx| {
             let state = self.poll_driver(cx);
-            if self.control.driver_complete.load(Ordering::Acquire) {
+            if self.control.execution_complete() {
                 Poll::Ready(state)
             } else {
                 Poll::Pending
@@ -397,7 +487,7 @@ impl<F: Future<Output = ()>> ClientTunSession<F> {
 impl<F> Drop for ClientTunSession<F> {
     fn drop(&mut self) {
         self.control.request_stop();
-        if !self.control.driver_complete.load(Ordering::Acquire) {
+        if !self.control.execution_complete() {
             self.control.record(RetainedFailure::from_io(
                 SessionControl::origin(FailurePhase::SessionLoopDrop),
                 std::io::Error::from(std::io::ErrorKind::Interrupted),
@@ -408,6 +498,7 @@ impl<F> Drop for ClientTunSession<F> {
     }
 }
 
+#[cfg(test)]
 fn prepare_client_tun_session<D, U, M>(
     device: D,
     upstream: Arc<U>,
@@ -421,25 +512,64 @@ where
     U: ProxyUpstream + DatagramUpstream + 'static,
     M: MetricsSink,
 {
-    let control = Arc::new(SessionControl {
-        opens: Mutex::new(
+    prepare_owned_client_tun_session(
+        device,
+        Some(SessionIngress {
+            upstream: Arc::new(LegacyOwnedUpstream::new(upstream)),
+            downlink: UdpDownlinkSource::legacy_raw(downlink_rx),
+            health_join: None,
+        }),
+        runtime_config,
+        metrics_handle,
+        metrics,
+    )
+}
+
+/// Absent ingress is only the unpublished startup-failure/stop path: it cannot
+/// enter DATA, but still owns the same actual device shutdown and error custody.
+struct SessionIngress<U> {
+    upstream: Arc<U>,
+    downlink: UdpDownlinkSource,
+    health_join: Option<crate::failover::HealthJoinObservation>,
+}
+
+fn prepare_owned_client_tun_session<D, U, M>(
+    device: D,
+    ingress: Option<SessionIngress<U>>,
+    runtime_config: TunRuntimeConfig,
+    metrics_handle: Arc<Metrics>,
+    metrics: M,
+) -> ClientTunSession<impl Future<Output = ()>>
+where
+    D: TunIo,
+    U: OwnedUpstream + 'static,
+    M: MetricsSink,
+{
+    let control = Arc::new({ let mut control = SessionControl::default(); control.opens = flow_custody::OpenOwner::new(
             if runtime_config.listener_capacity_profile == ListenerCapacityProfile::F4096 {
                 OpenCustody::with_flows()
             } else {
                 OpenCustody::default()
             },
-        ),
-        control_remaining: AtomicUsize::new(32),
-        ..SessionControl::default()
-    });
+        ); control.control_remaining = AtomicUsize::new(32); control });
     let retained = Arc::clone(&control);
-    let mut device = egress::SessionEgress::new(device, Arc::clone(&control));
+    let mut device = device;
     let driver = Box::pin(async move {
+        let mut source_retirement = None;
+        let mut inner_poll_custody = None;
+        let mut inner_drop_custody = None;
+        let mut source_early_custody = None;
+        if let Some(SessionIngress {
+            upstream,
+            mut downlink,
+            health_join,
+        }) = ingress
         {
+            let mut egress = egress::SessionEgress::new(&mut device, Arc::clone(&retained));
             let mut inner = Box::pin(run_borrowed_event_loop(
-                &mut device,
-                Arc::new(LegacyOwnedUpstream::new(upstream)),
-                UdpDownlinkSource::legacy_raw(downlink_rx),
+                &mut egress,
+                upstream,
+                &mut downlink,
                 runtime_config,
                 metrics_handle,
                 metrics,
@@ -461,70 +591,25 @@ where
                     SessionControl::origin(FailurePhase::DeviceRead),
                     error,
                 )),
-                Some(Err(payload)) => retained.record(RetainedFailure::from_panic(
-                    SessionControl::origin(FailurePhase::SessionLoop),
-                    payload,
-                )),
+                Some(Err(payload)) => {
+                    inner_poll_custody =
+                        retained.retain_panic(FailurePhase::SessionLoop, payload, false)
+                }
                 _ => {}
             }
             if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(inner))) {
-                retained.record(RetainedFailure::from_panic(
-                    SessionControl::origin(FailurePhase::SessionLoopDrop),
-                    payload,
-                ));
+                inner_drop_custody =
+                    retained.retain_panic(FailurePhase::SessionLoopDrop, payload, false);
+            }
+            if let Some(receipt) = health_join {
+                source_retirement = Some((downlink, receipt));
+            } else {
+                source_early_custody = session_udp::dispose(downlink, &retained);
             }
         }
-        retained.request_stop();
-        let mut stop_failed = false;
-        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| device.request_stop())) {
-            retained.quarantine(FailurePhase::DeviceStop, payload);
-            stop_failed = true;
-        }
-        let device_settlement = async {
-            if stop_failed {
-                return;
-            }
-            let shutdown = std::future::poll_fn(|cx| {
-                match catch_unwind(AssertUnwindSafe(|| device.poll_shutdown(cx))) {
-                    Ok(Poll::Pending) => Poll::Pending,
-                    Ok(Poll::Ready(result)) => Poll::Ready(Some(result)),
-                    Err(payload) => {
-                        retained.quarantine(FailurePhase::DeviceShutdown, payload);
-                        Poll::Ready(None)
-                    }
-                }
-            })
-            .await;
-            if let Some(mut shutdown) = shutdown {
-                #[cfg(test)]
-                retained.note_device_settled();
-                if let Some(failure) = shutdown.take_failure() {
-                    retained.record(failure);
-                } else if shutdown.state() == DeviceShutdownState::FailedSettled {
-                    retained.record(RetainedFailure::from_io(
-                        SessionControl::origin(FailurePhase::DeviceShutdown),
-                        std::io::Error::from(
-                            shutdown.io_kind().unwrap_or(std::io::ErrorKind::Other),
-                        ),
-                    ));
-                }
-                let mut ledger = retained.ledger();
-                ledger.additional_failures = ledger
-                    .additional_failures
-                    .saturating_add(shutdown.take_additional_failures());
-            }
-        };
-        tokio::join!(retained.settle_opens(), device_settlement);
-        let quarantined = retained.ledger().quarantined;
-        if quarantined {
-            std::future::pending::<()>().await;
-        }
-        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(device))) {
-            retained.record(RetainedFailure::from_panic(
-                SessionControl::origin(FailurePhase::DeviceDrop),
-                payload,
-            ));
-        }
+        let panic_custody = (inner_poll_custody, inner_drop_custody, source_early_custody);
+        business::finish_device(device, source_retirement, retained).await;
+        drop(panic_custody);
     });
     ClientTunSession {
         driver,
@@ -540,7 +625,7 @@ where
 pub(crate) async fn run_owned_event_loop<D, U, M>(
     mut device: D,
     upstream: Arc<U>,
-    udp_downlink: UdpDownlinkSource,
+    mut udp_downlink: UdpDownlinkSource,
     runtime_config: TunRuntimeConfig,
     metrics_handle: Arc<Metrics>,
     metrics: M,
@@ -549,17 +634,18 @@ pub(crate) async fn run_owned_event_loop<D, U, M>(
     U: OwnedUpstream + 'static,
     M: MetricsSink,
 {
-    if let Err(error) = run_borrowed_event_loop(
+    let result = run_borrowed_event_loop(
         &mut device,
         upstream,
-        udp_downlink,
+        &mut udp_downlink,
         runtime_config,
         metrics_handle,
         metrics,
         None,
     )
-    .await
-    {
+    .await;
+    drop(udp_downlink);
+    if let Err(error) = result {
         println!("TUN ingress terminated: {error}");
     }
 }
@@ -638,8 +724,9 @@ async fn run_event_loop_sinked<D, U>(
 /// 中文要点：knife1 起把主循环抽成 `run_event_loop`（泛型 over [`TunIo`] 设备 + [`super::MetricsSink`]），
 /// 生产与并发压测 harness **跑同一份循环代码**。本薄壳只负责构造真依赖；循环逻辑零回归。
 pub async fn start_tun_proxy() {
+    let upstream_kind = select_upstream_kind(std::env::var("MINI_VPN_UPSTREAM").ok().as_deref());
     let relay_policy = Arc::new(RelayFamilyPolicy::from_env());
-    let runtime_config =
+    let mut runtime_config =
         match TunRuntimeConfig::from_env_with_relay_policy(Arc::clone(&relay_policy)) {
             Ok(config) => config,
             Err(e) => {
@@ -791,26 +878,58 @@ pub async fn start_tun_proxy() {
     );
 
     // 1. 初始化 TUN 设备 / 创建操作系统的原生异步虚拟网卡。
-    let raw_tun = match create_tun_device(runtime_config.tun_mtu).await {
-        Ok(device) => device,
-        Err(e) => {
-            println!("无法创建 TUN 设备: {e}");
+    // Reject the production custody profile and transport configuration before
+    // creating an actual TUN/pump. The same selector runs in the saved helper.
+    let transport_config = if matches!(upstream_kind, UpstreamKind::Tuic | UpstreamKind::Failover) {
+        if let Err(error) = tuic_service::select_runtime(&mut runtime_config) {
+            eprintln!("TUIC session configuration rejected: {error}");
             return;
         }
-    };
-    let device = if runtime_config.relay_policy.d16_byte_owned() {
-        println!(
-            "🧺 TUN ingress service: enabled capacity={} packets source=tun_tx_queue_len",
-            runtime_config.tun_tx_queue_len
-        );
-        VirtualTunDevice::new_pumped(
-            raw_tun,
-            runtime_config.tun_mtu,
-            runtime_config.tun_tx_queue_len,
-        )
+        let config = match TuicClientConfig::from_env_with_relay_policy(Arc::clone(&relay_policy)) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("加载 TUIC 客户端配置失败（启动中止）: {error}");
+                return;
+            }
+        };
+        if upstream_kind == UpstreamKind::Failover {
+            let reality = match RealityUpstream::from_env() {
+                Ok(config) => config,
+                Err(error) => {
+                    eprintln!("加载 REALITY 配置失败（failover 启动中止）: {error}");
+                    return;
+                }
+            };
+            Some(tuic_service::Startup::Failover(config, reality))
+        } else {
+            Some(tuic_service::Startup::Tuic(config))
+        }
     } else {
-        println!("🧺 TUN ingress service: disabled");
-        VirtualTunDevice::new(raw_tun, runtime_config.tun_mtu)
+        None
+    };
+    let mtu = runtime_config.tun_mtu;
+    let pumped = runtime_config.relay_policy.d16_byte_owned();
+    let ingress_capacity = runtime_config.tun_tx_queue_len;
+    let device_factory = move |meter: Option<bytes::BackingMeter>| async move {
+        // Full Native device inventory is the next A slice. Until it exists,
+        // reject before OS-device creation or the original ingress pump spawn.
+        if meter
+            .as_ref()
+            .is_some_and(|meter| meter.budget_limit().is_some())
+        {
+            return Err(crate::shared::ClientError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Native device cold inventory is not ready",
+            )));
+        }
+        let raw_tun = create_tun_device(mtu)
+            .await
+            .map_err(|error| crate::shared::ClientError::Io(std::io::Error::other(error)))?;
+        Ok(if pumped {
+            VirtualTunDevice::new_pumped(raw_tun, mtu, ingress_capacity)
+        } else {
+            VirtualTunDevice::new(raw_tun, mtu)
+        })
     };
 
     // 刀11：进程级数据面可观测性句柄。**在选上游之前**构造一次 → 同一 `Arc<Metrics>` 既喂
@@ -819,47 +938,20 @@ pub async fn start_tun_proxy() {
 
     // 2. 选上游 Transport：MINI_VPN_UPSTREAM=tuic（默认）| reality（VLESS over REALITY over TCP，刀8）。
     //    两分支各自单态化 run_event_loop（device 只在选中的分支被 move，互斥）。
-    match select_upstream_kind(std::env::var("MINI_VPN_UPSTREAM").ok().as_deref()) {
-        UpstreamKind::Tuic => {
-            let cfg = match TuicClientConfig::from_env_with_relay_policy(Arc::clone(&relay_policy))
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    println!("加载 TUIC 客户端配置失败（启动中止）: {e}");
-                    return;
-                }
-            };
-            let upstream = match TuicUpstream::connect(&cfg, Arc::clone(&metrics)).await {
-                Ok(u) => {
-                    println!("✅ 已连接 TUIC 出口 {} (sing-box)", cfg.server);
-                    Arc::new(u)
-                }
-                Err(e) => {
-                    println!("连接 TUIC 出口失败（启动中止）: {e:?}");
-                    return;
-                }
-            };
-            // 3. UDP over TUIC Packet 下行接收端（断线自愈，见 13b/13c）。
-            println!("🌊 UDP relay 数据面就绪（TUIC Packet datagram → sing-box）");
-            let Some(mut udp_shutdown) = upstream.take_udp_shutdown() else {
-                eprintln!("TUIC UDP shutdown custody unavailable; retaining upstream");
-                std::future::pending::<()>().await;
-                return;
-            };
-            let tuic_downlink_rx = upstream.start_udp();
-            // 4. 进入共享主循环（生产传 NoopSink：零插桩开销）。
-            run_event_loop_sinked(
-                runtime_config.profile_loop,
-                device,
-                Arc::clone(&upstream),
-                tuic_downlink_rx,
-                runtime_config,
-                Arc::clone(&metrics),
-            )
-            .await;
-            udp_shutdown.finish().await;
+    match upstream_kind {
+        UpstreamKind::Tuic | UpstreamKind::Failover => {
+            if let Some(cfg) = transport_config {
+                tuic_service::serve(device_factory, cfg, runtime_config, metrics).await;
+            }
         }
         UpstreamKind::Reality => {
+            let device = match device_factory(None).await {
+                Ok(device) => device,
+                Err(error) => {
+                    eprintln!("无法创建 TUN 设备: {error}");
+                    return;
+                }
+            };
             // REALITY 是 **TCP-only**（force-reality）：UDP no-op（DatagramUpstream 静默丢）+
             // **空 downlink channel**——持有 tx 永不 send → run_event_loop 的下行 select 分支永久 pending
             // （REALITY 无 UDP 下行；分离上游/UDP-over-VLESS/failover 留刀9）。
@@ -881,58 +973,6 @@ pub async fn start_tun_proxy() {
                 device,
                 upstream,
                 dummy_rx,
-                runtime_config,
-                Arc::clone(&metrics),
-            )
-            .await;
-        }
-        UpstreamKind::Failover => {
-            // 刀9：健康感知 TUIC↔REALITY。两腿都建——TUIC 既承 TCP relay 又是 **UDP 唯一出口**，
-            // REALITY 是 TCP-only 备路。`FailoverUpstream::open_tcp` 按健康态选腿；`send_udp` 恒走 tuic。
-            let tuic_cfg =
-                match TuicClientConfig::from_env_with_relay_policy(Arc::clone(&relay_policy)) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        println!("加载 TUIC 客户端配置失败（failover 启动中止）: {e}");
-                        return;
-                    }
-                };
-            let tuic = match TuicUpstream::connect(&tuic_cfg, Arc::clone(&metrics)).await {
-                Ok(u) => {
-                    println!("✅ 已连接 TUIC 出口 {} (failover 主腿)", tuic_cfg.server);
-                    Arc::new(u)
-                }
-                Err(e) => {
-                    println!("连接 TUIC 出口失败（failover 启动中止）: {e:?}");
-                    return;
-                }
-            };
-            // UDP 下行接收端来源端 = TUIC（独立于 TCP 选腿；UDP 永久绑 TUIC）。
-            println!("🌊 UDP relay 数据面就绪（TUIC Packet datagram → sing-box；UDP 永留 QUIC）");
-            let tuic_downlink_rx = tuic.start_udp();
-            let reality = match RealityUpstream::from_env() {
-                Ok(u) => {
-                    println!(
-                        "✅ 已配置 REALITY 出口（failover 备腿；VLESS over REALITY over TCP）"
-                    );
-                    Arc::new(u)
-                }
-                Err(e) => {
-                    println!(
-                        "加载 REALITY 客户端配置失败（failover 需两腿都配齐，启动中止）: {e:?}"
-                    );
-                    return;
-                }
-            };
-            let upstream = Arc::new(FailoverUpstream::new(tuic, reality));
-            // 后台健康探针：REALITY 当班时每 30s 探 TUIC，按不对称迟滞（连续 3 + 60s 冷却）切回。
-            upstream.spawn_health_probe();
-            println!("🔀 failover 就绪：TCP relay 健康感知 TUIC↔REALITY，UDP 恒走 TUIC");
-            run_event_loop_sinked(
-                runtime_config.profile_loop,
-                device,
-                upstream,
-                tuic_downlink_rx,
                 runtime_config,
                 Arc::clone(&metrics),
             )

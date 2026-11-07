@@ -346,7 +346,7 @@ async fn dirty_pressure_counts_real_queues_pending_and_missing_sockets() {
     ));
     pair.contexts.insert(udp, SocketCtx::new(10000));
     for (handle, bytes) in [(first, 11), (second, 13), (idle, 17), (udp, 19)] {
-        pair.contexts.get_mut(&handle).unwrap().downlink_pending = vec![0x41; bytes];
+        pair.contexts.get_mut(&handle).unwrap().downlink_pending = vec![0x41; bytes].into();
     }
     for (dirty, expected) in [
         (vec![first, second, idle, udp], (19, 60, 7, 12)),

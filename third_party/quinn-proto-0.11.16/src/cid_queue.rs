@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use crate::{ConnectionId, ResetToken, frame::NewConnectionId};
+use crate::{frame::NewConnectionId, ConnectionId, ResetToken};
 
 /// DataType stored in CidQueue buffer
 type CidData = (ConnectionId, Option<ResetToken>);
@@ -8,7 +8,7 @@ type CidData = (ConnectionId, Option<ResetToken>);
 /// Sliding window of active Connection IDs
 ///
 /// May contain gaps due to packet loss or reordering
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CidQueue {
     /// Ring buffer indexed by `self.cursor`
     buffer: [Option<CidData>; Self::LEN],

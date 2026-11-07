@@ -1,9 +1,17 @@
 //! NodeHost's saved closed-auxiliary recovery transaction. Owns fixed demands,
 //! original preparation/draining permits and predecessor retirement. Only run
 //! polls physical work; callers submit/observe tickets and re-admit after commit.
-//! Primary uses the original UDP producer/consumer seals; healthy replacement remains closed.
+//! Primary uses original UDP seals; healthy predecessors retain their live carriers.
 //! No new tasks or DATA-path coordination. Real-peer tests: node/tests/recovery.rs.
 use super::*;
+mod maintenance;
+mod probe;
+#[cfg(test)]
+mod tests;
+pub(in crate::tuic) use maintenance::{Proof, Receipt, SubmissionFailure};
+pub(in crate::tuic) use probe::{ProbeKind, ProbeSubmissionFailure};
+#[cfg(test)]
+pub(super) use tests::ClearGate;
 
 pub(super) struct StatsTask {
     pub(super) stable_id: Option<usize>,
@@ -15,6 +23,14 @@ pub(in crate::tuic) struct Ticket {
     index: usize,
     identity: TcpPoolTransportIdentity,
     deadline: tokio::time::Instant,
+    sequence: u64,
+    kind: Kind,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Closed,
+    Healthy,
+    Probe(ProbeKind),
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Outcome {
@@ -26,20 +42,30 @@ struct Demand {
     ticket: Ticket,
     outcome: Outcome,
     attempts: u8,
+    preparation: Option<TcpPoolSlotPreparation>,
+    settled: bool,
+    ready_identity: Option<TcpPoolTransportIdentity>,
+    receipt_issued: bool,
 }
 pub(super) struct Predecessor {
     pub(super) generation: TerminalGeneration,
     pub(super) permit: TcpPoolDrainingPermit,
     entry: usize,
+    healthy: bool,
 }
 pub(super) struct State {
+    #[cfg(test)]
+    pub(super) clear_gate: Option<Arc<ClearGate>>,
     demands: Vec<Option<Demand>>,
+    sequence: u64,
+    active_ticket: Option<Ticket>,
     changed: Arc<Notify>,
     pub(super) preparation: Option<TcpPoolSlotPreparation>,
     pub(super) permit: Option<TcpPoolDrainingPermit>,
     pub(super) predecessor: Option<Predecessor>,
     pub(super) primary_predecessor: Option<Predecessor>,
     pub(super) primary_permit: Arc<AtomicBool>,
+    probe_custody: Vec<Option<probe::ProbeSlot>>,
     pub(super) release_failure: Option<(
         usize,
         TcpPoolTransportIdentity,
@@ -47,6 +73,43 @@ pub(super) struct State {
     )>,
 }
 impl State {
+    #[cfg(test)]
+    pub(super) fn completed_probe_custodies(&self) -> usize {
+        self.probe_custody
+            .iter()
+            .flatten()
+            .filter(|slot| slot.complete())
+            .count()
+    }
+
+    pub(super) fn has_rebuild_debt(&self) -> bool {
+        self.fallback_pending()
+            || self.predecessor.is_some()
+            || self.primary_predecessor.is_some()
+            || self.primary_permit.load(Ordering::Acquire)
+            || self.release_failure.is_some()
+            || self
+                .probe_custody
+                .iter()
+                .flatten()
+                .any(|slot| !slot.complete())
+            || self
+                .demands
+                .iter()
+                .flatten()
+                .any(|d| d.preparation.is_some())
+    }
+
+    pub(super) fn fallback_pending(&self) -> bool {
+        self.active_ticket.is_some()
+            || self.preparation.is_some()
+            || self.permit.is_some()
+            || self
+                .demands
+                .iter()
+                .flatten()
+                .any(|demand| demand.outcome == Outcome::Failed && !demand.settled)
+    }
     fn predecessor(&self, primary: bool) -> &Option<Predecessor> {
         if primary {
             &self.primary_predecessor
@@ -63,13 +126,18 @@ impl State {
     }
     pub(super) fn new(count: usize) -> Self {
         Self {
+            #[cfg(test)]
+            clear_gate: None,
             demands: (0..count).map(|_| None).collect(),
+            sequence: 0,
+            active_ticket: None,
             changed: Arc::new(Notify::new()),
             preparation: None,
             permit: None,
             predecessor: None,
             primary_predecessor: None,
             primary_permit: Arc::new(AtomicBool::new(false)),
+            probe_custody: (0..count).map(|_| None).collect(),
             release_failure: None,
         }
     }
@@ -144,21 +212,49 @@ impl StartupResources {
     fn expire_demands(&self) {
         let expired = {
             let mut state = self.state();
-            let mut expired = 0;
+            let active = state.recovery.active_ticket;
+            let mut expired = Vec::new();
             for demand in state.recovery.demands.iter_mut().flatten() {
                 if demand.outcome == Outcome::Pending
                     && tokio::time::Instant::now() >= demand.ticket.deadline
                 {
                     demand.outcome = Outcome::Failed;
-                    expired += 1;
+                    expired.push((
+                        demand.ticket,
+                        demand.preparation.take(),
+                        active == Some(demand.ticket),
+                    ));
+                }
+            }
+            // Physical custody remains authoritative if its control demand is
+            // damaged. Use its original deadline and avoid the active slot.
+            for slot in state.recovery.probe_custody.iter().flatten() {
+                if !slot.complete()
+                    && tokio::time::Instant::now() >= slot.ticket.deadline
+                    && !expired.iter().any(|(ticket, _, _)| *ticket == slot.ticket)
+                {
+                    expired.push((
+                        slot.ticket,
+                        None,
+                        active.is_some_and(|t| t.index == slot.ticket.index),
+                    ));
                 }
             }
             expired
         };
-        for _ in 0..expired {
-            self.record(io_err("tuic recovery", "original 15s deadline expired"));
+        let changed = !expired.is_empty();
+        for (ticket, preparation, active) in expired {
+            drop(preparation); // Wake only after releasing the root mutex.
+            if !active && probe::settle(self, ticket, false) == probe::Settlement::Complete {
+                if let Some(demand) = self.state().recovery.demands[ticket.index].as_mut() {
+                    if demand.ticket == ticket {
+                        demand.settled = true;
+                    }
+                }
+            }
+            self.record(io_err("tuic recovery", "original demand deadline expired"));
         }
-        if expired != 0 {
+        if changed {
             self.wake_recovery();
         }
     }
@@ -299,6 +395,7 @@ impl TuicUpstream {
             || state.stopping
             || state.quarantined
             || state.config_rejected
+            || !probe::slot_available(&state.recovery, index)
         {
             return Err(io_err(
                 "tuic recovery",
@@ -306,10 +403,14 @@ impl TuicUpstream {
             ));
         }
         if let Some(demand) = &state.recovery.demands[index] {
-            if demand.ticket.identity == identity {
+            if demand.ticket.identity == identity && demand.ticket.kind == Kind::Closed {
                 return Ok(demand.ticket);
             }
-            if demand.outcome == Outcome::Pending {
+            if demand.outcome == Outcome::Pending
+                || (demand.ticket.kind != Kind::Closed
+                    && !demand.settled
+                    && demand.outcome == Outcome::Failed)
+            {
                 return Err(io_err(
                     "tuic recovery",
                     "another generation still owns the slot demand",
@@ -331,15 +432,27 @@ impl TuicUpstream {
             self.udp_runtime.generation.changed.notify_waiters();
             return Err(recorded_failure());
         }
+        let sequence = state
+            .recovery
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| io_err("tuic recovery", "ticket sequence exhausted"))?;
+        state.recovery.sequence = sequence;
         let ticket = Ticket {
             index,
             identity,
             deadline,
+            sequence,
+            kind: Kind::Closed,
         };
         state.recovery.demands[index] = Some(Demand {
             ticket,
             outcome: Outcome::Pending,
             attempts: 0,
+            preparation: None,
+            settled: false,
+            ready_identity: None,
+            receipt_issued: false,
         });
         let changed = state.recovery.changed.clone();
         drop(state);
@@ -362,7 +475,7 @@ impl TuicUpstream {
             .ok_or_else(|| io_err("tuic recovery", "original node owner lost"))?;
         owner.expire_demands();
         let state = owner.state();
-        if state.stopping || state.quarantined {
+        if state.stopping || state.quarantined || state.config_rejected {
             return Err(recorded_failure());
         }
         let Some(demand) = state
@@ -373,14 +486,13 @@ impl TuicUpstream {
         else {
             return Err(io_err("tuic recovery", "original demand missing"));
         };
-        if demand.ticket.identity != ticket.identity {
-            // A newer generation has its own demand. This old observer may only
-            // re-admit; it has no authority to restart its old transaction.
-            return Ok(true);
+        if demand.ticket != ticket {
+            return Err(io_err("tuic recovery", "original ticket superseded"));
         }
         match demand.outcome {
             Outcome::Pending => Ok(false),
             Outcome::Ready => Ok(true),
+            Outcome::Failed if ticket.kind != Kind::Closed && !demand.settled => Ok(false),
             Outcome::Failed => Err(recorded_failure()),
         }
     }
@@ -407,21 +519,113 @@ impl TuicUpstream {
     }
 }
 
-pub(super) fn clear_uncommitted(owner: &StartupResources) {
-    let custody = {
+pub(super) async fn settle_uncommitted(owner: &StartupResources) {
+    let changed = owner.state().recovery.changed.clone();
+    loop {
+        let notified = changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if clear_uncommitted(owner) {
+            return;
+        }
+        notified.await;
+    }
+}
+
+pub(super) fn clear_uncommitted(owner: &StartupResources) -> bool {
+    let tickets: Vec<_> = {
+        let state = owner.state();
+        let mut tickets: Vec<_> = state
+            .recovery
+            .demands
+            .iter()
+            .flatten()
+            .filter(|d| state.stopping || state.recovery.active_ticket == Some(d.ticket))
+            .map(|d| d.ticket)
+            .collect();
+        for slot in state.recovery.probe_custody.iter().flatten() {
+            if (state.stopping
+                || state
+                    .recovery
+                    .active_ticket
+                    .is_some_and(|t| t.index == slot.ticket.index))
+                && !tickets.contains(&slot.ticket)
+            {
+                tickets.push(slot.ticket);
+            }
+        }
+        tickets
+    };
+    let mut busy = false;
+    for ticket in tickets {
+        busy |= probe::settle(owner, ticket, false) == probe::Settlement::Busy;
+    }
+    if busy {
+        return false;
+    }
+    let (preparation, permit, active, pending) = {
         let mut state = owner.state();
+        let stopping = state.stopping;
+        let active = state.recovery.active_ticket;
+        let pending: Vec<_> = state
+            .recovery
+            .demands
+            .iter_mut()
+            .flatten()
+            .filter(|d| stopping || active == Some(d.ticket))
+            .filter_map(|d| d.preparation.take())
+            .collect();
         (
             state.recovery.preparation.take(),
             state.recovery.permit.take(),
+            state.recovery.active_ticket.take(),
+            pending,
         )
     };
-    drop(custody);
+    #[cfg(test)]
+    let gate = owner.state().recovery.clear_gate.clone();
+    #[cfg(test)]
+    if let Some(gate) = &gate {
+        gate.observe(1);
+    }
+    drop((preparation, permit, pending));
+    #[cfg(test)]
+    if let Some(gate) = &gate {
+        gate.observe(2);
+    }
+    if let Some(ticket) = active {
+        let mut root = owner.state();
+        let complete = !root.quarantined && probe::slot_available(&root.recovery, ticket.index);
+        if let Some(demand) = root.recovery.demands[ticket.index].as_mut() {
+            if demand.ticket == ticket && complete {
+                demand.settled = true;
+            }
+        }
+    }
+    owner.wake_recovery();
+    true
 }
 
 pub(super) async fn run(
     owner: Arc<StartupResources>,
     data: Arc<TuicUpstream>,
     config: TuicClientConfig,
+) -> Result<(), ClientError> {
+    run_inner(&owner, &data, &config, None).await
+}
+pub(in crate::tuic) async fn run_native(
+    owner: &Arc<StartupResources>,
+    data: &Arc<TuicUpstream>,
+    config: &TuicClientConfig,
+    guard: &crate::owned_upstream::generation::callbacks::Guard,
+) -> Result<(), ClientError> {
+    run_inner(owner, data, config, Some(guard)).await
+}
+async fn run_inner(
+    owner: &Arc<StartupResources>,
+    data: &Arc<TuicUpstream>,
+    config: &TuicClientConfig,
+    guard: Option<&crate::owned_upstream::generation::callbacks::Guard>,
 ) -> Result<(), ClientError> {
     let changed = owner.state().recovery.changed.clone();
     loop {
@@ -431,24 +635,26 @@ pub(super) async fn run(
         owner.expire_demands();
         owner.reap_stats().await?;
         let (old, primary_old, next) = {
-            let state = owner.state();
+            let mut state = owner.state();
             if state.stopping || state.quarantined {
                 return Err(recorded_failure());
             }
+            let next = state
+                .recovery
+                .demands
+                .iter()
+                .flatten()
+                .filter(|d| {
+                    d.outcome == Outcome::Pending
+                        && state.recovery.predecessor(d.ticket.index == 0).is_none()
+                })
+                .min_by_key(|d| d.ticket.deadline)
+                .map(|d| d.ticket);
+            state.recovery.active_ticket = next;
             (
                 state.recovery.predecessor.is_some(),
                 state.recovery.primary_predecessor.is_some(),
-                state
-                    .recovery
-                    .demands
-                    .iter()
-                    .flatten()
-                    .filter(|d| {
-                        d.outcome == Outcome::Pending
-                            && state.recovery.predecessor(d.ticket.index == 0).is_none()
-                    })
-                    .min_by_key(|d| d.ticket.deadline)
-                    .map(|d| d.ticket),
+                next,
             )
         };
         if (old || primary_old) && next.is_none() {
@@ -473,12 +679,16 @@ pub(super) async fn run(
             notified.await;
             continue;
         };
-        let result =
-            tokio::time::timeout_at(ticket.deadline, recover(&owner, &data, &config, ticket))
-                .await
-                .unwrap_or_else(|_| {
-                    Err(io_err("tuic recovery", "original recovery budget expired"))
-                });
+        let work = async {
+            match ticket.kind {
+                Kind::Healthy => maintenance::recover(&owner, &data, &config, ticket).await,
+                Kind::Closed => recover(&owner, &data, &config, ticket, guard).await,
+                Kind::Probe(kind) => probe::recover(&owner, &data, &config, ticket, kind).await,
+            }
+        };
+        let result = tokio::time::timeout_at(ticket.deadline, work)
+            .await
+            .unwrap_or_else(|_| Err(io_err("tuic recovery", "original recovery budget expired")));
         if let Err(error) = result {
             owner.record_startup_result(error);
             if let Some(demand) = owner.state().recovery.demands[ticket.index].as_mut() {
@@ -489,7 +699,10 @@ pub(super) async fn run(
             // The same saved retire future continues while queued deadlines expire.
             let settled = owner.retire_unpublished().await;
             if settled {
-                clear_uncommitted(&owner);
+                if ticket.kind != Kind::Closed {
+                    maintenance::join_retired_stats(&owner).await?;
+                }
+                settle_uncommitted(&owner).await;
             } else {
                 return Err(recorded_failure());
             }
@@ -502,6 +715,7 @@ async fn recover(
     data: &TuicUpstream,
     config: &TuicClientConfig,
     ticket: Ticket,
+    guard: Option<&crate::owned_upstream::generation::callbacks::Guard>,
 ) -> Result<(), ClientError> {
     if owner.state().config_rejected {
         return Err(recorded_failure());
@@ -558,11 +772,22 @@ async fn recover(
         break;
     }
     if ticket.index == 0 {
-        data.udp_runtime
-            .generation
-            .wait_sealed(ticket.identity.generation)
-            .await;
-        if !data.udp_runtime.generation.valid() {
+        let valid = if guard.is_some() {
+            // The original saved recovery actor already owns this exact role.
+            data.udp_runtime
+                .generation
+                .wait_sealed(ticket.identity.generation)
+                .await;
+            data.udp_runtime.generation.valid()
+        } else {
+            data.udp_runtime
+                .wait_generation_sealed(
+                    ticket.identity.generation,
+                    crate::owned_upstream::generation::callbacks::Role::Recovery,
+                )
+                .await
+        };
+        if !valid {
             owner.state().quarantined = true;
             return Err(io_err("UDP generation", "invalid physical retirement"));
         }
@@ -604,7 +829,7 @@ async fn recover(
             spawn_quic_stats_logger(candidate.clone(), ticket.index, secs, stop.subscribe())
         })?;
     }
-    commit(owner, data, ticket, candidate, attempt).await
+    commit(owner, data, ticket, candidate, attempt, None).await
 }
 
 async fn commit(
@@ -613,6 +838,7 @@ async fn commit(
     ticket: Ticket,
     candidate: Connection,
     attempts: u64,
+    proof: Option<TcpPoolSuccessorForwardServiceProof>,
 ) -> Result<(), ClientError> {
     let mut slot = data.tcp_pool_slots[ticket.index].state.lock().await;
     let mut activity = data.tcp_pool_admission.current_generation_activity[ticket.index]
@@ -641,7 +867,7 @@ async fn commit(
         || root.recovery.permit.is_none()
         || slot.current.identity() != ticket.identity
         || !Arc::ptr_eq(&activity, &slot.current.activity)
-        || slot.current.transport.close_reason().is_none()
+        || (ticket.kind != Kind::Healthy && slot.current.transport.close_reason().is_none())
         || slot.draining.is_some()
         || old_entry.is_none()
         || new_entry.is_none()
@@ -727,7 +953,37 @@ async fn commit(
     } else {
         None
     };
-    let successor = TcpPoolGeneration::new(candidate, generation, attempts, data.clock);
+    let successor = if let Some(proof) = proof {
+        let successor = TcpPoolGeneration::new_successor(
+            candidate,
+            generation,
+            attempts,
+            data.clock,
+            proof.path_generation,
+            proof.readiness_cwnd_floor,
+        )
+        .ok_or_else(|| io_err("tuic recovery", "invalid service certificate"))?;
+        let install = TcpPoolSuccessorInstallServiceProof::from_forward_service(&successor, &proof)
+            .ok_or_else(|| io_err("tuic recovery", "service proof mismatch"))?;
+        slot.validate_successor(
+            ticket.index,
+            ticket.identity,
+            &activity,
+            &successor,
+            install,
+        )
+        .map_err(|error| io_err("tuic recovery", format!("service install: {error:?}")))?;
+        successor
+    } else {
+        if ticket.kind == Kind::Healthy {
+            return Err(io_err(
+                "tuic recovery",
+                "healthy publication lacks service proof",
+            ));
+        }
+        TcpPoolGeneration::new(candidate, generation, attempts, data.clock)
+    };
+    let successor_identity = successor.identity();
     let predecessor = TerminalGeneration {
         slot: ticket.index,
         current: false,
@@ -747,6 +1003,7 @@ async fn commit(
         generation: predecessor,
         permit,
         entry: old_entry,
+        healthy: ticket.kind == Kind::Healthy,
     });
     *activity = successor.activity.clone();
     let old = std::mem::replace(&mut slot.current, successor);
@@ -754,8 +1011,10 @@ async fn commit(
         entry.published = true;
     }
     let preparation = root.recovery.preparation.take();
+    root.recovery.active_ticket = None;
     if let Some(demand) = root.recovery.demands[ticket.index].as_mut() {
         demand.outcome = Outcome::Ready;
+        demand.ready_identity = Some(successor_identity);
     }
     drop(root);
     drop(activity);
@@ -770,7 +1029,7 @@ async fn commit(
 }
 
 async fn finish_predecessor(owner: &StartupResources, primary: bool) -> Result<(), ClientError> {
-    let (entry, drained, activity) = {
+    let (entry, mut drained, activity, healthy) = {
         let state = owner.state();
         let Some(old) = state.recovery.predecessor(primary) else {
             return Ok(());
@@ -779,8 +1038,20 @@ async fn finish_predecessor(owner: &StartupResources, primary: bool) -> Result<(
             old.entry,
             old.generation.physical_drained,
             old.generation.activity.clone(),
+            old.healthy,
         )
     };
+    if healthy {
+        activity.wait_for_zero().await;
+        wait_registries(owner, primary).await?;
+        if !drained {
+            owner.retire(entry).await?;
+            if let Some(old) = owner.state().recovery.predecessor_mut(primary).as_mut() {
+                old.generation.physical_drained = true;
+            }
+            drained = true;
+        }
+    }
     owner.reap_stats().await?;
     let old_logger_pending = {
         let state = owner.state();
@@ -804,6 +1075,13 @@ async fn finish_predecessor(owner: &StartupResources, primary: bool) -> Result<(
         }
     }
     activity.wait_for_zero().await;
+    wait_registries(owner, primary).await?;
+    let old = owner.state().recovery.predecessor_mut(primary).take();
+    drop(old);
+    Ok(())
+}
+
+async fn wait_registries(owner: &StartupResources, primary: bool) -> Result<(), ClientError> {
     let clear = {
         let state = owner.state();
         let Some(old) = state.recovery.predecessor(primary) else {
@@ -827,6 +1105,5 @@ async fn finish_predecessor(owner: &StartupResources, primary: bool) -> Result<(
     if !clear {
         std::future::pending::<()>().await;
     }
-    owner.state().recovery.predecessor_mut(primary).take();
     Ok(())
 }

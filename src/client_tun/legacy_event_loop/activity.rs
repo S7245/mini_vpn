@@ -16,7 +16,7 @@ pub(in crate::client_tun) struct ListenerActivity<'a, 'storage, U> {
     pub(in crate::client_tun) socket_ctxs: &'a mut HashMap<SocketHandle, SocketCtx>,
     pub(in crate::client_tun) upstream: &'a Arc<U>,
     pub(in crate::client_tun) handshake_done_tx: &'a OpenDispatch,
-    pub(in crate::client_tun) global_tx: &'a mpsc::Sender<(SocketHandle, RelayEvent)>,
+    pub(in crate::client_tun) global_tx: &'a crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
     pub(in crate::client_tun) owned_action_tx: &'a mpsc::Sender<OwnedActionEvent>,
     pub(in crate::client_tun) fake_pool: &'a mut FakeIpPool,
     pub(in crate::client_tun) now_secs: u64,
@@ -90,10 +90,11 @@ impl<U: OwnedUpstream + 'static> ListenerActivity<'_, '_, U> {
                     self.admission_origin,
                 );
                 note_downlink_pending_progress(ctx, self.now_secs, flush_outcome.accepted_bytes);
-                let terminal_disposition_pending = ctx.resumable_half_close.is_some()
-                    || (ctx.pending_relay_close.is_none()
-                        && d16_remote_eof_queue_state(ctx)
-                            .is_some_and(|(closed, empty)| closed && empty));
+                let d16_eof_ready = ctx.pending_relay_close.is_none()
+                    && d16_remote_eof_queue_state(ctx)
+                        .is_some_and(|(closed, empty)| closed && empty);
+                let terminal_disposition_pending =
+                    ctx.resumable_half_close.is_some() || d16_eof_ready;
                 if terminal_disposition_pending {
                     if !gate_legacy_rearm(
                         RearmGate::original_loop(self.handshake_done_tx),
@@ -101,7 +102,11 @@ impl<U: OwnedUpstream + 'static> ListenerActivity<'_, '_, U> {
                             handle,
                             ctx,
                             "remote_to_local",
-                            "listener_terminal_disposition",
+                            if d16_eof_ready {
+                                "remote_eof"
+                            } else {
+                                "listener_terminal_disposition"
+                            },
                             None,
                         ),
                     ) {
@@ -171,6 +176,10 @@ impl<U: OwnedUpstream + 'static> ListenerActivity<'_, '_, U> {
                 }
                 return Ok(());
             }
+            EstablishedUplink::Refused(error) => {
+                if let Some(ctx) = self.socket_ctxs.get_mut(&handle) { self.handshake_done_tx.refuse_native_uplink(ctx, error); }
+                return Ok(());
+            }
             EstablishedUplink::NotEstablished => {}
         }
 
@@ -185,8 +194,11 @@ impl<U: OwnedUpstream + 'static> ListenerActivity<'_, '_, U> {
             ctx.downlink_diag
                 .note_uplink_recv_queue(tcp_socket.recv_queue());
             let tcp_state = tcp_socket.state();
-            pump_established_uplink(ctx, tcp_state, self.now_secs, || {
-                extract_socket_payload(tcp_socket)
+            pump_established_uplink(ctx, tcp_state, self.now_secs, |meter| {
+                #[cfg(test)]
+                { self.handshake_done_tx.observe_established_extract(handle, tcp_socket, |socket| crate::client_tun::uplink::extract_for_lane(socket, meter)) }
+                #[cfg(not(test))]
+                { crate::client_tun::uplink::extract_for_lane(tcp_socket, meter) }
             })
         };
         match established_uplink {
@@ -251,6 +263,10 @@ impl<U: OwnedUpstream + 'static> ListenerActivity<'_, '_, U> {
                         "uplink_channel_closed",
                     );
                 }
+                return Ok(());
+            }
+            EstablishedUplink::Refused(error) => {
+                if let Some(ctx) = self.socket_ctxs.get_mut(&handle) { self.handshake_done_tx.refuse_native_uplink(ctx, error); }
                 return Ok(());
             }
             EstablishedUplink::NotEstablished => {}
@@ -572,7 +588,7 @@ impl<U: OwnedUpstream + 'static> ListenerActivity<'_, '_, U> {
             .await?;
             trace_log!("🚪 handle {:?} remote session opened", handle);
 
-            let (tx, rx) = tokio::sync::mpsc::channel(RELAY_CHANNEL_CAPACITY);
+            let (tx, rx) = crate::client_tun::uplink::channel(RELAY_CHANNEL_CAPACITY);
             if let Err(e) = tx.try_send(RelayCommand::Data(payload)) {
                 trace_log!(
                     "❌ handle {:?} 新建中继通道写入失败({e}) → rearm（不静默丢首包）",
@@ -648,7 +664,7 @@ impl<U: OwnedUpstream + 'static> ListenerActivity<'_, '_, U> {
 pub(in crate::client_tun) struct HandshakeCompletion<'a, 'storage> {
     pub(in crate::client_tun) sockets: &'a mut SocketSet<'storage>,
     pub(in crate::client_tun) socket_ctxs: &'a mut HashMap<SocketHandle, SocketCtx>,
-    pub(in crate::client_tun) global_tx: &'a mpsc::Sender<(SocketHandle, RelayEvent)>,
+    pub(in crate::client_tun) global_tx: &'a crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
     pub(in crate::client_tun) owned_action_tx: &'a mpsc::Sender<OwnedActionEvent>,
     pub(in crate::client_tun) fake_pool: &'a mut FakeIpPool,
     pub(in crate::client_tun) now_secs: u64,
@@ -789,7 +805,7 @@ impl HandshakeCompletion<'_, '_> {
         let expected_mode = ctx.pending_open_mode.take();
         match (expected_mode, result) {
             (Some(TcpOwnershipMode::LegacyRelay), Ok(OpenedOwnedTcp::Legacy(stream))) => {
-                let (tx, rx) = tokio::sync::mpsc::channel(RELAY_CHANNEL_CAPACITY);
+                let (tx, rx) = crate::client_tun::uplink::channel(RELAY_CHANNEL_CAPACITY);
                 // 按序 flush open 期间缓存的上行字节（首包 + 在飞期到达的后续包，FIFO）。新 channel 容量充足、
                 // rx 未 drop、仅 1 条消息 → try_send 必成（避免 await-with-borrow）。防御性：万一失败（未来
                 // 容量被改小等），**不静默丢缓存**——log + rearm 撤掉本槽，让应用 TCP 重建（Finding 2）。

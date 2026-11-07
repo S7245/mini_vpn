@@ -1225,6 +1225,29 @@ impl<'a> Socket<'a> {
         self.tx_buffer.len()
     }
 
+    /// Snapshot the current payload buffer's wrapping TCP start and byte length.
+    /// This is not flush/ACK proof or permission to admit new data: `may_send`
+    /// still governs admission. An empty interval does not prove settlement.
+    /// SYN occupies one sequence number before payload; FIN is never payload.
+    /// States after FIN acknowledgement (and closed/listening sockets) have no
+    /// payload origin here. Ranges at least half the sequence space are unknown.
+    pub fn send_payload_range(&self) -> Option<(u32, usize)> {
+        let syn = match self.state {
+            State::SynSent | State::SynReceived => 1,
+            State::Established
+            | State::CloseWait
+            | State::FinWait1
+            | State::LastAck
+            | State::Closing => 0,
+            State::Closed | State::Listen | State::FinWait2 | State::TimeWait => return None,
+        };
+        let len = self.tx_buffer.len();
+        if len >= (1usize << 31) {
+            return None;
+        }
+        Some(((self.local_seq_no.0 as u32).wrapping_add(syn), len))
+    }
+
     /// Return the amount of octets queued in the receive buffer. This value can be larger than
     /// the slice read by the next `recv` or `peek` call because it includes all queued octets,
     /// and not only the octets that may be returned as a contiguous slice.
@@ -7374,4 +7397,6 @@ mod test {
             assert_eq!(r.retransmission_timeout(), Duration::from_millis(rto));
         }
     }
+
+    mod send_range;
 }

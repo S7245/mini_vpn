@@ -1,13 +1,16 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, mem::ManuallyDrop};
 
 use bytes::Bytes;
 use thiserror::Error;
-use tracing::{debug, trace};
+use tracing::trace;
 
 use super::Connection;
+use bytes::{BackingMeter, MeteredCopyError};
+mod storage;
+pub(in crate::connection) mod packet;
 use crate::{
-    TransportError,
     frame::{Datagram, FrameStruct},
+    TransportError,
 };
 
 /// API to control datagram traffic
@@ -35,25 +38,39 @@ impl Datagrams<'_> {
         if data.len() > max {
             return Err(SendDatagramError::TooLarge);
         }
+        let inventory = &mut self.conn.datagrams;
+        if let Err(error) = inventory.admit(&data) {
+            return Err(SendDatagramError::Admission { data, error });
+        }
+        let mut evict = 0;
+        let mut retained = inventory.outgoing_total;
         if drop {
-            while self.conn.datagrams.outgoing_total > self.conn.config.datagram_send_buffer_size {
-                let prev = self
-                    .conn
-                    .datagrams
-                    .outgoing
-                    .pop_front()
-                    .expect("datagrams.outgoing_total desynchronized");
-                trace!(len = prev.data.len(), "dropping outgoing datagram");
-                self.conn.datagrams.outgoing_total -= prev.data.len();
+            // Keep the original policy: evict only while the OLD byte total is
+            // over its limit. A newly appended packet may exceed that limit.
+            for old in inventory.outgoing.iter() {
+                if retained <= self.conn.config.datagram_send_buffer_size { break; }
+                retained -= old.data.len(); evict += 1;
             }
-        } else if self.conn.datagrams.outgoing_total + data.len()
-            > self.conn.config.datagram_send_buffer_size
-        {
-            self.conn.datagrams.send_blocked = true;
+        } else if retained.checked_add(data.len()).is_none_or(|n| n > self.conn.config.datagram_send_buffer_size) {
+            // Preserve an actual application-event slot until the original
+            // sender becomes unblocked; ordinary notifications cannot consume it.
+            let held = usize::from(self.conn.successor_service_turn.is_some());
+            if let Err(error) = self.conn.events.reserve(1, held) {
+                return Err(SendDatagramError::Admission { data, error });
+            }
+            inventory.send_blocked = true;
             return Err(SendDatagramError::Blocked(data));
         }
-        self.conn.datagrams.outgoing_total += data.len();
-        self.conn.datagrams.outgoing.push_back(Datagram { data });
+        let needed = inventory.outgoing.len() - evict + 1;
+        let replacement = match inventory.outgoing.prepare(needed, inventory.meter.as_ref()) {
+            Ok(value) => value,
+            Err(error) => return Err(SendDatagramError::Admission { data, error }),
+        };
+        let Some(total) = retained.checked_add(data.len()) else {
+            return Err(SendDatagramError::Admission { data, error: MeteredCopyError::TooLarge });
+        };
+        inventory.outgoing.append(replacement, evict, Datagram { data });
+        inventory.outgoing_total = total;
         Ok(())
     }
 
@@ -99,45 +116,60 @@ impl Datagrams<'_> {
     }
 }
 
+/// Receive-window cost of one queued datagram. Upstream counts payload bytes
+/// only, so zero-length DATAGRAM frames were free and an unread queue grew
+/// without bound in count (A2 measurement, D16). At least one byte each bounds
+/// the queue to `window` entries; non-empty datagrams keep upstream semantics.
+pub(super) fn window_charge(len: usize) -> usize {
+    len.max(1)
+}
+
 #[derive(Default)]
 pub(super) struct DatagramState {
     /// Number of bytes of datagrams that have been received by the local transport but not
     /// delivered to the application
     pub(super) recv_buffered: usize,
-    pub(super) incoming: VecDeque<Datagram>,
-    pub(super) outgoing: VecDeque<Datagram>,
+    pub(super) incoming: ManuallyDrop<storage::Queue>,
+    pub(super) outgoing: ManuallyDrop<storage::Queue>,
     pub(super) outgoing_total: usize,
     pub(super) send_blocked: bool,
+    meter: Option<BackingMeter>,
 }
 
 impl DatagramState {
+    pub(super) fn new(meter: Option<BackingMeter>) -> Self {
+        Self { meter: meter.filter(|m| m.budget_limit().is_some()), incoming: ManuallyDrop::new(storage::Queue::default()), outgoing: ManuallyDrop::new(storage::Queue::default()), recv_buffered: 0, outgoing_total: 0, send_blocked: false }
+    }
+    fn admit(&self, data: &Bytes) -> Result<(), MeteredCopyError> {
+        let Some(meter) = &self.meter else { return Ok(()); };
+        meter.admit_precharged()?;
+        match data.backing_meter() {
+            Some(actual) if actual.same_budget(meter) => return Ok(()),
+            None if data.is_empty() && data.allocation_identity().is_none() => return Ok(()),
+            _ => {}
+        }
+        meter.quarantine();
+        if let Some(actual) = data.backing_meter() { actual.quarantine(); }
+        Err(MeteredCopyError::Quarantined)
+    }
+
     pub(super) fn received(
         &mut self,
         datagram: Datagram,
         window: &Option<usize>,
     ) -> Result<bool, TransportError> {
-        let window = match window {
-            None => {
-                return Err(TransportError::PROTOCOL_VIOLATION(
-                    "unexpected DATAGRAM frame",
-                ));
+        let window = self.check_received(&datagram, window)?;
+        let plan = self.reception(datagram.data.len(), window)?;
+        let needed = self.reception_needed(&plan);
+        let replacement = match self.incoming.prepare(needed, self.meter.as_ref()) {
+            Ok(value) => value,
+            Err(MeteredCopyError::BudgetFull | MeteredCopyError::TooLarge) => return Ok(false),
+            Err(_) => {
+                if let Some(meter) = &self.meter { meter.quarantine(); }
+                return Err(TransportError::INTERNAL_ERROR("datagram descriptor admission refused"));
             }
-            Some(x) => *x,
         };
-
-        if datagram.data.len() > window {
-            return Err(TransportError::PROTOCOL_VIOLATION("oversized datagram"));
-        }
-
-        let was_empty = self.recv_buffered == 0;
-        while datagram.data.len() + self.recv_buffered > window {
-            debug!("dropping stale datagram");
-            self.recv();
-        }
-
-        self.recv_buffered += datagram.data.len();
-        self.incoming.push_back(datagram);
-        Ok(was_empty)
+        Ok(self.commit_reception(datagram, plan, replacement))
     }
 
     /// Discard outgoing datagrams with a payload larger than `max_payload` bytes
@@ -185,7 +217,7 @@ impl DatagramState {
 
     pub(super) fn recv(&mut self) -> Option<Bytes> {
         let x = self.incoming.pop_front()?.data;
-        self.recv_buffered -= x.len();
+        self.recv_buffered -= window_charge(x.len());
         Some(x)
     }
 }
@@ -208,4 +240,29 @@ pub enum SendDatagramError {
     /// Send would block
     #[error("datagram send blocked")]
     Blocked(Bytes),
+    /// Original payload and exact Native physical admission refusal.
+    #[error("datagram physical admission refused: {error:?}")]
+    Admission { data: Bytes, error: MeteredCopyError },
 }
+
+impl Drop for DatagramState {
+    fn drop(&mut self) {
+        if let Some(meter) = &self.meter {
+            let incoming = self.incoming.iter().try_fold(0usize, |n, d| n.checked_add(window_charge(d.data.len())));
+            let outgoing = self.outgoing.iter().try_fold(0usize, |n, d| n.checked_add(d.data.len()));
+            if std::thread::panicking() || incoming != Some(self.recv_buffered)
+                || outgoing != Some(self.outgoing_total)
+                || !self.incoming.layout_matches(meter) || !self.outgoing.layout_matches(meter)
+            { meter.quarantine(); return; }
+        }
+        // Native payloads are authenticated precharged Bytes; after the whole
+        // physical inventory check, these two original containers are known.
+        unsafe {
+            ManuallyDrop::drop(&mut self.incoming);
+            ManuallyDrop::drop(&mut self.outgoing);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

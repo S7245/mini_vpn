@@ -102,6 +102,16 @@ impl<'a> SocketSet<'a> {
         }
     }
 
+    /// Look up an actual socket without panicking on a missing slot or wrong
+    /// type. The stored handle must also agree with the requested slot.
+    pub fn try_get<T: AnySocket<'a>>(&self, handle: SocketHandle) -> Option<&T> {
+        let item = self.item(handle)?;
+        if item.meta.handle != handle {
+            return None;
+        }
+        T::downcast(&item.socket)
+    }
+
     /// Get a mutable socket from the set by its handle, as mutable.
     ///
     /// # Panics
@@ -125,6 +135,18 @@ impl<'a> SocketSet<'a> {
             Some(item) => item.socket,
             None => panic!("handle does not refer to a valid socket"),
         }
+    }
+
+    /// Cold storage geometry, including unused slots retained by the owner.
+    /// Capacity describes the slot allocation, not the socket payload buffers.
+    #[doc(hidden)]
+    pub fn storage_geometry(&self) -> (usize, usize) {
+        let capacity = match &self.sockets {
+            ManagedSlice::Borrowed(slots) => slots.len(),
+            #[cfg(feature = "alloc")]
+            ManagedSlice::Owned(slots) => slots.capacity(),
+        };
+        (self.sockets.len(), capacity)
     }
 
     /// Get an iterator to the inner sockets.
@@ -155,3 +177,6 @@ impl<'a> SocketSet<'a> {
         self.sockets.iter_mut().filter_map(|x| x.inner.as_mut())
     }
 }
+
+#[cfg(test)]
+mod tests;

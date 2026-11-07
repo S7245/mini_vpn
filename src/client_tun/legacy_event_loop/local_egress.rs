@@ -18,7 +18,7 @@ pub(in crate::client_tun) async fn service_local_egress_until<D, U, M>(
     iface: &mut Interface,
     dirty: &mut HashSet<SocketHandle>,
     handshake_done_tx: &OpenDispatch,
-    global_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
+    global_tx: &crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
     owned_action_tx: &mpsc::Sender<OwnedActionEvent>,
     metrics: &mut M,
     downlink_flush_max_bytes: usize,
@@ -81,7 +81,6 @@ where
             tcp_downlink_aggregate(socket_ctxs.values()).send_slice_accepted_bytes;
         let pressure_before_cycle =
             LocalEgressPressureSnapshot::capture(device, dirty, socket_ctxs, sockets);
-        let send_queue_before_cycle = capture_dirty_send_queues(dirty, sockets);
         let mut cycle = LocalEgressServiceProgress {
             cycles: 1,
             ..LocalEgressServiceProgress::default()
@@ -122,18 +121,20 @@ where
             tun_rx_drain_diag.backlog_guard().resume_edges() > backlog_resume_edges_before;
 
         metrics.enter_poll();
-        let timestamp = smoltcp::time::Instant::now();
-        iface.poll(timestamp, device, sockets);
-        super::ingress_effects::collect(iface, sockets, dirty, handshake_done_tx.flow_mode());
         *tcp_loop_flush_tx_calls = tcp_loop_flush_tx_calls.saturating_add(1);
         cycle.flush_tx_calls = 1;
-        let (flush_result, flush_release) = flush_tx_and_release_downlink_permits(
+        let (flush_result, flush_release) = poll_egress_cycle(
             device,
+            iface,
             sockets,
             socket_ctxs,
+            None,
             "local_egress_service",
+            #[cfg(all(test, feature = "harness"))]
+            handshake_done_tx.test_egress_bridge(),
         )
         .await;
+        super::ingress_effects::collect(iface, sockets, dirty, handshake_done_tx.flow_mode());
         let pressure_after_cycle =
             LocalEgressPressureSnapshot::capture(device, dirty, socket_ctxs, sockets);
         if let Err(e) = flush_result {
@@ -149,14 +150,6 @@ where
                 .drain_bytes_to(pressure_after_cycle)
                 .max(flush_release.flushed_tcp_payload_bytes)
                 .max(flush_release.released_inflight_permit_bytes);
-        }
-        if flush_release.flushed_tcp_payload_bytes == 0 {
-            let released_inflight = release_dirty_downlink_inflight_permits_for_send_queue_drain(
-                &send_queue_before_cycle,
-                sockets,
-                socket_ctxs,
-            );
-            cycle.egress_drain_bytes = cycle.egress_drain_bytes.max(released_inflight);
         }
         metrics.leave_poll();
 

@@ -1,8 +1,13 @@
 use std::{collections::VecDeque, ops::Range};
 
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BackingMeter, MeteredCopyError};
+mod native;
+#[cfg(test)]
+#[path = "send_buffer/tests/native.rs"]
+mod native_tests;
 
-use crate::{VarInt, range_set::RangeSet};
+
+use crate::{range_set::RangeSet, VarInt};
 
 /// Buffer of outgoing retransmittable stream data
 #[derive(Default, Debug)]
@@ -23,19 +28,138 @@ pub(super) struct SendBuffer {
     acks: RangeSet,
     /// Previously transmitted ranges deemed lost
     retransmits: RangeSet,
+    native: Option<native::Native>,
 }
 
 impl SendBuffer {
+    pub(in crate::connection) fn check_packet_range(&self, range: &Range<u64>, meter: &BackingMeter) -> Result<(), MeteredCopyError> {
+        if range.end > self.offset || range.start > range.end {
+            meter.quarantine(); return Err(MeteredCopyError::Quarantined);
+        }
+        match &self.native {
+            Some(native) if native.meter.same_authority(meter) => native.stamp().map(|_| ()),
+            None if self.closed_inventory_matches(meter) => Ok(()),
+            _ => {
+                meter.quarantine();
+                if let Some(native) = &self.native { native.meter.quarantine(); }
+                Err(MeteredCopyError::Quarantined)
+            }
+        }
+    }
+    pub(in crate::connection) fn prepare_packet_capacity(&self, acks: usize, losses: usize) -> Result<PacketCapacity, MeteredCopyError> {
+        self.native.as_ref().map(|n| n.prepare_packet_capacity(acks, losses))
+            .transpose().map(PacketCapacity)
+    }
+    pub(in crate::connection) fn install_packet_capacity(&mut self, prepared: PacketCapacity) -> Result<(), MeteredCopyError> {
+        match (&mut self.native, prepared.0) {
+            (Some(native), Some(plan)) => native.install_packet_capacity(plan),
+            (None, None) => Ok(()),
+            (Some(native), None) => { native.meter.quarantine(); Err(MeteredCopyError::Quarantined) }
+            (None, Some(_)) => Err(MeteredCopyError::Quarantined),
+        }
+    }
+
+    pub(in crate::connection) fn retained_metadata_bytes(&self, meter: &BackingMeter) -> Option<usize> {
+        self.closed_inventory_matches(meter).then_some(())?;
+        self.native.as_ref().map_or(Some(0), |native| native.metadata_bytes())
+    }
+
+    pub(super) fn closed_inventory_matches(&self, meter: &BackingMeter) -> bool {
+        match &self.native {
+            Some(native) => native.meter.same_authority(meter) && native.inventory_matches(self.unacked_len),
+            None => self.offset == 0 && self.unacked_len == 0 && self.unsent == 0
+                && self.unacked_segments.capacity() == 0 && self.acks.is_empty() && self.retransmits.is_empty(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn encoding_cursor_for_probe(&self) -> u64 {
+        self.unsent
+    }
+
     /// Construct an empty buffer at the initial offset
     pub(super) fn new() -> Self {
         Self::default()
+    }
+
+    pub(super) fn prepare_write(&mut self, chunks: usize, meter: Option<&BackingMeter>) -> Result<PreparedWrite, MeteredCopyError> {
+        if let Some(meter) = meter {
+            meter.admit_precharged()?;
+            if self.native.is_none() {
+                if self.offset != 0 || !self.unacked_segments.is_empty() || self.unacked_segments.capacity() != 0 {
+                    meter.quarantine(); return Err(MeteredCopyError::Quarantined);
+                }
+                self.native = Some(native::Native::new(meter.clone()));
+            }
+            let Some(native) = self.native.as_ref() else { meter.quarantine(); return Err(MeteredCopyError::Quarantined); };
+            if !native.meter.same_authority(meter) {
+                native.meter.quarantine(); meter.quarantine(); return Err(MeteredCopyError::Quarantined);
+            }
+            let stamp = native.stamp()?;
+            return Ok(PreparedWrite { replacement: native.prepare(chunks)?, owner: Some(meter.clone()), stamp: Some(stamp) });
+        }
+        if let Some(native) = &self.native { native.meter.quarantine(); return Err(MeteredCopyError::Quarantined); }
+        Ok(PreparedWrite { replacement: None, owner: None, stamp: None })
+    }
+    pub(super) fn install_write(&mut self, plan: PreparedWrite) -> Result<(), MeteredCopyError> {
+        match (&mut self.native, plan.owner, plan.stamp) {
+            (Some(native), Some(owner), Some(stamp)) => native.install(plan.replacement, stamp, &owner),
+            (None, None, None) => Ok(()),
+            (native, owner, _) => {
+                if let Some(native) = native { native.meter.quarantine(); }
+                if let Some(owner) = owner { owner.quarantine(); }
+                Err(MeteredCopyError::Quarantined)
+            }
+        }
+    }
+    pub(super) fn prepare_ack(&self, range: Range<u64>) -> Result<PreparedRange, MeteredCopyError> {
+        match &self.native {
+            Some(native) => native.prepare_ack(range, self.offset, self.unacked_len).map(PreparedRange::Native),
+            None => Ok(PreparedRange::Legacy(range)),
+        }
+    }
+    pub(super) fn apply_ack(&mut self, plan: PreparedRange) -> Result<(), MeteredCopyError> {
+        match (&mut self.native, plan) {
+            (None, PreparedRange::Legacy(range)) => { self.ack(range); Ok(()) }
+            (Some(native), PreparedRange::Native(plan)) => native.ack(plan, self.offset, &mut self.unacked_len),
+            (native, plan) => {
+                if let Some(native) = native { native.meter.quarantine(); }
+                if let PreparedRange::Native(plan) = plan { plan.owner.quarantine(); }
+                Err(MeteredCopyError::Quarantined)
+            }
+        }
+    }
+    pub(super) fn ack_covers(&self, range: Range<u64>) -> bool {
+        let base = self.offset - self.unacked_len as u64;
+        match &self.native {
+            Some(native) => native.ack_covers(range, base, self.offset),
+            None => covers(range, base, self.offset, self.acks.iter()),
+        }
+    }
+    pub(super) fn prepare_retransmit(&self, range: Range<u64>) -> Result<PreparedRange, MeteredCopyError> {
+        match &self.native {
+            Some(native) => native.prepare_retransmit(range).map(PreparedRange::Native),
+            None => Ok(PreparedRange::Legacy(range)),
+        }
+    }
+    pub(super) fn apply_retransmit(&mut self, plan: PreparedRange) -> Result<(), MeteredCopyError> {
+        match (&mut self.native, plan) {
+            (None, PreparedRange::Legacy(range)) => { self.retransmit(range); Ok(()) }
+            (Some(native), PreparedRange::Native(plan)) => native.retransmit(plan),
+            (native, plan) => {
+                if let Some(native) = native { native.meter.quarantine(); }
+                if let PreparedRange::Native(plan) = plan { plan.owner.quarantine(); }
+                Err(MeteredCopyError::Quarantined)
+            }
+        }
     }
 
     /// Append application data to the end of the stream
     pub(super) fn write(&mut self, data: Bytes) {
         self.unacked_len += data.len();
         self.offset += data.len() as u64;
-        self.unacked_segments.push_back(data);
+        if let Some(native) = &mut self.native { native.push(data); }
+        else { self.unacked_segments.push_back(data); }
     }
 
     /// Discard a range of acknowledged stream data
@@ -90,7 +214,9 @@ impl SendBuffer {
         debug_assert!(max_len >= 8 + 8);
         let mut encode_length = false;
 
-        if let Some(range) = self.retransmits.pop_min() {
+        if let Some(range) = match &mut self.native {
+            Some(native) => native.pop_retransmit(), None => self.retransmits.pop_min(),
+        } {
             // Retransmit sent data
 
             // When the offset is known, we know how many bytes are required to encode it.
@@ -105,7 +231,8 @@ impl SendBuffer {
 
             let end = range.end.min((max_len as u64).saturating_add(range.start));
             if end != range.end {
-                self.retransmits.insert(end..range.end);
+                if let Some(native) = &mut self.native { native.put_suffix(end..range.end); }
+                else { self.retransmits.insert(end..range.end); }
             }
             return (range.start..end, encode_length);
         }
@@ -138,6 +265,7 @@ impl SendBuffer {
     /// retrieve more data.
     pub(super) fn get(&self, offsets: Range<u64>) -> &[u8] {
         let base_offset = self.offset - self.unacked_len as u64;
+        if let Some(native) = &self.native { return native.get(offsets, base_offset); }
 
         let mut segment_offset = base_offset;
         for segment in self.unacked_segments.iter() {
@@ -163,6 +291,7 @@ impl SendBuffer {
 
     pub(super) fn retransmit_all_for_0rtt(&mut self) {
         debug_assert_eq!(self.offset, self.unacked_len as u64);
+        if let Some(native) = &mut self.native { native.changed(); }
         self.unsent = 0;
     }
 
@@ -186,12 +315,34 @@ impl SendBuffer {
     ///
     /// There may be sent unacknowledged data even when this is false.
     pub(super) fn has_unsent_data(&self) -> bool {
-        self.unsent != self.offset || !self.retransmits.is_empty()
+        self.unsent != self.offset || self.native.as_ref().map_or_else(
+            || !self.retransmits.is_empty(), native::Native::has_retransmits)
     }
 
     /// Compute the amount of data that hasn't been acknowledged
     pub(super) fn unacked(&self) -> u64 {
-        self.unacked_len as u64 - self.acks.iter().map(|x| x.end - x.start).sum::<u64>()
+        self.unacked_len as u64 - self.native.as_ref().map_or_else(
+            || self.acks.iter().map(|x| x.end - x.start).sum::<u64>(), native::Native::acknowledged)
+    }
+}
+
+pub(super) struct PreparedWrite { replacement: Option<native::Segments>, owner: Option<BackingMeter>, stamp: Option<native::Stamp> }
+pub(super) enum PreparedRange { Legacy(Range<u64>), Native(native::Ack) }
+fn covers(range: Range<u64>, base: u64, offset: u64, old: impl Iterator<Item = Range<u64>>) -> bool {
+    if base == offset { return true; }
+    if range.start > base || range.end < base { return false; }
+    let mut through = range.end;
+    for old in old {
+        if old.start > through { break; }
+        through = through.max(old.end);
+    }
+    through >= offset
+}
+impl Drop for SendBuffer {
+    fn drop(&mut self) {
+        if let Some(native) = &self.native {
+            if !native.inventory_matches(self.unacked_len) { native.meter.quarantine(); }
+        }
     }
 }
 
@@ -397,3 +548,5 @@ mod tests {
         result
     }
 }
+
+pub(in crate::connection) struct PacketCapacity(Option<native::PacketCapacity>);

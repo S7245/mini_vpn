@@ -8,11 +8,11 @@ use bytes::{Buf, BufMut, Bytes};
 use rand::{Rng, RngExt};
 
 use crate::{
-    Duration, RESET_TOKEN_SIZE, ServerConfig, SystemTime, UNIX_EPOCH,
     coding::{BufExt, BufMutExt},
     crypto::{HandshakeTokenKey, HmacKey},
     packet::InitialHeader,
     shared::ConnectionId,
+    Duration, ServerConfig, SystemTime, RESET_TOKEN_SIZE, UNIX_EPOCH,
 };
 
 /// Responsible for limiting clients' ability to reuse validation tokens
@@ -78,6 +78,38 @@ impl TokenLog for NoneTokenLog {
 /// Responsible for storing validation tokens received from servers and retrieving them for use in
 /// subsequent connections
 pub trait TokenStore: Send + Sync {
+    /// Prepare actual insertion resources without storing a token or holding a
+    /// cache lock across Connection processing. Unknown providers fail closed.
+    #[doc(hidden)]
+    fn prepare_insert_metered(
+        self: std::sync::Arc<Self>, _: &str, _: &bytes::BackingMeter,
+    ) -> Result<PreparedTokenInsert, TokenStoreError> {
+        Err(TokenStoreError::Unsupported)
+    }
+
+    /// Hard-profile admission. The default rejects without calling the legacy
+    /// store, whose allocation and failure behavior cannot establish custody.
+    #[doc(hidden)]
+    fn insert_metered(
+        &self,
+        _: &str,
+        _: Bytes,
+        _: &bytes::BackingMeter,
+    ) -> Result<(), TokenStoreError> {
+        Err(TokenStoreError::Unsupported)
+    }
+
+    /// Hard-profile one-time transfer. An unsupported store must not consume
+    /// anything; returning a legacy token here would bypass physical custody.
+    #[doc(hidden)]
+    fn take_metered(
+        &self,
+        _: &str,
+        _: &bytes::BackingMeter,
+    ) -> Result<Option<Bytes>, TokenStoreError> {
+        Err(TokenStoreError::Unsupported)
+    }
+
     /// Potentially store a token for later one-time use
     ///
     /// Called when a NEW_TOKEN frame is received from the server.
@@ -90,6 +122,55 @@ pub trait TokenStore: Send + Sync {
     ///
     /// Called when trying to connect to a server. It is always ok for this to return `None`.
     fn take(&self, server_name: &str) -> Option<Bytes>;
+}
+
+/// Refusal from a hard-profile token store, before cache publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TokenStoreError {
+    /// This store or configuration has no hard-profile custody implementation.
+    #[error("unsupported hard token store")]
+    Unsupported,
+    /// A pre-existing legacy cache cannot be silently reclassified as charged.
+    #[error("uncharged tokens already stored")]
+    OccupiedLegacy,
+    /// The cache or token belongs to a different physical owner.
+    #[error("foreign token cache authority")]
+    ForeignAuthority,
+    /// Exact-layout admission or allocation failed before commit.
+    #[error("token cache capacity: {0:?}")]
+    Capacity(bytes::MeteredCopyError),
+}
+
+/// A prepared store operation. Implementations must never allocate on insert.
+/// Unexpected errors after publication are settled by the Connection quarantine.
+#[doc(hidden)]
+pub trait TokenInsert: Send {
+    /// Store one admitted token, in wire order, using only prepared resources.
+    fn insert(&mut self, token: Bytes) -> Result<(), TokenStoreError>;
+}
+
+/// Owns the actual provider operation and its exact allocation allowance.
+#[doc(hidden)]
+pub struct PreparedTokenInsert {
+    operation: Box<dyn TokenInsert>,
+    _allowance: Option<bytes::BackingBudgetReservation>,
+}
+impl PreparedTokenInsert {
+    /// Allocate the concrete operation before any protocol or cache publication.
+    pub fn new<T: TokenInsert + 'static>(operation: T, meter: &bytes::BackingMeter) -> Result<Self, TokenStoreError> {
+        use std::alloc::{alloc, Layout};
+        let layout = Layout::new::<T>();
+        let allowance = meter.reserve_cold_layout(layout.size()).map_err(TokenStoreError::Capacity)?;
+        let pointer = if layout.size() == 0 { std::ptr::NonNull::<T>::dangling().as_ptr() }
+            else { unsafe { alloc(layout).cast::<T>() } };
+        if pointer.is_null() { return Err(TokenStoreError::Capacity(bytes::MeteredCopyError::Allocation)); }
+        // This Box owns exactly the layout admitted above. Declaration order
+        // releases the concrete physical allocation before its allowance.
+        unsafe { pointer.write(operation); }
+        Ok(Self { operation: unsafe { Box::from_raw(pointer) }, _allowance: allowance })
+    }
+    /// Publish one token with the original provider's prepared operation.
+    pub fn insert(&mut self, token: Bytes) -> Result<(), TokenStoreError> { self.operation.insert(token) }
 }
 
 /// Null implementation of [`TokenStore`], which does not store any tokens
@@ -370,7 +451,22 @@ impl ResetToken {
     pub(crate) fn new(key: &dyn HmacKey, id: ConnectionId) -> Self {
         let mut signature = vec![0; key.signature_len()];
         key.sign(&id, &mut signature);
-        // TODO: Server ID??
+        Self::from_signature(&signature)
+    }
+    pub(crate) fn new_bounded(
+        key: &dyn HmacKey,
+        id: ConnectionId,
+        scratch: &mut [u8],
+    ) -> Option<Self> {
+        let len = key.signature_len();
+        if len < RESET_TOKEN_SIZE || len > scratch.len() {
+            return None;
+        }
+        key.sign(&id, &mut scratch[..len]);
+        Some(Self::from_signature(&scratch[..len]))
+    }
+    fn from_signature(signature: &[u8]) -> Self {
+        // Both paths use the same original stateless reset derivation.
         let mut result = [0; RESET_TOKEN_SIZE];
         result.copy_from_slice(&signature[..RESET_TOKEN_SIZE]);
         result.into()
@@ -429,8 +525,8 @@ mod test {
 
     #[test]
     fn retry_token_sanity() {
-        use crate::MAX_CID_SIZE;
         use crate::cid_generator::{ConnectionIdGenerator, RandomConnectionIdGenerator};
+        use crate::MAX_CID_SIZE;
         use crate::{Duration, UNIX_EPOCH};
 
         use std::net::Ipv6Addr;

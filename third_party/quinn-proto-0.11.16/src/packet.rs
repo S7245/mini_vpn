@@ -4,9 +4,8 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use thiserror::Error;
 
 use crate::{
-    ConnectionId,
     coding::{self, BufExt, BufMutExt},
-    crypto,
+    crypto, ConnectionId,
 };
 
 /// Decodes a QUIC packet's invariant header
@@ -219,13 +218,16 @@ impl PartialDecode {
     }
 }
 
-pub(crate) struct Packet {
+pub(crate) struct Packet<T = BytesMut> {
     pub(crate) header: Header,
     pub(crate) header_data: Bytes,
-    pub(crate) payload: BytesMut,
+    pub(crate) payload: T,
 }
 
 impl Packet {
+    pub(crate) fn freeze(self) -> Packet<Bytes> {
+        Packet { header: self.header, header_data: self.header_data, payload: self.payload.freeze() }
+    }
     pub(crate) fn reserved_bits_valid(&self) -> bool {
         let mask = match self.header {
             Header::Short { .. } => SHORT_RESERVED_BITS,
@@ -938,8 +940,8 @@ mod tests {
     #[cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
     #[test]
     fn header_encoding() {
-        use crate::Side;
         use crate::crypto::rustls::{initial_keys, initial_suite_from_provider};
+        use crate::Side;
         #[cfg(all(feature = "rustls-aws-lc-rs", not(feature = "rustls-ring")))]
         use rustls::crypto::aws_lc_rs::default_provider;
         #[cfg(feature = "rustls-ring")]

@@ -164,3 +164,6 @@ async fn actual_zero_notification_panic_keeps_attempt_and_partial_debits_quarant
     drop(upstream);
     pair.close().await;
 }
+
+#[path = "carrier_inventory.rs"]
+pub(in crate::tuic::tcp_open) mod carrier_inventory;

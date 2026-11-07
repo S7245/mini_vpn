@@ -12,7 +12,13 @@ mod relay_writer;
 mod supervision;
 mod transaction;
 
+pub(in crate::client_tun) use receive_window::ReaderWindow;
+#[cfg(test)]
+pub(in crate::client_tun) use receive_window::ReceiveWindow;
+
 pub(in crate::client_tun::compatibility_runtime) use transaction::OpenCustody;
+pub(in crate::client_tun::compatibility_runtime) use transaction::ROOT_GEOMETRY;
+pub(in crate::client_tun::compatibility_runtime) use transaction::custody::Owner as OpenOwner;
 pub(in crate::client_tun) use transaction::{HandshakeNotice, OpenDispatch, OpenEvent};
 #[cfg(all(test, feature = "harness"))]
 pub(in crate::client_tun::compatibility_runtime) use transaction::{
@@ -21,9 +27,9 @@ pub(in crate::client_tun::compatibility_runtime) use transaction::{
 
 pub(in crate::client_tun) use rearm::{
     FatalPhysicalTurn, FatalStep, FlowAdmission, FlowMirror, LocalReset, RearmGate, RearmIntent,
-    RemotePayloadRequest, flush_tx_and_release_downlink_permits, gate_legacy_rearm,
+    RemotePayloadRequest, ResetProof, flush_tx_and_release_downlink_permits, gate_legacy_rearm,
     legacy_bare_rearm_from_loop, legacy_reasoned_rearm_from_loop, legacy_reasoned_rearm_with_gate,
-    legacy_reasoned_rearm_with_snapshot_and_gate, reap_dead_slots_from_loop,
+    legacy_reasoned_rearm_with_snapshot_and_gate, poll_egress_cycle, reap_dead_slots_from_loop,
 };
 
 #[cfg(test)]
@@ -32,6 +38,7 @@ pub(in crate::client_tun) use rearm::{
     should_reap_slot_with_snapshot,
 };
 
+pub(in crate::client_tun) use supervision::{FailureClock, stamp_failure};
 pub(in crate::client_tun) use supervision::{
     GenericLaunchRequest, launch_generic_relay, run_relay, run_relay_ordered_egress_permit,
     run_relay_thin, run_relay_with_engine,

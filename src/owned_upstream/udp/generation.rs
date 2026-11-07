@@ -16,9 +16,13 @@ pub(crate) struct GenerationControl {
     consumer: AtomicU64,
     consumer_disposition: AtomicU8, // 0 present, 1 destructing, 2 physically absent
     invalid: AtomicBool,
+    native_meter: std::sync::OnceLock<bytes::BackingMeter>,
     pub(crate) changed: Notify,
     discarded_messages: AtomicU64,
     discarded_bytes: AtomicU64,
+    capacity_drops: AtomicU64,
+    #[cfg(test)]
+    publication_absent: AtomicU64,
 }
 impl Default for GenerationControl {
     fn default() -> Self {
@@ -29,9 +33,13 @@ impl Default for GenerationControl {
             consumer: AtomicU64::new(0),
             consumer_disposition: AtomicU8::new(0),
             invalid: AtomicBool::new(false),
+            native_meter: std::sync::OnceLock::new(),
             changed: Notify::new(),
             discarded_messages: AtomicU64::new(0),
             discarded_bytes: AtomicU64::new(0),
+            capacity_drops: AtomicU64::new(0),
+            #[cfg(test)]
+            publication_absent: AtomicU64::new(0),
         }
     }
 }
@@ -49,6 +57,29 @@ impl Publication<'_> {
     }
 }
 impl GenerationControl {
+    #[cfg(test)]
+    pub(crate) fn diagnostic(&self) -> (u8, u64, bool, bool, u64) {
+        let epoch = self.epoch();
+        (
+            self.consumer_disposition.load(Ordering::Acquire),
+            epoch,
+            self.sealed(epoch),
+            self.valid(),
+            self.publication_absent.load(Ordering::Acquire),
+        )
+    }
+    pub(crate) fn bind_native_meter(
+        &self,
+        meter: &bytes::BackingMeter,
+    ) -> Result<(), bytes::MeteredCopyError> {
+        if self.native_meter.get().is_some() || self.phase.load(Ordering::Acquire) != 2 {
+            meter.quarantine();
+            return Err(bytes::MeteredCopyError::Quarantined);
+        }
+        self.native_meter
+            .set(meter.clone())
+            .map_err(|_| bytes::MeteredCopyError::Quarantined)
+    }
     pub(crate) fn epoch(&self) -> u64 {
         self.phase.load(Ordering::Acquire) >> 1
     }
@@ -69,25 +100,26 @@ impl GenerationControl {
         ok
     }
     pub(crate) fn producer_sealed(&self, epoch: u64) {
-        if self.frozen(epoch) {
+        if self.frozen(epoch) && self.valid() {
             self.producer.fetch_max(epoch, Ordering::AcqRel);
             self.changed.notify_waiters();
         }
     }
     pub(crate) fn seal_unstarted(&self, epoch: u64) {
-        if self.frozen(epoch) {
+        if self.frozen(epoch) && self.valid() {
             self.producer.fetch_max(epoch, Ordering::AcqRel);
             self.consumer.fetch_max(epoch, Ordering::AcqRel);
         }
     }
     fn consumer_sealed(&self, epoch: u64) {
-        if self.frozen(epoch) {
+        if self.frozen(epoch) && self.valid() {
             self.consumer.fetch_max(epoch, Ordering::AcqRel);
             self.changed.notify_waiters();
         }
     }
     pub(crate) fn sealed(&self, epoch: u64) -> bool {
-        self.frozen(epoch)
+        self.valid()
+            && self.frozen(epoch)
             && self.producer.load(Ordering::Acquire) == epoch
             && match self.consumer_disposition.load(Ordering::Acquire) {
                 0 => self.consumer.load(Ordering::Acquire) == epoch,
@@ -97,6 +129,10 @@ impl GenerationControl {
     }
     pub(crate) fn valid(&self) -> bool {
         !self.invalid.load(Ordering::Acquire)
+            && self
+                .native_meter
+                .get()
+                .is_none_or(|meter| !meter.is_quarantined())
     }
     pub(crate) async fn wait_frozen(&self, epoch: u64) {
         loop {
@@ -134,6 +170,10 @@ impl GenerationControl {
             || old.checked_add(1) != Some(new)
             || new > u64::MAX >> 1
         {
+            #[cfg(test)]
+            if self.consumer_disposition.load(Ordering::Acquire) != 0 {
+                self.publication_absent.fetch_add(1, Ordering::Release);
+            }
             return None;
         }
         Some(Publication {
@@ -149,27 +189,73 @@ struct Envelope {
 }
 pub(crate) struct GenerationSender {
     sender: Option<mpsc::Sender<Envelope>>,
+    native: Option<native_source::Sender>,
     control: Arc<GenerationControl>,
 }
 impl Clone for GenerationSender {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
+            native: self.native.clone(),
             control: self.control.clone(),
         }
     }
 }
 impl GenerationSender {
-    pub(crate) async fn send(&self, epoch: u64, bytes: Vec<u8>) -> Result<(), ()> {
+    pub(crate) async fn send_legacy(
+        &self,
+        epoch: u64,
+        bytes: Vec<u8>,
+    ) -> Result<(), crate::shared::bounded_channel::ReserveError> {
+        if self.native.is_some() {
+            return self.send(epoch, Bytes::from(bytes)).await;
+        }
         match &self.sender {
-            Some(tx) => tx.send(Envelope { epoch, bytes }).await.map_err(|_| ()),
-            None => Err(()),
+            Some(tx) => tx
+                .send(Envelope { epoch, bytes })
+                .await
+                .map_err(|_| crate::shared::bounded_channel::ReserveError::Closed),
+            None => Err(crate::shared::bounded_channel::ReserveError::Closed),
+        }
+    }
+    pub(crate) async fn send(
+        &self,
+        epoch: u64,
+        bytes: impl Into<Bytes>,
+    ) -> Result<(), crate::shared::bounded_channel::ReserveError> {
+        let bytes = bytes.into();
+        if let Some(sender) = &self.native {
+            return sender.send(epoch, bytes).await;
+        }
+        match &self.sender {
+            Some(tx) => tx
+                .send(Envelope {
+                    epoch,
+                    bytes: bytes.to_vec(),
+                })
+                .await
+                .map_err(|_| crate::shared::bounded_channel::ReserveError::Closed),
+            None => Err(crate::shared::bounded_channel::ReserveError::Closed),
         }
     }
     pub(crate) fn is_closed(&self) -> bool {
-        self.sender.as_ref().is_none_or(|tx| tx.is_closed())
+        self.native.as_ref().map_or_else(
+            || self.sender.as_ref().is_none_or(|tx| tx.is_closed()),
+            |tx| tx.is_closed(),
+        )
     }
     pub(crate) async fn closed(&self) {
+        if self.native.is_some() {
+            loop {
+                let changed = self.control.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if self.is_closed() {
+                    return;
+                }
+                changed.await;
+            }
+        }
         if let Some(tx) = &self.sender {
             tx.closed().await;
         }
@@ -180,6 +266,7 @@ impl Drop for GenerationSender {
         // Notify only after the actual sender is destroyed: frozen source may
         // be waiting for terminal EOF rather than a new publication.
         drop(self.sender.take());
+        drop(self.native.take());
         self.control.changed.notify_waiters();
     }
 }
@@ -196,6 +283,7 @@ pub(crate) fn channel(
     (
         GenerationSender {
             sender: Some(sender),
+            native: None,
             control: control.clone(),
         },
         UdpDownlinkSource {
@@ -208,6 +296,10 @@ pub(crate) fn channel(
     )
 }
 impl Source {
+    #[cfg(test)]
+    pub(super) fn generation_for_test(&self) -> Arc<GenerationControl> {
+        self.control.clone()
+    }
     fn discard(&mut self) {
         if let Some(receiver) = &mut self.receiver {
             while let Ok(envelope) = receiver.try_recv() {
@@ -225,6 +317,7 @@ impl Source {
     }
     pub(super) async fn recv(&mut self, clock: &Instant) -> Option<UdpDownlinkEvent> {
         loop {
+            self.receiver.as_ref()?;
             let control = self.control.clone();
             let notified = control.changed.notified();
             tokio::pin!(notified);
@@ -241,15 +334,19 @@ impl Source {
                 if self
                     .receiver
                     .as_ref()
-                    .is_some_and(|receiver| receiver.is_closed() && receiver.is_empty())
-                    && control.consumer.load(Ordering::Acquire) == epoch
+                    .is_some_and(|receiver| receiver.is_closed())
                 {
+                    self.retire();
                     return None;
                 }
                 notified.await;
                 continue;
             }
-            let envelope = tokio::select! { biased; _ = &mut notified => continue, item = self.receiver.as_mut()?.recv() => item? };
+            let envelope = tokio::select! { biased; _ = &mut notified => continue, item = self.receiver.as_mut()?.recv() => item };
+            let Some(envelope) = envelope else {
+                self.retire();
+                return None;
+            };
             if envelope.epoch != epoch || control.frozen(epoch) {
                 return Some(UdpDownlinkEvent::Ignored);
             }
@@ -274,8 +371,13 @@ impl Source {
         self.reassembler.sweep(now, ttl);
     }
 }
-impl Drop for Source {
-    fn drop(&mut self) {
+impl Source {
+    // EOF and Drop have the same physical disposition. A consumer that has
+    // observed EOF need not be polled or destroyed again to let cleanup settle.
+    fn retire(&mut self) {
+        if self.receiver.is_none() {
+            return;
+        }
         let control = self.control.clone();
         let guard = match control.publication.lock() {
             Ok(guard) => guard,
@@ -298,5 +400,17 @@ impl Drop for Source {
     }
 }
 
+impl Drop for Source {
+    fn drop(&mut self) {
+        self.retire();
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests;
+
+mod native_fragments;
+
+pub(crate) mod callbacks;
+
+pub(crate) mod native_source;

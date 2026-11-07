@@ -26,6 +26,10 @@ use std::task::{Context, Poll, ready};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
+mod staged;
+#[cfg(test)]
+pub(crate) use tests::reality_server_sim;
+
 /// TLS 1.3 record 明文上限（2^14）——每条 0x17 record 至多封这么多明文。
 const MAX_PLAINTEXT: usize = 16384;
 /// TLS record 密文上限（2^14 + 256，RFC 8446 §5.2）——防恶意巨 length 字段无界分配。
@@ -545,6 +549,13 @@ const REALITY_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 
 #[async_trait::async_trait]
 impl ProxyUpstream for RealityUpstream {
+    fn staged_tcp_open(
+        self: std::sync::Arc<Self>,
+        request: crate::upstream::TcpOpenRequest,
+    ) -> crate::upstream::StagedTcpOpen<crate::upstream::OpenedTcpRelay> {
+        staged::create(self, request).map(|open| Box::new(open) as _)
+    }
+
     async fn open_tcp(&self, target: &TargetAddr) -> Result<RelayStream, ClientError> {
         let timeout = std::time::Duration::from_secs(REALITY_HANDSHAKE_TIMEOUT_SECS);
         let mut stream = tokio::time::timeout(timeout, TcpStream::connect(&self.cfg.server))
@@ -907,7 +918,7 @@ mod tests {
 
     /// 服务端 REALITY 握手（CH→SH/flight→验 client Finished），返回 `RecordReader` + app keys。
     /// `reality_server_sim` 与 KeyUpdate loopback 共用此握手段，握手后各自续读（VLESS / KeyUpdate）。
-    async fn reality_sim_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    pub(super) async fn reality_sim_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         io: &mut S,
         server_static_sk: [u8; 32],
     ) -> (RecordReader, crate::reality::key_schedule::AppKeys) {
@@ -975,7 +986,7 @@ mod tests {
     }
 
     /// 测试内最小 REALITY **服务端**模拟器：完整跑服务端握手 + 收 VLESS 请求 + echo（验客户端整条路径）。
-    async fn reality_server_sim<S: AsyncRead + AsyncWrite + Unpin>(
+    pub(crate) async fn reality_server_sim<S: AsyncRead + AsyncWrite + Unpin>(
         mut io: S,
         server_static_sk: [u8; 32],
         expected_uuid: [u8; 16],

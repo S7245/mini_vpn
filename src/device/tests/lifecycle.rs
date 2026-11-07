@@ -692,18 +692,24 @@ async fn settled_virtual_shell_releases_reinserted_backing_and_rejects_io() {
     // This is a stopped diagnostic shell, not a real TUN/backend acceptance fixture.
     let mut device = VirtualTunDevice {
         backend: VirtualTunBackend::Stopped,
+        cut: crate::device::cut::CutBoundary::default(),
         stopping: true,
         shutdown_failure: None,
+        shutdown_failure_transferred: false,
+        shutdown_callbacks: None,
         interface_name: Some("closed-test-shell".into()),
         mtu: 1200,
-        rx_buffer: Some(BytesMut::with_capacity(192)),
-        iface_rx_queue: VecDeque::from([BytesMut::zeroed(64)]),
-        tx_queue: VecDeque::from([BytesMut::zeroed(96)]),
-        flushed_tcp_packets: Vec::with_capacity(4),
+        rx: crate::device::rx::RxStock::test_legacy(Some(BytesMut::with_capacity(192)), VecDeque::from([BytesMut::zeroed(64)])),
+        egress: {
+            let mut egress = egress::Egress::default();
+            egress.queue = VecDeque::from([BytesMut::zeroed(96)]);
+            egress.summaries = Vec::with_capacity(4);
+            egress
+        },
     };
-    assert!(device.rx_buffer.as_ref().unwrap().capacity() >= 192);
-    assert!(device.iface_rx_queue.capacity() > 0);
-    assert!(device.flushed_tcp_packets.capacity() > 0);
+    assert!(device.rx.test_current_capacity() >= 192);
+    assert!(device.rx.test_staged_capacity() > 0);
+    assert!(device.egress.summaries.capacity() > 0);
     assert_eq!(
         device.wait_for_rx().await.unwrap_err().kind(),
         ErrorKind::BrokenPipe
@@ -730,20 +736,20 @@ async fn settled_virtual_shell_releases_reinserted_backing_and_rejects_io() {
         let result = std::future::poll_fn(|cx| device.poll_shutdown(cx)).await;
         assert_eq!(result.state(), DeviceShutdownState::Settled);
         assert!(matches!(device.backend, VirtualTunBackend::Stopped));
-        assert!(device.rx_buffer.is_none());
-        assert_eq!(device.iface_rx_queue.capacity(), 0);
-        assert_eq!(device.tx_queue.capacity(), 0);
-        assert_eq!(device.flushed_tcp_packets.capacity(), 0);
+        assert!(!device.rx.has_current());
+        assert_eq!(device.rx.test_staged_capacity(), 0);
+        assert_eq!(device.egress.queue.capacity(), 0);
+        assert_eq!(device.egress.summaries.capacity(), 0);
         assert_eq!(device.queued_tx_bytes(), 0);
         assert_eq!(device.interface_name(), Some("closed-test-shell"));
         if round == 0 {
             // Existing public fields can be written after the first settled observation.
-            device.rx_buffer = Some(BytesMut::with_capacity(256));
-            device.tx_queue.reserve(4);
-            device.tx_queue.push_back(BytesMut::with_capacity(512));
-            assert!(device.rx_buffer.as_ref().unwrap().capacity() >= 256);
-            assert!(device.tx_queue.capacity() > 0);
-            assert!(device.tx_queue.front().unwrap().capacity() >= 512);
+            device.rx.test_set_current(BytesMut::with_capacity(256));
+            device.egress.queue.reserve(4);
+            device.egress.queue.push_back(BytesMut::with_capacity(512));
+            assert!(device.rx.test_current_capacity() >= 256);
+            assert!(device.egress.queue.capacity() > 0);
+            assert!(device.egress.queue.front().unwrap().capacity() >= 512);
         }
     }
 }

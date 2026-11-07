@@ -27,7 +27,7 @@ async fn control_turn(
     })
     .await;
     if let Poll::Ready(Some(event)) = event {
-        let (global_tx, _global_rx) = mpsc::channel(4);
+        let (global_tx, _global_rx) = crate::client_tun::relay_channel::channel(4);
         let (owned_action_tx, _owned_rx) = mpsc::channel(4);
         HandshakeCompletion::from_loop(
             dispatch,

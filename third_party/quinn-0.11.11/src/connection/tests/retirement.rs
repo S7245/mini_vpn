@@ -15,6 +15,22 @@ impl Loopback {
     }
 
     pub(super) async fn with_bi_limit(limit: Option<u32>) -> Self {
+        Self::with_options(limit, None, None).await
+    }
+
+    pub(super) async fn with_meter(meter: bytes::BackingMeter) -> Self {
+        Self::with_options(None, Some(meter), None).await
+    }
+
+    pub(super) async fn with_control_limit(meter: bytes::BackingMeter, count: usize) -> Self {
+        Self::with_options(None, Some(meter), Some(count)).await
+    }
+
+    async fn with_options(
+        limit: Option<u32>,
+        meter: Option<bytes::BackingMeter>,
+        controls: Option<usize>,
+    ) -> Self {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into());
         let mut server =
@@ -26,8 +42,21 @@ impl Loopback {
         }
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert.cert.der().clone()).unwrap();
-        let mut endpoint =
-            Endpoint::server(server, SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let address = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let mut endpoint = if let Some(meter) = meter {
+            let runtime = crate::default_runtime().unwrap();
+            let socket = runtime
+                .wrap_udp_socket(std::net::UdpSocket::bind(address).unwrap())
+                .unwrap();
+            let mut config = crate::EndpointConfig::default();
+            if let Some(count) = controls {
+                config.receive_control_record_limit(count).unwrap();
+            }
+            Endpoint::new_with_metered_abstract_socket(config, Some(server), socket, runtime, meter)
+                .unwrap()
+        } else {
+            Endpoint::server(server, address).unwrap()
+        };
         endpoint.set_default_client_config(
             ClientConfig::with_root_certificates(Arc::new(roots)).unwrap(),
         );

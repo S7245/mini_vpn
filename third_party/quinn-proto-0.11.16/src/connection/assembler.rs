@@ -1,18 +1,23 @@
-use std::{
-    cmp::Ordering,
-    collections::{BinaryHeap, binary_heap::PeekMut},
-    mem,
-};
+use std::{cmp::Ordering, mem};
 
-use bytes::{Buf, Bytes, BytesMut};
+use super::streams::ReadableError;
+use bytes::{BackingMeter, Buf, Bytes, BytesMut, MeteredCopyError};
 
-use crate::range_set::RangeSet;
+mod replacement;
+pub(in crate::connection) mod crypto;
+pub(in crate::connection) mod batch;
+pub(in crate::connection) mod insertion;
+mod storage;
+use super::storage::intervals::Intervals;
+use replacement::Replacement;
+use storage::{Heap, Mutation};
 
 /// Helper to assemble unordered stream frames into an ordered stream
 #[derive(Debug, Default)]
 pub(super) struct Assembler {
+    backing_meter: Option<BackingMeter>,
     state: State,
-    data: BinaryHeap<Buffer>,
+    data: Heap,
     /// Total number of buffered bytes, including duplicates in ordered mode.
     buffered: usize,
     /// Estimated number of allocated bytes, will never be less than `buffered`.
@@ -34,198 +39,222 @@ pub(super) struct AssemblerProgress {
 }
 
 impl Assembler {
+    pub(super) fn closed_inventory_matches(&self, meter: &BackingMeter) -> bool {
+        self.backing_meter.as_ref().map_or_else(|| !self.has_native_layout(), |saved| saved.same_authority(meter))
+            && self.data.layout_matches(meter)
+            && self.data.iter().try_fold(0usize, |n, v| n.checked_add(v.bytes.len())) == Some(self.buffered)
+            && self.data.iter().try_fold(0usize, |n, v| n.checked_add(v.allocation_size)) == Some(self.allocated)
+            && self.bytes_read <= self.end
+            && self.data.iter().all(|v| v.allocation_size >= v.bytes.len()
+                && v.offset.checked_add(v.bytes.len() as u64).is_some_and(|end| end <= self.end)
+                && v.bytes.backing_meter().is_some_and(|actual| actual.same_authority(meter)))
+            && match &self.state { State::Ordered => true, State::Unordered { recvd, received_prefix } =>
+                recvd.inventory_within(meter, self.end)
+                    && recvd.min().is_none_or(|first| first > *received_prefix)
+                    && received_prefix.checked_add(recvd.bytes()).is_some_and(|unique|
+                        unique <= self.end && self.bytes_read <= unique) }
+    }
+
     pub(super) fn new() -> Self {
         Self::default()
     }
 
-    /// Reset to the initial state
-    pub(super) fn reinit(&mut self) {
-        let old_data = mem::take(&mut self.data);
-        *self = Self::default();
-        self.data = old_data;
-        self.data.clear();
+    fn has_native_layout(&self) -> bool {
+        self.data.has_native_layout() || match &self.state {
+            State::Ordered => false,
+            State::Unordered { recvd, .. } => recvd.has_native_layout(),
+        }
     }
-
-    pub(super) fn ensure_ordering(&mut self, ordered: bool) -> Result<(), IllegalOrderedRead> {
-        if ordered && !self.state.is_ordered() {
-            return Err(IllegalOrderedRead);
-        } else if !ordered && self.state.is_ordered() {
-            // Enter unordered mode
-            if !self.data.is_empty() {
-                // Get rid of possible duplicates
-                self.defragment();
-            }
-            let mut recvd = RangeSet::new();
-            recvd.insert(0..self.bytes_read);
-            for chunk in &self.data {
-                recvd.insert(chunk.offset..chunk.offset + chunk.bytes.len() as u64);
-            }
-            self.state = State::Unordered { recvd };
+    fn inventory_failure(&self) -> InsertError {
+        if let Some(meter) = &self.backing_meter { meter.quarantine(); }
+        self.data.quarantine_layout_owner();
+        // Actual chunks keep every implicated authority alive during marking.
+        for chunk in self.data.iter() {
+            if let Some(actual) = chunk.bytes.backing_meter() { actual.quarantine(); }
+        }
+        InsertError::AuthorityMismatch
+    }
+    /// Constant local authority check. A missing root may bind only while no
+    /// actual hard layout remains; an internally consistent foreign inventory
+    /// is still foreign to its original Connection.
+    pub(super) fn check_authority(&self, expected: Option<&BackingMeter>) -> Result<(), InsertError> {
+        let valid = match &self.backing_meter {
+            Some(saved) => expected.is_none_or(|meter| saved.same_authority(meter)),
+            None => !self.has_native_layout(),
+        };
+        if !valid {
+            if let Some(meter) = expected { meter.quarantine(); }
+            return Err(self.inventory_failure());
+        }
+        Ok(())
+    }
+    pub(super) fn check_inventory(&self) -> Result<(), InsertError> {
+        let valid = match &self.backing_meter {
+            Some(meter) => self.closed_inventory_matches(meter),
+            None => !self.has_native_layout()
+                && self.data.iter().all(|chunk| chunk.bytes.backing_meter().is_none()),
+        };
+        if !valid { return Err(self.inventory_failure()); }
+        Ok(())
+    }
+    pub(super) fn check_inventory_with_end(&self, owner_end: u64, expected: Option<&BackingMeter>) -> Result<(), InsertError> {
+        self.check_authority(expected)?;
+        self.check_inventory()?;
+        if self.end > owner_end || self.bytes_read > owner_end {
+            return Err(self.inventory_failure());
         }
         Ok(())
     }
 
-    /// Get the the next chunk
-    pub(super) fn read(&mut self, max_length: usize, ordered: bool) -> Option<Chunk> {
-        loop {
-            let mut chunk = self.data.peek_mut()?;
+    /// Reset only a physically qualified original inventory.
+    pub(super) fn reinit_checked(&mut self) -> Result<(), InsertError> {
+        self.check_inventory()?;
+        let old_data = mem::take(&mut self.data);
+        let meter = self.backing_meter.take();
+        *self = Self::default();
+        self.backing_meter = meter;
+        self.data = old_data;
+        self.data.clear();
+        Ok(())
+    }
 
-            if ordered {
-                if chunk.offset > self.bytes_read {
-                    // Next chunk is after current read index
-                    return None;
-                } else if (chunk.offset + chunk.bytes.len() as u64) <= self.bytes_read {
-                    // Next chunk is useless as the read index is beyond its end
-                    self.buffered -= chunk.bytes.len();
-                    self.allocated -= chunk.allocation_size;
-                    PeekMut::pop(chunk);
+    /// Preserve an already-determined API rejection before resource admission.
+    pub(super) fn check_ordering(&self, ordered: bool) -> Result<(), ReadableError> {
+        if ordered && !self.state.is_ordered() {
+            return Err(ReadableError::IllegalOrderedRead);
+        }
+        Ok(())
+    }
+
+    pub(super) fn ensure_ordering(&mut self, ordered: bool) -> Result<(), ReadableError> {
+        self.check_ordering(ordered)?;
+        if !ordered && self.state.is_ordered() {
+            self.check_inventory().map_err(|_| ReadableError::BackingAuthorityLost)?;
+            // All replacement layouts and offset inventory precede publication.
+            let replacement = if self.data.is_empty() {
+                None
+            } else {
+                Some(
+                    Replacement::prepare(self, freeze_metered)
+                        .map_err(|_| ReadableError::BackingAuthorityLost)?,
+                )
+            };
+            let mut recvd = Intervals::default();
+            let meter = self.backing_meter.as_ref();
+            let mut received_prefix = self.bytes_read;
+            let data = replacement.as_ref().map_or(&self.data, |r| &r.data);
+            for chunk in data.iter() {
+                let range = chunk.offset.max(received_prefix)..chunk.offset + chunk.bytes.len() as u64;
+                if range.start > received_prefix {
+                    let prepare = recvd.prepare(range.clone(), meter)
+                        .map_err(|_| ReadableError::BackingAuthorityLost)?;
+                    recvd.install(prepare);
+                }
+                record_received(&mut recvd, &mut received_prefix, range);
+            }
+            let mutation =
+                Mutation::begin(meter).map_err(|_| ReadableError::BackingAuthorityLost)?;
+            if let Some(replacement) = replacement {
+                replacement.commit(self);
+            }
+            self.state = State::Unordered { recvd, received_prefix };
+            mutation.commit();
+        }
+        Ok(())
+    }
+
+    /// Prepare the original next read without consuming useful bytes. Obsolete
+    /// ordered heads are disposed exactly as read() did; gaps/EOF/zero reads
+    /// predict no positive consumption and therefore require no control credit.
+    pub(super) fn qualify_read(&self, expected: Option<&BackingMeter>) -> Result<(), ReadableError> {
+        self.check_authority(expected).map_err(|_| self.read_inventory_lost())?;
+        if !self.data.qualify() { return Err(self.read_inventory_lost()); }
+        Ok(())
+    }
+    pub(super) fn prepare_read(&mut self, max_length: usize, ordered: bool) -> Result<Option<usize>, ReadableError> {
+        self.qualify_read(None)?;
+        loop {
+            let Some(chunk) = self.data.peek() else { return Ok(None); };
+            let end = chunk.offset.checked_add(chunk.bytes.len() as u64)
+                .ok_or_else(|| self.read_inventory_lost())?;
+            let start = if ordered {
+                if chunk.offset > self.bytes_read { return Ok(None); }
+                if end <= self.bytes_read {
+                    if self.buffered < chunk.bytes.len() || self.allocated < chunk.allocation_size {
+                        return Err(self.read_inventory_lost());
+                    }
+                    let actual = self.data.pop_checked().map_err(|_| self.read_inventory_lost())?
+                        .ok_or_else(|| self.read_inventory_lost())?;
+                    self.buffered -= actual.bytes.len();
+                    self.allocated -= actual.allocation_size;
                     continue;
                 }
-
-                // Determine `start` and `len` of the slice of useful data in chunk
-                let start = (self.bytes_read - chunk.offset) as usize;
-                if start > 0 {
-                    chunk.bytes.advance(start);
-                    chunk.offset += start as u64;
-                    self.buffered -= start;
-                }
-            }
-
-            return Some(if max_length < chunk.bytes.len() {
-                self.bytes_read += max_length as u64;
-                let offset = chunk.offset;
-                chunk.offset += max_length as u64;
-                self.buffered -= max_length;
-                Chunk::new(offset, chunk.bytes.split_to(max_length))
-            } else {
-                self.bytes_read += chunk.bytes.len() as u64;
-                self.buffered -= chunk.bytes.len();
-                self.allocated -= chunk.allocation_size;
-                let chunk = PeekMut::pop(chunk);
-                Chunk::new(chunk.offset, chunk.bytes)
-            });
+                (self.bytes_read - chunk.offset) as usize
+            } else { 0 };
+            return Ok(Some((chunk.bytes.len() - start).min(max_length)));
         }
+    }
+    fn read_inventory_lost(&self) -> ReadableError {
+        self.inventory_failure();
+        ReadableError::BackingAuthorityLost
+    }
+    pub(super) fn read_checked(&mut self, max_length: usize, ordered: bool) -> Result<Option<Chunk>, ReadableError> {
+        let Some(take) = self.prepare_read(max_length, ordered)? else { return Ok(None); };
+        let Some(head) = self.data.peek() else { return Err(self.read_inventory_lost()); };
+        let skip = if ordered { (self.bytes_read - head.offset) as usize } else { 0 };
+        let consumed = skip.checked_add(take).ok_or_else(|| self.read_inventory_lost())?;
+        let removed = if consumed == head.bytes.len() { head.allocation_size } else { 0 };
+        let buffered = self.buffered.checked_sub(consumed).ok_or_else(|| self.read_inventory_lost())?;
+        let allocated = self.allocated.checked_sub(removed).ok_or_else(|| self.read_inventory_lost())?;
+        let bytes_read = self.bytes_read.checked_add(take as u64).ok_or_else(|| self.read_inventory_lost())?;
+        let actual = self.data.read_head(skip, max_length).map_err(|_| self.read_inventory_lost())?
+            .ok_or_else(|| self.read_inventory_lost())?;
+        debug_assert_eq!((actual.discarded, actual.bytes.len(), actual.allocation_removed), (skip, take, removed));
+        self.buffered = buffered;
+        self.allocated = allocated;
+        self.bytes_read = bytes_read;
+        Ok(Some(Chunk::new(actual.offset, actual.bytes)))
     }
 
     /// Copy fragmented chunk data to new chunks backed by a single buffer
     ///
     /// This makes sure we're not unnecessarily holding on to many larger allocations.
     /// We merge contiguous chunks in the process of doing so.
-    fn defragment(&mut self) {
-        let new = BinaryHeap::with_capacity(self.data.len());
-        let old = mem::replace(&mut self.data, new);
-        let mut buffers = old.into_sorted_vec();
-        self.buffered = 0;
-        let mut fragmented_buffered = 0;
-        let mut offset = 0;
-        for chunk in buffers.iter_mut().rev() {
-            chunk.try_mark_defragment(offset);
-            let size = chunk.bytes.len();
-            offset = chunk.offset + size as u64;
-            self.buffered += size;
-            if !chunk.defragmented {
-                fragmented_buffered += size;
-            }
-        }
-        self.allocated = self.buffered;
-        let mut buffer = BytesMut::with_capacity(fragmented_buffered);
-        let mut offset = 0;
-        for chunk in buffers.into_iter().rev() {
-            if chunk.defragmented {
-                // bytes might be empty after try_mark_defragment
-                if !chunk.bytes.is_empty() {
-                    self.data.push(chunk);
-                }
-                continue;
-            }
-            // Overlap is resolved by try_mark_defragment
-            if chunk.offset != offset + (buffer.len() as u64) {
-                if !buffer.is_empty() {
-                    self.data
-                        .push(Buffer::new_defragmented(offset, buffer.split().freeze()));
-                }
-                offset = chunk.offset;
-            }
-            buffer.extend_from_slice(&chunk.bytes);
-        }
-        if !buffer.is_empty() {
-            self.data
-                .push(Buffer::new_defragmented(offset, buffer.split().freeze()));
-        }
+    fn defragment(&mut self) -> Result<(), InsertError> {
+        self.defragment_with(freeze_metered)
+    }
+
+    fn defragment_with<F>(&mut self, mut freeze: F) -> Result<(), InsertError>
+    where
+        F: FnMut(&mut BytesMut, Option<&BackingMeter>) -> Result<Bytes, InsertError>,
+    {
+        let replacement = Replacement::prepare(self, &mut freeze)?;
+        let mutation = Mutation::begin(self.backing_meter.as_ref())?;
+        replacement.commit(self);
+        mutation.commit();
+        Ok(())
     }
 
     // Note: If a packet contains many frames from the same stream, the estimated over-allocation
     // will be much higher because we are counting the same allocation multiple times.
+    #[cfg(test)]
     pub(super) fn insert(
         &mut self,
-        mut offset: u64,
-        mut bytes: Bytes,
+        offset: u64,
+        bytes: Bytes,
         allocation_size: usize,
-    ) -> Result<(), TooManyChunks> {
-        debug_assert!(
-            bytes.len() <= allocation_size,
-            "allocation_size less than bytes.len(): {:?} < {:?}",
-            allocation_size,
-            bytes.len()
-        );
-        self.end = self.end.max(offset + bytes.len() as u64);
-        if let State::Unordered { ref mut recvd } = self.state {
-            // Discard duplicate data
-            for duplicate in recvd.replace(offset..offset + bytes.len() as u64) {
-                if duplicate.start > offset {
-                    let buffer = Buffer::new(
-                        offset,
-                        bytes.split_to((duplicate.start - offset) as usize),
-                        allocation_size,
-                    );
-                    self.buffered += buffer.bytes.len();
-                    self.allocated += buffer.allocation_size;
-                    self.data.push(buffer);
-                    offset = duplicate.start;
-                }
-                bytes.advance((duplicate.end - offset) as usize);
-                offset = duplicate.end;
-            }
-        } else if offset < self.bytes_read {
-            if (offset + bytes.len() as u64) <= self.bytes_read {
-                return Ok(());
-            } else {
-                let diff = self.bytes_read - offset;
-                offset += diff;
-                bytes.advance(diff as usize);
-            }
-        }
+    ) -> Result<(), InsertError> {
+        self.insert_checked(offset, bytes, allocation_size, None)
+    }
 
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        let buffer = Buffer::new(offset, bytes, allocation_size);
-        self.buffered += buffer.bytes.len();
-        self.allocated += buffer.allocation_size;
-        self.data.push(buffer);
-        // `self.buffered` also counts duplicate bytes, therefore we use
-        // `self.end - self.bytes_read` as an upper bound of buffered unique
-        // bytes. This will cause a defragmentation if the amount of duplicate
-        // bytes exceedes a proportion of the receive window size.
-        let buffered = self.buffered.min((self.end - self.bytes_read) as usize);
-        let over_allocation = self.allocated - buffered;
-        // Rationale: on the one hand, we want to defragment rarely, ideally never
-        // in non-pathological scenarios. However, a pathological or malicious
-        // peer could send us one-byte frames, and since we use reference-counted
-        // buffers in order to prevent copying, this could result in keeping a lot
-        // of memory allocated. This limits over-allocation in proportion to the
-        // buffered data. The constants are chosen somewhat arbitrarily and try to
-        // balance between defragmentation overhead and over-allocation.
-        let threshold = 32768.max(buffered * 3 / 2);
-        if over_allocation > threshold {
-            self.defragment();
-            // ngtcp2 uses a threshold of 4000 -- try to be a little more conservative?
-            if self.data.len() > 1024 {
-                return Err(TooManyChunks);
-            }
-        }
-
-        Ok(())
+    pub(super) fn insert_checked(
+        &mut self,
+        offset: u64,
+        bytes: Bytes,
+        allocation_size: usize,
+        expected_meter: Option<&BackingMeter>,
+    ) -> Result<(), InsertError> {
+        self.prepare_insert(offset, bytes, allocation_size, expected_meter)?.commit()
     }
 
     /// Number of bytes consumed by the application
@@ -247,11 +276,27 @@ impl Assembler {
     }
 
     /// Discard all buffered data
-    pub(super) fn clear(&mut self) {
+    pub(super) fn clear_checked(&mut self) -> Result<(), InsertError> {
+        self.check_inventory()?;
         self.data.clear();
         self.buffered = 0;
         self.allocated = 0;
+        Ok(())
     }
+}
+
+fn freeze_metered(
+    buffer: &mut BytesMut,
+    meter: Option<&BackingMeter>,
+) -> Result<Bytes, InsertError> {
+    let split = buffer.split();
+    if let Some(meter) = meter {
+        if !split.charge_shared_backing(meter) {
+            meter.quarantine();
+            return Err(InsertError::AuthorityMismatch);
+        }
+    }
+    Ok(split.freeze())
 }
 
 /// A chunk of data from the receive stream
@@ -269,7 +314,7 @@ impl Chunk {
     }
 }
 
-#[derive(Debug, Eq)]
+#[derive(Debug, Clone, Eq)]
 struct Buffer {
     offset: u64,
     bytes: Bytes,
@@ -352,10 +397,23 @@ enum State {
     #[default]
     Ordered,
     Unordered {
-        /// The set of offsets that have been received from the peer, including portions not yet
-        /// read by the application.
-        recvd: RangeSet,
+        /// Duplicate history after the contiguous prefix, including unread data.
+        /// Every sparse range starts strictly beyond received_prefix.
+        recvd: Intervals,
+        received_prefix: u64,
     },
+}
+
+// Same Assembler commit: contiguous receipt consumes no sparse slot. Folding
+// bridges returns nodes to this original slab, never its global layout charge.
+fn record_received(recvd: &mut Intervals, prefix: &mut u64, range: std::ops::Range<u64>) {
+    if range.is_empty() { return; }
+    if range.start > *prefix { recvd.insert(range); return; }
+    *prefix = (*prefix).max(range.end);
+    while recvd.min().is_some_and(|start| start <= *prefix) {
+        let Some(next) = recvd.pop_min() else { break; };
+        *prefix = (*prefix).max(next.end);
+    }
 }
 
 impl State {
@@ -364,13 +422,18 @@ impl State {
     }
 }
 
-/// Error indicating that an ordered read was performed on a stream after an unordered read
 #[derive(Debug)]
-pub struct IllegalOrderedRead;
+pub(crate) enum InsertError {
+    TooManyChunks,
+    AuthorityMismatch,
+    Capacity(MeteredCopyError),
+}
 
-/// Error indicating that too many chunks are buffered due to maliciously small/gapped frames
-#[derive(Debug)]
-pub(crate) struct TooManyChunks;
+impl From<MeteredCopyError> for InsertError {
+    fn from(error: MeteredCopyError) -> Self {
+        Self::Capacity(error)
+    }
+}
 
 #[cfg(test)]
 mod test {
@@ -408,9 +471,7 @@ mod test {
             "an empty assembler is not an ordered gap"
         );
 
-        assembler
-            .insert(3, Bytes::from_static(b"def"), 3)
-            .unwrap();
+        assembler.insert(3, Bytes::from_static(b"def"), 3).unwrap();
         let gap = assembler.progress();
         assert_eq!(gap.read_offset, 0);
         assert_eq!(gap.next_received_offset, Some(3));
@@ -418,9 +479,7 @@ mod test {
         assert_eq!(gap.buffered_bytes, 3);
         assert_eq!(gap.ordered_gap_bytes, 3);
 
-        assembler
-            .insert(0, Bytes::from_static(b"abc"), 3)
-            .unwrap();
+        assembler.insert(0, Bytes::from_static(b"abc"), 3).unwrap();
         let contiguous = assembler.progress();
         assert_eq!(contiguous.next_received_offset, Some(0));
         assert_eq!(contiguous.ordered_gap_bytes, 0);
@@ -741,3 +800,18 @@ mod test {
         x.read(size, true).map(|chunk| chunk.bytes)
     }
 }
+
+#[cfg(test)]
+mod meter_tests;
+
+#[cfg(test)]
+#[path = "assembler/tests/inventory.rs"]
+mod inventory_tests;
+
+#[cfg(test)]
+#[path = "assembler/tests/prefix.rs"]
+mod prefix_tests;
+
+#[cfg(test)]
+#[path = "assembler/tests/legacy_read.rs"]
+mod legacy_read;

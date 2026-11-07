@@ -46,7 +46,7 @@ fn reject_physical_fault(physical: &mut Physical, id: FlowIdentity, fault: Physi
             assert_eq!(physical.server.sockets.add(original), id.handle);
         }
         PhysicalFault::MissingRoot | PhysicalFault::CensusRoot | PhysicalFault::ScanRoot => {
-            let original = physical.owner.opens().slots[id.index].take().unwrap();
+            let original = physical.owner.opens().slots.take(id.index).unwrap();
             match fault {
                 PhysicalFault::CensusRoot => assert!(!physical.dispatch.flow_shutdown_complete(
                     &physical.server.sockets,
@@ -62,11 +62,10 @@ fn reject_physical_fault(physical: &mut Physical, id: FlowIdentity, fault: Physi
                 ),
                 _ => assert!(!service(physical, id)),
             }
-            physical.owner.opens().slots[id.index] = Some(original);
+            assert!(matches!(physical.owner.opens().slots.put(id.index, original), Ok(None)));
         }
         PhysicalFault::SlotEpoch | PhysicalFault::RootAudit => {
-            physical.owner.opens().slots[id.index]
-                .as_mut()
+            physical.owner.opens().slots.get_mut(id.index)
                 .unwrap()
                 .epoch += 1;
             let accepted = if matches!(fault, PhysicalFault::RootAudit) {
@@ -74,8 +73,7 @@ fn reject_physical_fault(physical: &mut Physical, id: FlowIdentity, fault: Physi
             } else {
                 service(physical, id)
             };
-            physical.owner.opens().slots[id.index]
-                .as_mut()
+            physical.owner.opens().slots.get_mut(id.index)
                 .unwrap()
                 .epoch = id.epoch;
             assert!(!accepted);
@@ -89,8 +87,7 @@ fn reject_physical_fault(physical: &mut Physical, id: FlowIdentity, fault: Physi
                     &crate::client_tun::ListenerSpec { local_port: 10001 },
                 ));
             if matches!(fault, PhysicalFault::SlotHandle) {
-                physical.owner.opens().slots[id.index]
-                    .as_mut()
+                physical.owner.opens().slots.get_mut(id.index)
                     .unwrap()
                     .handle = other;
             } else {
@@ -107,8 +104,7 @@ fn reject_physical_fault(physical: &mut Physical, id: FlowIdentity, fault: Physi
                     });
             }
             let accepted = service(physical, id);
-            physical.owner.opens().slots[id.index]
-                .as_mut()
+            physical.owner.opens().slots.get_mut(id.index)
                 .unwrap()
                 .handle = id.handle;
             physical
@@ -164,7 +160,7 @@ fn original(physical: &Physical) -> Option<FlowPhysicalReceipt> {
 }
 
 pub(super) fn service(physical: &mut Physical, id: FlowIdentity) -> bool {
-    let (global_tx, _global_rx) = mpsc::channel(4);
+    let (global_tx, _global_rx) = crate::client_tun::relay_channel::channel(4);
     let (owned_action_tx, _owned_rx) = mpsc::channel(4);
     physical.dispatch.service_flow(
         id,

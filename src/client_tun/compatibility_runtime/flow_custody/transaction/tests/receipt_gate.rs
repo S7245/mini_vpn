@@ -24,6 +24,7 @@ pub(in crate::client_tun::compatibility_runtime) struct HeldReceiptView {
     pub(in crate::client_tun::compatibility_runtime) disposition:
         (usize, usize, usize, usize, usize),
     pub(in crate::client_tun::compatibility_runtime) calls: usize,
+    pub(in crate::client_tun::compatibility_runtime) discarded_inflight: usize,
     pub(in crate::client_tun::compatibility_runtime) row_held: bool,
     pub(in crate::client_tun::compatibility_runtime) quarantined: bool,
     pub(in crate::client_tun::compatibility_runtime) original_matches: bool,
@@ -183,6 +184,7 @@ impl SessionControl {
             rearming: flow.is_some_and(|flow| flow.stage == FlowStage::Rearming),
             producer_stopped: flow.is_some_and(|flow| flow.producer_stopped),
             disposition: receipt.data_disposition(),
+            discarded_inflight: receipt.discarded_inflight(),
             calls: gate.calls,
             row_held: flow.is_some(),
             quarantined: flow.is_some_and(|flow| flow.stage == FlowStage::Quarantined),

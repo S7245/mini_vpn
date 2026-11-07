@@ -2,12 +2,15 @@ use bytes::Bytes;
 use rand::RngExt;
 use tracing::{debug, trace, trace_span};
 
-use super::{Connection, SentFrames, spaces::SentPacket};
+use super::{
+    sent_history::{PacketPermit, SentPacket},
+    Connection, SentFrames,
+};
 use crate::{
-    ConnectionId, Instant, TransportError, TransportErrorCode,
     connection::ConnectionSide,
     frame::{self, Close},
-    packet::{FIXED_BIT, Header, InitialHeader, LongType, PacketNumber, PartialEncode, SpaceId},
+    packet::{Header, InitialHeader, LongType, PacketNumber, PartialEncode, SpaceId, FIXED_BIT},
+    ConnectionId, Instant, TransportError, TransportErrorCode,
 };
 
 pub(super) struct PacketBuilder {
@@ -25,6 +28,7 @@ pub(super) struct PacketBuilder {
     pub(super) max_size: usize,
     pub(super) tag_len: usize,
     pub(super) _span: tracing::span::EnteredSpan,
+    history: Option<PacketPermit>,
 }
 
 impl PacketBuilder {
@@ -40,8 +44,14 @@ impl PacketBuilder {
         buffer_capacity: usize,
         datagram_start: usize,
         ack_eliciting: bool,
+        mut history: Option<PacketPermit>,
         conn: &mut Connection,
     ) -> Option<Self> {
+        if let Some(permit) = &mut history {
+            if permit.begin_encoding().is_err() {
+                return None;
+            }
+        }
         let version = conn.version;
         // Initiate key update if we're approaching the confidentiality limit
         let sent_with_keys = conn.spaces[space_id].sent_with_keys;
@@ -166,7 +176,12 @@ impl PacketBuilder {
             tag_len,
             ack_eliciting,
             _span: span,
+            history,
         })
+    }
+
+    pub(super) fn allows_data(&self) -> bool {
+        self.history.as_ref().is_some_and(PacketPermit::allows_data)
     }
 
     /// Append the minimum amount of padding to the packet such that, after encryption, the
@@ -182,17 +197,29 @@ impl PacketBuilder {
     }
 
     pub(super) fn finish_and_track(
-        self,
+        mut self,
         now: Instant,
         conn: &mut Connection,
         sent: Option<SentFrames>,
         buffer: &mut Vec<u8>,
     ) {
+        if self
+            .history
+            .as_ref()
+            .is_some_and(|permit| !permit.allows_data())
+            && sent.as_ref().is_some_and(|frames| {
+                !frames.stream_frames.is_empty() || frames.application_datagram
+            })
+        {
+            conn.quarantine_event_inventory();
+            return;
+        }
+        let history = self.history.take();
         let ack_eliciting = self.ack_eliciting;
         let exact_number = self.exact_number;
         let space_id = self.space;
         let (size, padded) = self.finish(conn, now, buffer);
-        let sent = match sent {
+        let mut sent = match sent {
             Some(sent) => sent,
             None => return,
         };
@@ -202,7 +229,9 @@ impl PacketBuilder {
             false => 0,
         };
 
+        sent.retransmits.records.release_if_empty();
         let packet = SentPacket {
+            recovery_selection: 0,
             path_generation: conn.path.generation(),
             largest_acked: sent.largest_acked,
             time_sent: now,
@@ -218,8 +247,17 @@ impl PacketBuilder {
             conn.note_successor_service_turn_packet_sent(packet.path_generation, u64::from(size));
         }
 
-        conn.path
-            .sent(exact_number, packet, &mut conn.spaces[space_id]);
+        let Some(permit) = history else {
+            conn.quarantine_event_inventory();
+            return;
+        };
+        if !conn
+            .path
+            .sent(exact_number, packet, &mut conn.spaces[space_id], permit)
+        {
+            conn.quarantine_event_inventory();
+            return;
+        }
         conn.stats.path.sent_packets += 1;
         conn.reset_keep_alive(now);
         if size != 0 {

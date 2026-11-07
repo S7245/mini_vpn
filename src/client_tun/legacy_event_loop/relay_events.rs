@@ -22,7 +22,7 @@ pub(in crate::client_tun) struct RelayClose {
 pub(in crate::client_tun) enum RelayEvent {
     Data {
         epoch: u64,
-        bytes: Vec<u8>,
+        bytes: crate::tcp_downlink_pump::OwnedPayload,
         stream_service_window: StreamServiceWindow,
         downstream_permit: Option<DownstreamBytePermit>,
     },
@@ -53,8 +53,8 @@ mod test_bridge;
 
 #[cfg(all(test, feature = "harness"))]
 pub(in crate::client_tun) use test_bridge::{
-    RelayEventTestBridge, RelayEventTestContext, RelayEventTestKind, RelayEventTestSendResult,
-    RelayEventTestSnapshot,
+    EgressProbePhase, ForeignEgressFired, ForeignEgressPhase, RelayEventTestBridge,
+    RelayEventTestContext, RelayEventTestKind, RelayEventTestSendResult, RelayEventTestSnapshot,
 };
 
 pub(in crate::client_tun) fn remote_payload_left_local_egress_work(
@@ -309,7 +309,7 @@ pub(in crate::client_tun) fn tun_rx_drain_budget_for_relay_gap_followup(
 
 /// Receiver-local state. It never owns any root resource or physical timer.
 pub(in crate::client_tun) struct RelayEventLane {
-    global_rx: tokio::sync::mpsc::Receiver<(SocketHandle, RelayEvent)>,
+    global_rx: crate::client_tun::relay_channel::Receiver<(SocketHandle, RelayEvent)>,
     stalled_read_service_until: HashMap<SocketHandle, std::time::Instant>,
     relay_gap_ack_drain: RelayGapAckDrainState,
     global_rx_receive_paused: bool,
@@ -317,7 +317,7 @@ pub(in crate::client_tun) struct RelayEventLane {
 
 impl RelayEventLane {
     pub(in crate::client_tun) fn new(
-        global_rx: tokio::sync::mpsc::Receiver<(SocketHandle, RelayEvent)>,
+        global_rx: crate::client_tun::relay_channel::Receiver<(SocketHandle, RelayEvent)>,
     ) -> Self {
         Self {
             global_rx,
@@ -485,7 +485,7 @@ pub(in crate::client_tun) struct RelayEventIngressState<'turn, D, U, M> {
     pub(in crate::client_tun) iface: &'turn mut Interface,
     pub(in crate::client_tun) handshake_done_tx: &'turn OpenDispatch,
     pub(in crate::client_tun) global_tx:
-        &'turn tokio::sync::mpsc::Sender<(SocketHandle, RelayEvent)>,
+        &'turn crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
     pub(in crate::client_tun) owned_action_tx: &'turn tokio::sync::mpsc::Sender<OwnedActionEvent>,
     pub(in crate::client_tun) metrics: &'turn mut M,
     pub(in crate::client_tun) runtime_config: &'turn TunRuntimeConfig,
@@ -746,10 +746,20 @@ impl RelayEventLane {
             .and_then(|ctx| ctx.flow_mirror.as_mut())
         {
             match &event {
-                RelayEvent::Data { bytes, .. } => {
-                    Some(mirror.begin_event(event_epoch, Some(bytes.len())))
+                RelayEvent::Data {
+                    bytes,
+                    downstream_permit,
+                    ..
+                } => {
+                    Some(mirror.begin_data_event(event_epoch, bytes, downstream_permit)?)
                 }
                 RelayEvent::AckDrainHint { .. } => Some(mirror.begin_event(event_epoch, None)),
+                RelayEvent::DataReady { .. } if mirror.d16_bound() => {
+                    Some(mirror.begin_d16_event(event_epoch, true))
+                }
+                RelayEvent::Closed(_) if mirror.d16_bound() => {
+                    Some(mirror.begin_d16_event(event_epoch, false))
+                }
                 _ => {
                     mirror.quarantined = true;
                     Some(false)
@@ -767,8 +777,18 @@ impl RelayEventLane {
                 .get_mut(&handle)
                 .and_then(|ctx| ctx.flow_mirror.as_mut())
             {
-                if let RelayEvent::Data { bytes, .. } = &event {
-                    mirror.discard_data(bytes.len());
+                if let RelayEvent::Data {
+                    bytes,
+                    downstream_permit,
+                    ..
+                } = event
+                {
+                    if !mirror.discard_data_permit(bytes.len(), downstream_permit) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "flow DATA release mismatch",
+                        ));
+                    }
                 }
                 mirror.finish_event();
             }

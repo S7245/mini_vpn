@@ -16,6 +16,8 @@ pub struct UdpStats {
     ///
     /// Can be less than `datagrams` when GSO, GRO, and/or batched system calls are in use.
     pub ios: u64,
+    /// Authenticated whole packets refused before protocol commit on known Full.
+    pub admission_refused: u64,
 }
 
 impl UdpStats {

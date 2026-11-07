@@ -1,24 +1,9 @@
 use mini_vpn::client_tun;
 use mini_vpn::metrics::Metrics;
 use mini_vpn::reality_upstream;
-use mini_vpn::shared::{ClientError, TargetAddr};
-use mini_vpn::tuic::{TuicClientConfig, TuicUpstream};
-use mini_vpn::upstream::ProxyUpstream;
+use mini_vpn::tuic::TuicClientConfig;
+use mini_vpn::tuic::probe::{self, SinkReport as TuicTcpSinkProbeReport};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::AsyncReadExt;
-
-#[derive(Debug, Clone, PartialEq)]
-struct TuicTcpSinkProbeReport {
-    target: String,
-    requested_duration_secs: u64,
-    elapsed_ms: u128,
-    bytes: u64,
-    reads: u64,
-    first_rx_ms: Option<u128>,
-    max_read_gap_ms: u128,
-    eof: bool,
-}
 
 #[tokio::main]
 async fn main() {
@@ -66,59 +51,23 @@ async fn main() {
 async fn tuic_tcp_sink_probe(
     target: &str,
     duration_secs: u64,
-) -> Result<TuicTcpSinkProbeReport, ClientError> {
-    let target_addr = TargetAddr::parse(target)?;
-    let cfg = TuicClientConfig::standalone_from_env()?;
-    let metrics = Arc::new(Metrics::new());
-    let upstream = TuicUpstream::connect(&cfg, metrics).await?;
-    let mut stream = upstream.open_tcp(&target_addr).await?;
-
-    let duration = Duration::from_secs(duration_secs);
-    let start = tokio::time::Instant::now();
-    let deadline = start + duration;
-    let mut buf = vec![0u8; 256 * 1024];
-    let mut bytes = 0u64;
-    let mut reads = 0u64;
-    let mut first_rx_ms = None;
-    let mut last_read_at = None;
-    let mut max_read_gap_ms = 0u128;
-    let mut eof = false;
-
-    loop {
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-            break;
-        }
-        let remaining = deadline.duration_since(now);
-        let read_result = tokio::time::timeout(remaining, stream.read(&mut buf)).await;
-        let n = match read_result {
-            Ok(result) => result?,
-            Err(_) => break,
-        };
-        if n == 0 {
-            eof = true;
-            break;
-        }
-        let read_at = tokio::time::Instant::now();
-        bytes = bytes.saturating_add(n as u64);
-        reads = reads.saturating_add(1);
-        first_rx_ms.get_or_insert_with(|| read_at.duration_since(start).as_millis());
-        if let Some(prev) = last_read_at {
-            max_read_gap_ms = max_read_gap_ms.max(read_at.duration_since(prev).as_millis());
-        }
-        last_read_at = Some(read_at);
+) -> Result<TuicTcpSinkProbeReport, String> {
+    let cfg = TuicClientConfig::standalone_from_env().map_err(|error| error.to_string())?;
+    let mut owner = probe::prepare_sink(cfg, target, duration_secs, Arc::new(Metrics::new()))
+        .map_err(|error| error.to_string())?;
+    let observed = owner.run().await;
+    if observed.phase == probe::Phase::Complete {
+        observed
+            .sink
+            .ok_or_else(|| "sink completed without its original report".into())
+    } else {
+        Err(owner.failure().map(ToString::to_string).unwrap_or_else(|| {
+            format!(
+                "sink lifecycle {:?}, node {:?}",
+                observed.phase, observed.node
+            )
+        }))
     }
-
-    Ok(TuicTcpSinkProbeReport {
-        target: target.to_string(),
-        requested_duration_secs: duration_secs,
-        elapsed_ms: start.elapsed().as_millis(),
-        bytes,
-        reads,
-        first_rx_ms,
-        max_read_gap_ms,
-        eof,
-    })
 }
 
 fn parse_probe_duration_secs(raw: &str) -> Result<u64, String> {

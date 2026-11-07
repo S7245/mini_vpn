@@ -165,6 +165,9 @@ impl TunIo for GatedResetDevice {
     fn rx_take(&mut self) -> Option<bytes::BytesMut> {
         self.inner.rx_take()
     }
+    fn rx_take_packet(&mut self) -> Option<crate::device::RxPacket> {
+        self.inner.rx_take_packet()
+    }
     fn can_stage_single_iface_rx(&self) -> bool {
         let single = self.inner.can_stage_single_iface_rx();
         if single {
@@ -209,7 +212,7 @@ impl TunIo for GatedResetDevice {
     fn queued_tx_bytes(&self) -> usize {
         self.inner.queued_tx_bytes()
     }
-    fn take_flushed_tcp_packets(&mut self) -> Vec<crate::device::TunFlushedTcpPacket> {
+    fn take_flushed_tcp_packets(&mut self) -> crate::device::FlushedTcpBatch<'_> {
         self.inner.take_flushed_tcp_packets()
     }
     fn inject_ip_packet(&mut self, pkt: &[u8]) {
@@ -516,6 +519,8 @@ async fn saved_f_real_tuic_provider_failure_retains_source_after_actual_reset_an
         }
     };
     let endpoint = upstream_endpoint(&upstream);
+    let carrier = crate::tuic::tcp_fixture::upstream_ready_connection(&upstream)
+        .expect("original authenticated carrier before endpoint close");
     let inbound = PacketLink::bounded(64);
     let outbound = PacketLink::bounded(64);
     let mut apps = FlowRoleApps::new(outbound.clone(), inbound.clone());
@@ -550,6 +555,11 @@ async fn saved_f_real_tuic_provider_failure_retains_source_after_actual_reset_an
         tokio::time::timeout(Duration::from_secs(2), peer.closed())
             .await
             .unwrap();
+        let cause = carrier.close_reason().expect("actual original local close");
+        assert_eq!(cause, quinn::ConnectionError::LocallyClosed);
+        let expected_source =
+            crate::shared::ClientError::Io(std::io::Error::other(cause)).to_string();
+        drop(carrier);
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 apps.turn().await;
@@ -575,10 +585,9 @@ async fn saved_f_real_tuic_provider_failure_retains_source_after_actual_reset_an
         assert_eq!((seen.published, seen.released, seen.joined), (0, 1, 0));
         assert!(seen.audit);
         let source = session.control.retained_provider_failure().unwrap();
-        assert_eq!(
-            source.2,
-            "I/O error: TUIC ready pool generation/lease identity changed"
-        );
+        // Typed Closed now carries its real identity/activity. The ready stage
+        // must retain the original carrier cause, not invent identity failure.
+        assert_eq!(source.2, expected_source);
         assert_eq!(source.1.connect_written, 0);
 
         assert_eq!(source.1.phase, crate::upstream::TcpOpenPhase::Settled);

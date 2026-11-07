@@ -1,4 +1,9 @@
-use std::ops::Range;
+use bytes::{BackingBudgetReservation, BackingMeter};
+use std::{
+    alloc::{alloc, Layout},
+    io,
+    ops::Range,
+};
 
 use tinyvec::TinyVec;
 
@@ -17,29 +22,97 @@ use tinyvec::TinyVec;
 /// of ranges is usually very low (since ACK numbers are in consecutive fashion
 /// unless reordering or packet loss occur).
 #[derive(Debug, Default)]
-pub struct ArrayRangeSet(TinyVec<[Range<u64>; ARRAY_RANGE_SET_INLINE_CAPACITY]>);
+pub struct ArrayRangeSet(
+    TinyVec<[Range<u64>; ARRAY_RANGE_SET_INLINE_CAPACITY]>,
+    Option<ColdRangeOwner>,
+    #[cfg(test)] usize,
+);
+
+#[derive(Debug)]
+struct ColdRangeOwner {
+    capacity: usize,
+    meter: BackingMeter,
+    // The exact Vec layout is destroyed before this last field refunds it.
+    _reservation: BackingBudgetReservation,
+}
+impl Drop for ColdRangeOwner {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.meter.quarantine();
+        }
+    }
+}
 
 /// The capacity of elements directly stored in [`ArrayRangeSet`]
 ///
 /// An inline capacity of 2 is chosen to keep `SentFrame` below 128 bytes.
 const ARRAY_RANGE_SET_INLINE_CAPACITY: usize = 2;
 
-impl Clone for ArrayRangeSet {
-    fn clone(&self) -> Self {
-        // tinyvec keeps the heap representation after clones.
-        // We rather prefer the inline representation for clones if possible,
-        // since clones (e.g. for storage in `SentFrames`) are rarely mutated
-        if self.0.is_inline() || self.0.len() > ARRAY_RANGE_SET_INLINE_CAPACITY {
-            return Self(self.0.clone());
-        }
-
-        let mut vec = TinyVec::new();
-        vec.extend_from_slice(self.0.as_slice());
-        Self(vec)
-    }
-}
+#[derive(Debug)]
+pub(crate) struct ColdRangeInvariant;
 
 impl ArrayRangeSet {
+    /// Only PendingAcks uses cold storage. Its insert-then-trim peak is 65;
+    /// prefix removal never splits a range. No Clone can escape this owner.
+    pub(crate) fn cold_layout(capacity: usize) -> io::Result<Layout> {
+        Layout::array::<Range<u64>>(capacity).map_err(io::Error::other)
+    }
+    pub(crate) fn cold(meter: &BackingMeter, capacity: usize) -> io::Result<Self> {
+        if capacity == 0 {
+            return Err(io::Error::other("empty cold ACK range capacity"));
+        }
+        let layout = Self::cold_layout(capacity)?;
+        let reservation = meter
+            .reserve_cold_layout(layout.size())
+            .map_err(|e| io::Error::other(format!("{e:?}")))?
+            .ok_or_else(|| io::Error::other("cold ACK ranges require hard budget"))?;
+        let ptr = unsafe { alloc(layout) as *mut Range<u64> };
+        if ptr.is_null() {
+            return Err(io::Error::other("cold ACK range allocation failed"));
+        }
+        // Exact requested element capacity; Vec initializes only live ranges.
+        let ranges = unsafe { Vec::from_raw_parts(ptr, 0, capacity) };
+        let mut result = Self::default();
+        result.0 = TinyVec::Heap(ranges);
+        result.1 = Some(ColdRangeOwner {
+            capacity,
+            meter: meter.clone(),
+            _reservation: reservation,
+        });
+        Ok(result)
+    }
+    fn can_add_range(&self) -> bool {
+        if let Some(owner) = &self.1 {
+            let valid_layout =
+                matches!(&self.0, TinyVec::Heap(ranges) if ranges.capacity() == owner.capacity);
+            if !valid_layout || self.0.len() >= owner.capacity {
+                owner.meter.quarantine();
+                return false;
+            }
+        }
+        true
+    }
+    fn note_growth(&mut self) {
+        #[cfg(test)]
+        {
+            self.2 = self.2.max(self.0.len());
+        }
+    }
+    pub(crate) fn clear(&mut self) {
+        self.0.clear();
+    }
+    #[cfg(test)]
+    pub(crate) fn cold_inventory(&self) -> (Option<usize>, usize) {
+        (self.1.as_ref().map(|_| self.0.capacity()), self.2)
+    }
+    #[cfg(test)]
+    pub(crate) fn corrupt_cold_shape_for_recovery_probe(&mut self) -> bool {
+        let Some(owner) = &mut self.1 else {
+            return false;
+        };
+        owner.capacity = owner.capacity.saturating_sub(1);
+        true
+    }
     pub fn new() -> Self {
         Default::default()
     }
@@ -77,11 +150,47 @@ impl ArrayRangeSet {
         }
     }
 
+    fn validate_cold(&self) -> Result<(), ColdRangeInvariant> {
+        if let Some(owner) = &self.1 {
+            if owner.meter.is_quarantined() {
+                return Err(ColdRangeInvariant);
+            }
+            if !matches!(&self.0, TinyVec::Heap(ranges) if ranges.capacity() == owner.capacity) {
+                owner.meter.quarantine();
+                return Err(ColdRangeInvariant);
+            }
+        }
+        Ok(())
+    }
+    /// Cold PendingAcks has one spare physical slot before its bounded trim.
+    pub(crate) fn prepare_cold_insert(&self, meter: &BackingMeter) -> Result<(), ColdRangeInvariant> {
+        self.validate_cold()?;
+        let valid = self.1.as_ref().is_some_and(|owner|
+            owner.meter.same_authority(meter) && self.0.len() < owner.capacity);
+        if !valid {
+            meter.quarantine();
+            if let Some(owner) = &self.1 { owner.meter.quarantine(); }
+            return Err(ColdRangeInvariant);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn try_insert_one(&mut self, x: u64) -> Result<bool, ColdRangeInvariant> {
+        self.validate_cold()?;
+        let inserted = self.insert_one(x);
+        self.validate_cold()?;
+        Ok(inserted)
+    }
+
     pub fn insert_one(&mut self, x: u64) -> bool {
         self.insert(x..x + 1)
     }
 
     pub fn insert(&mut self, x: Range<u64>) -> bool {
+        // Includes in-place range extension: Q is never a duplicate/no-op.
+        if self.validate_cold().is_err() {
+            return false;
+        }
         let mut result = false;
 
         if x.is_empty() {
@@ -96,7 +205,11 @@ impl ArrayRangeSet {
             if range.start > x.end {
                 // The range is fully before this range and therefore not extensible.
                 // Add a new range to the left
+                if !self.can_add_range() {
+                    return false;
+                }
                 self.0.insert(idx, x);
+                self.note_growth();
                 return true;
             } else if range.start > x.start {
                 // The new range starts before this range but overlaps.
@@ -139,7 +252,11 @@ impl ArrayRangeSet {
         }
 
         // Insert a range at the end
+        if !self.can_add_range() {
+            return false;
+        }
         self.0.push(x);
+        self.note_growth();
         true
     }
 
@@ -178,8 +295,12 @@ impl ArrayRangeSet {
                 self.0[idx] = left;
                 idx += 1;
             } else {
+                if !self.can_add_range() {
+                    return false;
+                }
                 self.0[idx] = right;
                 self.0.insert(idx, left);
+                self.note_growth();
                 idx += 2;
             }
         }
@@ -207,3 +328,6 @@ impl ArrayRangeSet {
         self.iter().next_back().map(|x| x.end - 1)
     }
 }
+
+#[cfg(test)]
+mod tests;

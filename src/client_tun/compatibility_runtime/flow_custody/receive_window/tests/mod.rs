@@ -74,7 +74,7 @@ fn receive_window_known_abandonment_is_not_admission() {
 #[tokio::test]
 async fn receive_window_receiver_drop_panic_is_retained_by_actual_reader_guard() {
     use crate::client_tun::compatibility_runtime::flow_custody::relay_reader::{
-        ReaderRequest, run_custodied_relay_reader_gated,
+        ReaderOutput, ReaderRequest, run_custodied_relay_reader_gated,
     };
     use crate::client_tun::{RelayReadCredit, RelayStream};
     use std::future::Future;
@@ -104,7 +104,7 @@ async fn receive_window_receiver_drop_panic_is_retained_by_actual_reader_guard()
         smoltcp::socket::tcp::SocketBuffer::new(vec![0; 8]),
         smoltcp::socket::tcp::SocketBuffer::new(vec![0; 8]),
     ));
-    let (back_tx, _back) = tokio::sync::mpsc::channel(1);
+    let (back_tx, _back) = crate::client_tun::relay_channel::channel(1);
     let (_credit, read_credit_rx) = watch::channel(RelayReadCredit::default());
     let (signal_tx, _signals) = tokio::sync::mpsc::channel(1);
     let (stop, stop_rx) = tokio::sync::oneshot::channel();
@@ -114,7 +114,7 @@ async fn receive_window_receiver_drop_panic_is_retained_by_actual_reader_guard()
             handle,
             epoch: 1,
             remote_reader,
-            back_tx,
+            back_tx: ReaderOutput::Main(back_tx),
             read_credit_rx,
             signal_tx,
             local_finish_seen: Arc::new(AtomicBool::new(false)),

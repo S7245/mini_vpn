@@ -7,6 +7,7 @@
 //! Legacy run drops its outcome before task completion. Continuous shares the
 //! publication kernel. Tests: tests/outcomes.rs and client_tun/tests/relay_reader_batch.rs.
 
+use crate::tcp_downlink_pump::OwnedPayload;
 use super::super::super::{
     RELAY_REMOTE_DISPATCH_SEGMENT_MAX_BYTES, RELAY_REMOTE_READ_BURST_MAX_CHUNKS, RelayCloseReason,
     RelayEvent, RelayReadCredit, RelayReaderSignal, RelayStream, RelayTaskDiag, RemoteReadBurst,
@@ -30,7 +31,7 @@ pub(in crate::client_tun) struct ReadyReadRequest<'a> {
     pub(in crate::client_tun) epoch: u64,
     pub(in crate::client_tun) initial_payload: Vec<u8>,
     pub(in crate::client_tun) buf: &'a mut [u8],
-    pub(in crate::client_tun) back_tx: &'a mpsc::Sender<(SocketHandle, RelayEvent)>,
+    pub(in crate::client_tun) back_tx: &'a crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
     pub(in crate::client_tun) diag: &'a mut RelayTaskDiag,
     pub(in crate::client_tun) read_credit: RelayReadCredit,
     pub(in crate::client_tun) global_rx_pressure_threshold: std::time::Duration,
@@ -40,11 +41,40 @@ pub(super) struct ReaderRequest {
     pub(super) handle: SocketHandle,
     pub(super) epoch: u64,
     pub(super) remote_reader: tokio::io::ReadHalf<RelayStream>,
-    pub(super) back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
+    pub(super) back_tx: ReaderOutput,
     pub(super) read_credit_rx: watch::Receiver<RelayReadCredit>,
     pub(super) signal_tx: mpsc::Sender<RelayReaderSignal>,
     pub(super) local_finish_seen: Arc<std::sync::atomic::AtomicBool>,
     pub(super) stop_rx: oneshot::Receiver<()>,
+}
+
+/// One physical destination sender, with the same guarded drop in both modes.
+pub(super) enum ReaderOutput {
+    Main(crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>),
+    Stage(mpsc::Sender<super::supervision::thin::StageItem>),
+    Continuous(Arc<super::supervision::continuous::Shared>),
+}
+#[derive(Clone, Copy)]
+enum OutputRef<'a> {
+    Main(&'a crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>),
+    Stage(&'a mpsc::Sender<super::supervision::thin::StageItem>),
+    Continuous(&'a super::supervision::continuous::Shared),
+}
+impl ReaderOutput {
+    fn borrowed(&self) -> OutputRef<'_> {
+        match self {
+            Self::Main(tx) => OutputRef::Main(tx),
+            Self::Stage(tx) => OutputRef::Stage(tx),
+            Self::Continuous(shared) => OutputRef::Continuous(shared),
+        }
+    }
+    fn batch_limit(&self) -> usize {
+        match self {
+            Self::Main(tx) => relay_remote_ready_batch_byte_limit(tx),
+            Self::Stage(_) => super::super::super::RELAY_REMOTE_READ_BURST_MAX_BYTES,
+            Self::Continuous(_) => 65_536,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +83,7 @@ pub(super) enum ReaderTerminal {
     Eof,
     ReadFailed,
     GlobalClosed,
+    GlobalCapacity,
     SignalClosed,
     CreditClosed,
     Stopped,
@@ -64,6 +95,7 @@ impl ReaderTerminal {
         match self {
             Self::Eof => Some(("remote_to_local", "remote_eof")),
             Self::ReadFailed => Some(("remote_to_local", "remote_read_failed")),
+            Self::GlobalCapacity => Some(("remote_to_local", "global_rx_capacity")),
             Self::GlobalClosed => Some(("remote_to_local", "global_rx_closed")),
             _ => None,
         }
@@ -84,7 +116,7 @@ struct Span {
 
 #[derive(Default)]
 struct Publication {
-    pending: Option<Vec<u8>>,
+    pending: Option<OwnedPayload>,
     cursor: usize,
     // Only send itself owns this mark. A panic after successful commit keeps the
     // committed cursor/counters and is quarantined by the outer poll guard.
@@ -96,7 +128,7 @@ struct Publication {
 struct Dispatch<'a> {
     handle: SocketHandle,
     epoch: u64,
-    back_tx: &'a mpsc::Sender<(SocketHandle, RelayEvent)>,
+    back_tx: OutputRef<'a>,
     diag: &'a mut RelayTaskDiag,
     stop: Option<&'a mut oneshot::Receiver<()>>,
     threshold: std::time::Duration,
@@ -134,21 +166,91 @@ impl Publication {
             return Err(ReaderTerminal::AccountingFailed);
         };
         dispatch.diag.note_remote_batch(chunks, payload_len);
-        note_global_rx_channel_occupancy(dispatch.diag, dispatch.back_tx);
-        let wait_started = std::time::Instant::now();
-        let permit_result = tokio::select! {
-            _ = stopped(&mut dispatch.stop) => return Err(ReaderTerminal::Stopped),
-            permit = dispatch.back_tx.reserve() => permit,
-        };
-        let waited = wait_started.elapsed();
-        dispatch
-            .diag
-            .note_global_rx_wait(waited, dispatch.threshold);
-        let Ok(permit) = permit_result else {
-            return Err(ReaderTerminal::GlobalClosed);
-        };
-        note_global_rx_channel_occupancy(dispatch.diag, dispatch.back_tx);
         let stream_service_window = dispatch.diag.stream_service_window();
+        match dispatch.back_tx {
+            OutputRef::Continuous(shared) => {
+                self.in_flight = Some(Span {
+                    start: self.cursor,
+                    end,
+                });
+                let result = tokio::select! {
+                    _ = stopped(&mut dispatch.stop) => Err(ReaderTerminal::Stopped),
+                    result = shared.queue.push_custodied(&mut self.pending) =>
+                        result.map_err(|_| ReaderTerminal::AccountingFailed),
+                };
+                if result.is_ok() {
+                    self.cursor = end;
+                    self.messages = messages;
+                    self.bytes = bytes;
+                }
+                self.in_flight = None;
+                result?;
+            }
+            OutputRef::Main(tx) => {
+                note_global_rx_channel_occupancy(dispatch.diag, tx);
+                let wait_started = std::time::Instant::now();
+                let permit = tokio::select! {
+                    _ = stopped(&mut dispatch.stop) => return Err(ReaderTerminal::Stopped),
+                    permit = tx.reserve() => permit,
+                };
+                let waited = wait_started.elapsed();
+                dispatch
+                    .diag
+                    .note_global_rx_wait(waited, dispatch.threshold);
+                note_global_rx_channel_occupancy(dispatch.diag, tx);
+                let permit = permit.map_err(|error| match error {
+                    crate::client_tun::relay_channel::ReserveError::Closed => ReaderTerminal::GlobalClosed,
+                    crate::client_tun::relay_channel::ReserveError::Capacity => ReaderTerminal::GlobalCapacity,
+                    crate::client_tun::relay_channel::ReserveError::Quarantined => ReaderTerminal::AccountingFailed,
+                })?;
+                // Preserve Main's service-window snapshot after its wait diagnostic.
+                let window = dispatch.diag.stream_service_window();
+                self.commit(end, messages, bytes, |payload| {
+                    permit.send((
+                        dispatch.handle,
+                        RelayEvent::Data {
+                            epoch: dispatch.epoch,
+                            bytes: payload.into(),
+                            stream_service_window: window,
+                            downstream_permit: None,
+                        },
+                    ))
+                })?;
+                note_global_rx_channel_occupancy(dispatch.diag, tx);
+                if waited >= dispatch.threshold {
+                    tcp_diag_log!(
+                        "🔎 tcp-global-rx-pressure handle={:?} wait_us={} payload_bytes={} pressure_events={}",
+                        dispatch.handle,
+                        waited.as_micros(),
+                        payload_len,
+                        dispatch.diag.global_rx_pressure_events
+                    );
+                }
+            }
+            OutputRef::Stage(tx) => {
+                let permit = tokio::select! {
+                    _ = stopped(&mut dispatch.stop) => return Err(ReaderTerminal::Stopped),
+                    permit = tx.reserve() => permit,
+                }
+                .map_err(|_| ReaderTerminal::GlobalClosed)?;
+                self.commit(end, messages, bytes, |payload| {
+                    permit.send(super::supervision::thin::StageItem::Data {
+                        epoch: dispatch.epoch,
+                        payload,
+                        window: stream_service_window,
+                    })
+                })?;
+            }
+        }
+        Ok(())
+    }
+    fn commit(
+        &mut self,
+        end: usize,
+        messages: usize,
+        bytes: usize,
+        send: impl FnOnce(OwnedPayload),
+    ) -> Result<(), ReaderTerminal> {
         self.in_flight = Some(Span {
             start: self.cursor,
             end,
@@ -156,29 +258,11 @@ impl Publication {
         let Some(payload) = self.pending.take() else {
             return Err(ReaderTerminal::AccountingFailed);
         };
-        permit.send((
-            dispatch.handle,
-            RelayEvent::Data {
-                epoch: dispatch.epoch,
-                bytes: payload,
-                stream_service_window,
-                downstream_permit: None,
-            },
-        ));
+        send(payload);
         self.cursor = end;
         self.messages = messages;
         self.bytes = bytes;
         self.in_flight = None;
-        note_global_rx_channel_occupancy(dispatch.diag, dispatch.back_tx);
-        if waited >= dispatch.threshold {
-            tcp_diag_log!(
-                "🔎 tcp-global-rx-pressure handle={:?} wait_us={} payload_bytes={} pressure_events={}",
-                dispatch.handle,
-                waited.as_micros(),
-                payload_len,
-                dispatch.diag.global_rx_pressure_events
-            );
-        }
         Ok(())
     }
 }
@@ -186,6 +270,9 @@ impl Publication {
 #[derive(Default)]
 struct ReadyBatch {
     failure_clock: Option<super::supervision::FailureClock>,
+    remote_total: usize,
+    stage: bool,
+    continuous: bool,
     error_order: Option<usize>,
     initial: Vec<u8>,
     payload: Vec<u8>,
@@ -206,6 +293,16 @@ struct BatchRead<'a> {
 }
 
 impl ReadyBatch {
+    fn debit_stage(&mut self, n: usize) -> bool {
+        if !self.stage {
+            return true;
+        }
+        let Some(next) = self.remote_total.checked_add(n) else {
+            return false;
+        };
+        self.remote_total = next;
+        true
+    }
     fn fail(&mut self, error: std::io::Error) {
         self.failure = Some(error);
         self.error_order = super::supervision::stamp_failure(&self.failure_clock);
@@ -242,6 +339,10 @@ impl ReadyBatch {
                 }
                 Some(Ok(n)) => {
                     *read.valid = n;
+                    if !self.debit_stage(n) {
+                        self.close_after = Some(ReaderTerminal::AccountingFailed);
+                        return;
+                    }
                     if read.window.as_mut().is_some_and(|window| !window.debit(n)) {
                         self.close_after = Some(ReaderTerminal::AccountingFailed);
                         return;
@@ -283,7 +384,7 @@ impl ReadyBatch {
                 1
             };
             if publication.pending.is_none() {
-                publication.pending = Some(self.payload[publication.cursor..end].to_vec());
+                publication.pending = Some(self.payload[publication.cursor..end].to_vec().into());
             }
             publication.send(dispatch, chunks).await?;
             if publication.cursor < self.payload.len() {
@@ -298,14 +399,14 @@ impl ReadyBatch {
 pub(in crate::client_tun) async fn send_remote_payload_batch_to_main(
     handle: SocketHandle,
     epoch: u64,
-    payload: Vec<u8>,
+    payload: impl Into<OwnedPayload>,
     batch_chunks: usize,
-    back_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
+    back_tx: &crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
     diag: &mut RelayTaskDiag,
     global_rx_pressure_threshold: std::time::Duration,
 ) -> Result<(), RelayCloseReason> {
     let mut publication = Publication {
-        pending: Some(payload),
+        pending: Some(payload.into()),
         ..Publication::default()
     };
     publication
@@ -313,7 +414,7 @@ pub(in crate::client_tun) async fn send_remote_payload_batch_to_main(
             &mut Dispatch {
                 handle,
                 epoch,
-                back_tx,
+                back_tx: OutputRef::Main(back_tx),
                 diag,
                 stop: None,
                 threshold: global_rx_pressure_threshold,
@@ -374,7 +475,7 @@ pub(in crate::client_tun) async fn drain_ready_remote_reads(
             &mut Dispatch {
                 handle,
                 epoch,
-                back_tx,
+                back_tx: OutputRef::Main(back_tx),
                 diag,
                 stop: None,
                 threshold: global_rx_pressure_threshold,
@@ -396,6 +497,10 @@ pub(super) struct ReaderDiscardReceipt {
     pub(super) segment_bytes: usize,
     pub(super) scratch_bytes: usize,
     pub(super) unpublished_bytes: usize,
+    pub(super) initial_capacity: usize,
+    pub(super) batch_capacity: usize,
+    pub(super) segment_capacity: usize,
+    pub(super) scratch_capacity: usize,
 }
 
 pub(super) struct ReaderRemainder {
@@ -415,6 +520,10 @@ impl ReaderRemainder {
             || self.reading
             || self.publication.in_flight.is_some()
             || self.window.as_ref().is_some_and(ReaderWindow::failed)
+    }
+
+    pub(super) fn remote_total(&self) -> usize {
+        self.batch.remote_total
     }
 
     pub(super) fn read_total(&self) -> Option<usize> {
@@ -438,15 +547,16 @@ impl ReaderRemainder {
         if let Some(receipt) = self.receipt {
             return Some(receipt);
         }
-        let segment_bytes = self.publication.pending.as_ref().map_or(0, Vec::len);
-        let valid = self.publication.cursor <= self.batch.payload.len()
+        let segment_bytes = self.publication.pending.as_ref().map_or(0, OwnedPayload::len);
+        let valid = (self.batch.continuous || self.publication.cursor <= self.batch.payload.len())
             && self.valid <= self.scratch.as_ref().map_or(0, |buf| buf.len())
-            && self.publication.pending.as_ref().is_none_or(|segment| {
-                self.batch
-                    .payload
-                    .get(self.publication.cursor..)
-                    .is_some_and(|tail| tail.starts_with(segment))
-            });
+            && (self.batch.continuous
+                || self.publication.pending.as_ref().is_none_or(|segment| {
+                    self.batch
+                        .payload
+                        .get(self.publication.cursor..)
+                        .is_some_and(|tail| tail.starts_with(segment))
+                }));
         if !valid {
             self.quarantined = true;
             return None;
@@ -456,7 +566,15 @@ impl ReaderRemainder {
             batch_bytes: self.batch.payload.len(),
             segment_bytes,
             scratch_bytes: self.valid,
-            unpublished_bytes: self.batch.payload.len() - self.publication.cursor,
+            unpublished_bytes: if self.batch.continuous {
+                segment_bytes
+            } else {
+                self.batch.payload.len() - self.publication.cursor
+            },
+            initial_capacity: self.batch.initial.capacity(),
+            batch_capacity: self.batch.payload.capacity(),
+            segment_capacity: self.publication.pending.as_ref().map_or(0, OwnedPayload::capacity),
+            scratch_capacity: self.scratch.as_ref().map_or(0, |buf| buf.len()),
         };
         if self.window.as_ref().is_some_and(|window| {
             self.publication
@@ -465,6 +583,16 @@ impl ReaderRemainder {
                 != Some(window.read())
                 || self.valid != 0
         }) {
+            self.quarantined = true;
+            return None;
+        }
+        if self.batch.stage
+            && self
+                .publication
+                .bytes
+                .checked_add(receipt.unpublished_bytes)
+                != Some(self.batch.remote_total)
+        {
             self.quarantined = true;
             return None;
         }
@@ -505,24 +633,44 @@ struct ReaderState {
 }
 
 async fn notify_closed(state: &mut ReaderState, reason: RelayCloseReason) {
-    let permit = tokio::select! {
-        _ = &mut state.request.stop_rx => {
-            state.terminal = ReaderTerminal::Stopped;
-            return;
-        }
-        permit = state.request.signal_tx.reserve() => permit,
-    };
-    let Ok(permit) = permit else {
-        state.terminal = ReaderTerminal::SignalClosed;
-        return;
-    };
     let signal = RelayReaderSignal::Closed {
         direction: reason.0,
         reason: reason.1,
         diag: state.diag.clone(),
     };
-    state.notification.in_flight = true;
-    permit.send(signal);
+    match &state.request.back_tx {
+        ReaderOutput::Continuous(shared) => {
+            state.notification.in_flight = true;
+            if !shared.finish(signal) {
+                state.terminal = ReaderTerminal::AccountingFailed;
+                return;
+            }
+        }
+        ReaderOutput::Main(_) => {
+            let permit = tokio::select! {
+                _ = &mut state.request.stop_rx => { state.terminal = ReaderTerminal::Stopped; return; }
+                permit = state.request.signal_tx.reserve() => permit,
+            };
+            let Ok(permit) = permit else {
+                state.terminal = ReaderTerminal::SignalClosed;
+                return;
+            };
+            state.notification.in_flight = true;
+            permit.send(signal);
+        }
+        ReaderOutput::Stage(tx) => {
+            let permit = tokio::select! {
+                _ = &mut state.request.stop_rx => { state.terminal = ReaderTerminal::Stopped; return; }
+                permit = tx.reserve() => permit,
+            };
+            let Ok(permit) = permit else {
+                state.terminal = ReaderTerminal::SignalClosed;
+                return;
+            };
+            state.notification.in_flight = true;
+            permit.send(super::supervision::thin::StageItem::Terminal(signal));
+        }
+    }
     state.notification.closed_sent = true;
     state.notification.in_flight = false;
 }
@@ -544,9 +692,32 @@ async fn run_reader_io(state: &mut ReaderState) {
             state.terminal = ReaderTerminal::AccountingFailed;
             return;
         };
-        let mut read_len = state
-            .diag
-            .next_remote_read_len(stream_poll_credit, buf.len());
+        let mut read_len = if let ReaderOutput::Continuous(shared) = &request.back_tx {
+            let started = std::time::Instant::now();
+            let n = tokio::select! {
+                _ = &mut request.stop_rx => { state.terminal = ReaderTerminal::Stopped; return; }
+                update = request.read_credit_rx.changed() => {
+                    if update.is_err() { state.terminal = ReaderTerminal::CreditClosed; return; }
+                    read_credit = *request.read_credit_rx.borrow_and_update();
+                    state.diag.note_read_credit(read_credit);
+                    continue;
+                }
+                n = shared.queue.wait_read_len(buf.len()) => n,
+            };
+            let Ok(n) = n else {
+                state.terminal = ReaderTerminal::GlobalClosed;
+                return;
+            };
+            state
+                .diag
+                .note_continuous_queue_wait(started.elapsed(), std::time::Duration::from_millis(5));
+            state.diag.note_remote_read_service_tick(n);
+            n
+        } else {
+            state
+                .diag
+                .next_remote_read_len(stream_poll_credit, buf.len())
+        };
         if let Some(window) = &mut remainder.window {
             let Some(remaining) = window.remaining() else {
                 state.terminal = ReaderTerminal::AccountingFailed;
@@ -629,6 +800,10 @@ async fn run_reader_io(state: &mut ReaderState) {
             }
             Ok(n) => {
                 remainder.valid = n;
+                if !remainder.batch.debit_stage(n) {
+                    state.terminal = ReaderTerminal::AccountingFailed;
+                    return;
+                }
                 if remainder
                     .window
                     .as_mut()
@@ -638,38 +813,64 @@ async fn run_reader_io(state: &mut ReaderState) {
                     return;
                 }
                 note_reader_local_finish_if_needed(&request.local_finish_seen, &mut state.diag);
-                remainder.batch.initial = buf[..n].to_vec();
-                remainder.valid = 0;
-                let limit = relay_remote_ready_batch_byte_limit(&request.back_tx)
-                    .min(stream_poll_credit.max_batch_bytes)
-                    .max(n);
-                remainder
-                    .batch
-                    .gather(BatchRead {
-                        remote: &mut request.remote_reader,
-                        handle: request.handle,
-                        buf: &mut buf[..],
-                        valid: &mut remainder.valid,
-                        reading: &mut remainder.reading,
-                        byte_limit: limit,
-                        window: remainder.window.as_mut(),
-                        diag: &mut state.diag,
-                    })
-                    .await;
-                let publish = remainder
-                    .batch
-                    .publish(
-                        &mut remainder.publication,
-                        &mut Dispatch {
+                let publish = if remainder.batch.continuous {
+                    if remainder.publication.pending.is_some() {
+                        state.terminal = ReaderTerminal::AccountingFailed;
+                        return;
+                    }
+                    state.diag.note_remote_read(n);
+                    remainder.publication.pending = Some(buf[..n].to_vec().into());
+                    remainder.valid = 0;
+                    remainder
+                        .publication
+                        .send(
+                            &mut Dispatch {
+                                handle: request.handle,
+                                epoch: request.epoch,
+                                back_tx: request.back_tx.borrowed(),
+                                diag: &mut state.diag,
+                                stop: Some(&mut request.stop_rx),
+                                threshold: std::time::Duration::from_millis(5),
+                            },
+                            1,
+                        )
+                        .await
+                } else {
+                    remainder.batch.initial = buf[..n].to_vec();
+                    remainder.valid = 0;
+                    let limit = request
+                        .back_tx
+                        .batch_limit()
+                        .min(stream_poll_credit.max_batch_bytes)
+                        .max(n);
+                    remainder
+                        .batch
+                        .gather(BatchRead {
+                            remote: &mut request.remote_reader,
                             handle: request.handle,
-                            epoch: request.epoch,
-                            back_tx: &request.back_tx,
+                            buf: &mut buf[..],
+                            valid: &mut remainder.valid,
+                            reading: &mut remainder.reading,
+                            byte_limit: limit,
+                            window: remainder.window.as_mut(),
                             diag: &mut state.diag,
-                            stop: Some(&mut request.stop_rx),
-                            threshold: std::time::Duration::from_millis(5),
-                        },
-                    )
-                    .await;
+                        })
+                        .await;
+                    remainder
+                        .batch
+                        .publish(
+                            &mut remainder.publication,
+                            &mut Dispatch {
+                                handle: request.handle,
+                                epoch: request.epoch,
+                                back_tx: request.back_tx.borrowed(),
+                                diag: &mut state.diag,
+                                stop: Some(&mut request.stop_rx),
+                                threshold: std::time::Duration::from_millis(5),
+                            },
+                        )
+                        .await
+                };
                 #[cfg(test)]
                 if let Some(window) = &remainder.window {
                     window.observe_published(remainder.publication.bytes);
@@ -691,9 +892,15 @@ async fn run_reader_io(state: &mut ReaderState) {
                 if let Some(terminal) = remainder.batch.close_after {
                     state.terminal = terminal;
                 } else {
+                    let remote_total = remainder.batch.remote_total;
+                    let stage = remainder.batch.stage;
+                    let continuous = remainder.batch.continuous;
                     let failure_clock = remainder.batch.failure_clock.take();
                     remainder.batch = ReadyBatch {
                         failure_clock,
+                        remote_total,
+                        stage,
+                        continuous,
                         ..ReadyBatch::default()
                     };
                     // Only the cycle resets; exact published totals never do.
@@ -729,11 +936,18 @@ pub(super) async fn run_custodied_relay_reader_gated(
     failure_clock: Option<super::supervision::FailureClock>,
     window: Option<ReaderWindow>,
 ) -> ReaderOutcome {
+    let stage = !matches!(&request.back_tx, ReaderOutput::Main(_));
+    let continuous = match &request.back_tx {
+        ReaderOutput::Continuous(shared) => Some(shared.clone()),
+        _ => None,
+    };
     let mut state = ReaderState {
         request,
         remainder: ReaderRemainder {
             batch: ReadyBatch {
                 failure_clock,
+                stage,
+                continuous: continuous.is_some(),
                 ..ReadyBatch::default()
             },
             publication: Publication::default(),
@@ -758,7 +972,12 @@ pub(super) async fn run_custodied_relay_reader_gated(
         state.terminal = ReaderTerminal::Stopped;
         (None, None)
     } else {
-        let mut body = Box::pin(run_reader_io(&mut state));
+        let mut body = Box::pin(async {
+            run_reader_io(&mut state).await;
+            if let Some(shared) = &continuous {
+                shared.queue.close().await;
+            }
+        });
         let body_panic =
             poll_fn(
                 |cx| match catch_unwind(AssertUnwindSafe(|| body.as_mut().poll(cx))) {

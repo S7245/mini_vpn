@@ -130,7 +130,9 @@ pub(in crate::client_tun) async fn handle_remote_payload_with_gate<D: TunIo>(
 
     // 不直接 send_slice（会丢写不下的字节）：先入下行 pending，再尽量 flush；
     // 剩余字节由主循环每轮 poll 持续推进（TCP ACK 释放 buffer 后继续）。
-    compatibility_runtime::FlowMirror::accept_data(ctx, payload, downstream_permit.take());
+    if !compatibility_runtime::FlowMirror::accept_data(ctx, payload, downstream_permit) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Main pending storage admission refused"));
+    }
     #[cfg(all(test, feature = "harness"))]
     if let RearmGate::OriginalLoop(dispatch) = gate {
         dispatch.observe_payload_transfer(payload);
@@ -245,10 +247,17 @@ pub(in crate::client_tun) async fn handle_remote_payload_with_gate<D: TunIo>(
         return Ok(accepted_bytes);
     }
 
-    let timestamp = smoltcp::time::Instant::now();
-    iface.poll(timestamp, device, sockets);
-    let (result, _) =
-        flush_tx_and_release_downlink_permits(device, sockets, socket_ctxs, "remote_payload").await;
+    let (result, _) = poll_egress_cycle(
+        device,
+        iface,
+        sockets,
+        socket_ctxs,
+        None,
+        "remote_payload",
+        #[cfg(all(test, feature = "harness"))]
+        None,
+    )
+    .await;
     let ok = result.is_ok();
     if let Some(ctx) = socket_ctxs.get_mut(&handle) {
         ctx.downlink_diag.note_tun_flush(ok);

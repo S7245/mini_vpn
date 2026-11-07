@@ -1,19 +1,24 @@
 //! Maintain the state of local connection IDs
+#[cfg(test)]
+mod tests;
 use std::collections::VecDeque;
 
 use rustc_hash::FxHashSet;
 use tracing::{debug, trace};
 
-use crate::{Duration, Instant, TransportError, shared::IssuedCid};
+use crate::{shared::IssuedCid, Duration, Instant, TransportError};
 
 /// Local connection ID management
 pub(super) struct CidState {
     /// Timestamp when issued cids should be retired
     retire_timestamp: VecDeque<CidTimestamp>,
-    /// Number of local connection IDs that have been issued in NEW_CONNECTION_ID frames.
+    /// Next generated sequence, including handshake IDs; not proof of exposure.
     issued: u64,
+    /// Highest sequence potentially exposed in handshake metadata or encoded
+    /// by the original frame writer. This is not a UDP delivery witness.
+    largest_encoded_seq: u64,
     /// Sequence numbers of local connection IDs not yet retired by the peer
-    active_seq: FxHashSet<u64>,
+    active_seq: Active,
     /// Sequence number the peer has already retired all CIDs below at our request via `retire_prior_to`
     prev_retire_seq: u64,
     /// Sequence number to set in retire_prior_to field in NEW_CONNECTION_ID frame
@@ -31,14 +36,40 @@ impl CidState {
         now: Instant,
         issued: u64,
     ) -> Self {
-        let mut active_seq = FxHashSet::default();
-        // Add sequence number of CIDs used in handshaking into tracking set
+        let mut active_seq = Active::Legacy(FxHashSet::default());
         for seq in 0..issued {
             active_seq.insert(seq);
         }
+        Self::with_active(cid_len, cid_lifetime, now, issued, active_seq)
+    }
+
+    pub(crate) fn new_native(
+        cid_len: usize,
+        now: Instant,
+        issued: u64,
+    ) -> Result<Self, TransportError> {
+        if issued > crate::LOC_CID_COUNT {
+            return Err(cid_capacity());
+        }
+        let mut active_seq = Active::Native([None; crate::LOC_CID_COUNT as usize]);
+        for seq in 0..issued {
+            if !active_seq.insert(seq) {
+                return Err(cid_capacity());
+            }
+        }
+        Ok(Self::with_active(cid_len, None, now, issued, active_seq))
+    }
+    fn with_active(
+        cid_len: usize,
+        cid_lifetime: Option<Duration>,
+        now: Instant,
+        issued: u64,
+        active_seq: Active,
+    ) -> Self {
         let mut this = Self {
             retire_timestamp: VecDeque::new(),
             issued,
+            largest_encoded_seq: issued.saturating_sub(1),
             active_seq,
             prev_retire_seq: 0,
             retire_seq: 0,
@@ -132,35 +163,102 @@ impl CidState {
     }
 
     /// Update cid state when `NewIdentifiers` event is received
-    pub(crate) fn new_cids(&mut self, ids: &[IssuedCid], now: Instant) {
-        // `ids` could be `None` once active_connection_id_limit is set to 1 by peer
-        let last_cid = match ids.last() {
-            Some(cid) => cid,
-            None => return,
-        };
-        self.issued += ids.len() as u64;
-        // Record the timestamp of CID with the largest seq number
-        let sequence = last_cid.sequence;
-        ids.iter().for_each(|frame| {
+    pub(crate) fn new_cids(
+        &mut self,
+        ids: impl IntoIterator<Item = IssuedCid>,
+        now: Instant,
+    ) -> Result<(), TransportError> {
+        if matches!(self.active_seq, Active::Native(_)) {
+            let mut count = 0u64;
+            let mut seen = 0u16;
+            for frame in ids {
+                let offset = frame
+                    .sequence
+                    .checked_sub(self.issued)
+                    .ok_or_else(cid_capacity)?;
+                if offset >= crate::LOC_CID_COUNT || seen & (1u16 << offset) != 0 {
+                    return Err(cid_capacity());
+                }
+                seen |= 1u16 << offset;
+                count += 1;
+            }
+            if seen != (1u16 << count) - 1 {
+                return Err(cid_capacity());
+            }
+            let prepared = self.prepare_native(self.issued, count)?;
+            self.install_native(prepared);
+            return Ok(());
+        }
+        let mut last = None;
+        for frame in ids {
+            self.issued += 1;
             self.active_seq.insert(frame.sequence);
-        });
-        self.track_lifetime(sequence, now);
+            last = Some(last.map_or(frame.sequence, |old: u64| old.max(frame.sequence)));
+        }
+        if let Some(sequence) = last {
+            self.track_lifetime(sequence, now);
+        }
+        Ok(())
+    }
+    pub(crate) fn prepare_native(
+        &self,
+        sequence: u64,
+        count: u64,
+    ) -> Result<PreparedNative, TransportError> {
+        let Active::Native(active) = &self.active_seq else {
+            return Err(cid_capacity());
+        };
+        if sequence != self.issued || count > crate::LOC_CID_COUNT {
+            return Err(cid_capacity());
+        }
+        let mut prepared = PreparedNative {
+            active: *active,
+            issued: self.issued,
+        };
+        for _ in 0..count {
+            prepared.push(prepared.issued)?;
+        }
+        Ok(prepared)
+    }
+    pub(crate) fn install_native(&mut self, prepared: PreparedNative) {
+        self.active_seq = Active::Native(prepared.active);
+        self.issued = prepared.issued;
+    }
+
+    /// Record the original writer's completed frame encoding, before that
+    /// same record moves into SentFrames. Retransmission cannot lower this.
+    pub(crate) fn mark_encoded(&mut self, sequence: u64) {
+        self.largest_encoded_seq = self.largest_encoded_seq.max(sequence);
     }
 
     /// Update CidState for receipt of a `RETIRE_CONNECTION_ID` frame
     ///
-    /// Returns whether a new CID can be issued, or an error if the frame was illegal.
+    /// Returns a new retirement and whether a CID can be issued. A duplicate
+    /// has no Endpoint effect and returns None after the original validation.
     pub(crate) fn on_cid_retirement(
         &mut self,
         sequence: u64,
         limit: u64,
-    ) -> Result<bool, TransportError> {
+    ) -> Result<Option<bool>, TransportError> {
+        self.check_retirement(sequence)?;
+        if !self.active_seq.remove(&sequence) {
+            return Ok(None);
+        }
+        // Consider a scenario where peer A has active remote cid 0,1,2.
+        // Peer B first send a NEW_CONNECTION_ID with cid 3 and retire_prior_to set to 1.
+        // Peer A processes this NEW_CONNECTION_ID frame; update remote cid to 1,2,3
+        // and meanwhile send a RETIRE_CONNECTION_ID to retire cid 0 to peer B.
+        // If peer B doesn't check the cid limit here and send a new cid again, peer A will then face CONNECTION_ID_LIMIT_ERROR
+        Ok(Some(limit > self.active_seq.len() as u64))
+    }
+
+    pub(super) fn check_retirement(&self, sequence: u64) -> Result<(), TransportError> {
         if self.cid_len == 0 {
             return Err(TransportError::PROTOCOL_VIOLATION(
                 "RETIRE_CONNECTION_ID when CIDs aren't in use",
             ));
         }
-        if sequence > self.issued {
+        if sequence > self.largest_encoded_seq {
             debug!(
                 sequence,
                 "got RETIRE_CONNECTION_ID for unissued sequence number"
@@ -169,13 +267,7 @@ impl CidState {
                 "RETIRE_CONNECTION_ID for unissued sequence number",
             ));
         }
-        self.active_seq.remove(&sequence);
-        // Consider a scenario where peer A has active remote cid 0,1,2.
-        // Peer B first send a NEW_CONNECTION_ID with cid 3 and retire_prior_to set to 1.
-        // Peer A processes this NEW_CONNECTION_ID frame; update remote cid to 1,2,3
-        // and meanwhile send a RETIRE_CONNECTION_ID to retire cid 0 to peer B.
-        // If peer B doesn't check the cid limit here and send a new cid again, peer A will then face CONNECTION_ID_LIMIT_ERROR
-        Ok(limit > self.active_seq.len() as u64)
+        Ok(())
     }
 
     /// Length of local Connection IDs
@@ -220,4 +312,90 @@ struct CidTimestamp {
     sequence: u64,
     /// Timestamp when cid needs to be retired
     timestamp: Instant,
+}
+
+// Native's no-lifetime profile owns exactly eight inline active sequences. The
+// Legacy set and lifetime behavior retain their original semantics; no heap or
+// new refund authority is introduced for the fixed instance state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Active {
+    Legacy(FxHashSet<u64>),
+    Native([Option<u64>; crate::LOC_CID_COUNT as usize]),
+}
+impl Active {
+    fn len(&self) -> usize {
+        match self {
+            Self::Legacy(set) => set.len(),
+            Self::Native(slots) => slots.iter().flatten().count(),
+        }
+    }
+    fn contains(&self, sequence: &u64) -> bool {
+        match self {
+            Self::Legacy(set) => set.contains(sequence),
+            Self::Native(slots) => slots.contains(&Some(*sequence)),
+        }
+    }
+    fn insert(&mut self, sequence: u64) -> bool {
+        match self {
+            Self::Legacy(set) => set.insert(sequence),
+            Self::Native(slots) => {
+                if slots.contains(&Some(sequence)) {
+                    return false;
+                }
+                let Some(slot) = slots.iter_mut().find(|slot| slot.is_none()) else {
+                    return false;
+                };
+                *slot = Some(sequence);
+                true
+            }
+        }
+    }
+    fn remove(&mut self, sequence: &u64) -> bool {
+        match self {
+            Self::Legacy(set) => set.remove(sequence),
+            Self::Native(slots) => {
+                let Some(slot) = slots.iter_mut().find(|slot| **slot == Some(*sequence)) else {
+                    return false;
+                };
+                *slot = None;
+                true
+            }
+        }
+    }
+    fn iter(&self) -> impl Iterator<Item = &u64> {
+        let (legacy, native) = match self {
+            Self::Legacy(set) => (Some(set), None),
+            Self::Native(slots) => (None, Some(slots)),
+        };
+        legacy
+            .into_iter()
+            .flat_map(|set| set.iter())
+            .chain(native.into_iter().flat_map(|slots| slots.iter().flatten()))
+    }
+}
+pub(crate) struct PreparedNative {
+    active: [Option<u64>; crate::LOC_CID_COUNT as usize],
+    issued: u64,
+}
+impl PreparedNative {
+    fn push(&mut self, sequence: u64) -> Result<(), TransportError> {
+        if sequence != self.issued
+            || sequence > u64::from(crate::VarInt::MAX)
+            || self.active.contains(&Some(sequence))
+        {
+            return Err(cid_capacity());
+        }
+        let next = self.issued.checked_add(1).ok_or_else(cid_capacity)?;
+        let slot = self
+            .active
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or_else(cid_capacity)?;
+        *slot = Some(sequence);
+        self.issued = next;
+        Ok(())
+    }
+}
+fn cid_capacity() -> TransportError {
+    TransportError::INTERNAL_ERROR("native CID sequence or active inventory unavailable")
 }

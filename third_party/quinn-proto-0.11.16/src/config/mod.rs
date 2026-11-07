@@ -35,6 +35,13 @@ pub use transport::{AckFrequencyConfig, IdleTimeout, MtuDiscoveryConfig, Transpo
 /// Default values should be suitable for most internet applications.
 #[derive(Clone)]
 pub struct EndpointConfig {
+    pub(crate) receive_backing_meter: Option<bytes::BackingMeter>,
+    pub(crate) receive_datagram_limit: usize,
+    pub(crate) sent_history_ordinary: usize,
+    pub(crate) sent_history_control: usize,
+    pub(crate) control_record_capacity: usize,
+    pub(crate) stream_record_capacity: usize,
+    pub(crate) crypto_record_capacity: usize,
     pub(crate) reset_key: Arc<dyn HmacKey>,
     pub(crate) max_udp_payload_size: VarInt,
     /// CID generator factory
@@ -125,12 +132,117 @@ impl EndpointPacingServiceConfig {
 }
 
 impl EndpointConfig {
+    /// Actual maximum single receive slice supplied by the I/O owner, not the
+    /// advertised transport parameter. Standalone Proto defaults to UDP max.
+    #[doc(hidden)]
+    pub fn receive_datagram_limit(&mut self, limit: usize) -> Result<&mut Self, ConfigError> {
+        if limit < 1200 {
+            return Err(ConfigError::OutOfBounds);
+        }
+        self.receive_datagram_limit = limit;
+        Ok(self)
+    }
+    /// Cold per-connection Data-space packet positions. Ordinary requests
+    /// cannot consume the control reserve. A control-capacity failure closes
+    /// only this QUIC connection; packets already in flight remain owned.
+    #[doc(hidden)]
+    pub fn receive_sent_history_limits(
+        &mut self,
+        ordinary: usize,
+        control: usize,
+    ) -> Result<&mut Self, ConfigError> {
+        if ordinary == 0 || control == 0 || ordinary.checked_add(control).is_none() {
+            return Err(ConfigError::OutOfBounds);
+        }
+        self.sent_history_ordinary = ordinary;
+        self.sent_history_control = control;
+        Ok(self)
+    }
+
+    /// Independent cold control-record stock per Connection. Exhaustion fails
+    /// that Connection before a new local RESET/STOP obligation is committed.
+    #[doc(hidden)]
+    pub fn receive_control_record_limit(
+        &mut self,
+        capacity: usize,
+    ) -> Result<&mut Self, ConfigError> {
+        if capacity == 0
+            || capacity
+                .checked_add(self.stream_record_capacity)
+                .and_then(|n| n.checked_add(self.crypto_record_capacity))
+                .is_none_or(|n| n >= u32::MAX as usize)
+        {
+            return Err(ConfigError::OutOfBounds);
+        }
+        self.control_record_capacity = capacity;
+        Ok(self)
+    }
+
+    /// Ordinary STREAM frame records in the same cold Connection pool. Full
+    /// pauses only STREAM encoding; it cannot consume control-record credit.
+    #[doc(hidden)]
+    pub fn receive_stream_record_limit(
+        &mut self,
+        capacity: usize,
+    ) -> Result<&mut Self, ConfigError> {
+        if capacity == 0
+            || capacity
+                .checked_add(self.control_record_capacity)
+                .and_then(|n| n.checked_add(self.crypto_record_capacity))
+                .is_none_or(|n| n >= u32::MAX as usize)
+        {
+            return Err(ConfigError::OutOfBounds);
+        }
+        self.stream_record_capacity = capacity;
+        Ok(self)
+    }
+
+    /// Independent CRYPTO custody in the same cold pool. Application control
+    /// and STREAM records cannot consume it. This is a limit, not a promise
+    /// that every TLS flight fits; exhaustion fails only this Connection.
+    #[doc(hidden)]
+    pub fn receive_crypto_record_limit(
+        &mut self,
+        capacity: usize,
+    ) -> Result<&mut Self, ConfigError> {
+        if capacity == 0
+            || capacity
+                .checked_add(self.control_record_capacity)
+                .and_then(|n| n.checked_add(self.stream_record_capacity))
+                .is_none_or(|n| n >= u32::MAX as usize)
+        {
+            return Err(ConfigError::OutOfBounds);
+        }
+        self.crypto_record_capacity = capacity;
+        Ok(self)
+    }
+
+    /// Bind all receive assemblers from this endpoint to the same Node authority.
+    #[doc(hidden)]
+    pub fn receive_backing_meter(&mut self, meter: bytes::BackingMeter) -> &mut Self {
+        self.receive_backing_meter = Some(meter);
+        self
+    }
+
+    /// Read the embedded authority before a facade constructor publishes a driver.
+    #[doc(hidden)]
+    pub fn receive_backing_meter_authority(&self) -> Option<bytes::BackingMeter> {
+        self.receive_backing_meter.clone()
+    }
+
     /// Create a default config with a particular `reset_key`
     pub fn new(reset_key: Arc<dyn HmacKey>) -> Self {
         let cid_factory =
             || -> Box<dyn ConnectionIdGenerator> { Box::<HashedConnectionIdGenerator>::default() };
         Self {
             reset_key,
+            receive_backing_meter: None,
+            receive_datagram_limit: 65_535,
+            sent_history_ordinary: 1024,
+            sent_history_control: 1024,
+            control_record_capacity: 2048,
+            stream_record_capacity: 4096,
+            crypto_record_capacity: 2048,
             max_udp_payload_size: (1500u32 - 28).into(), // Ethernet MTU minus IP + UDP headers
             connection_id_generator_factory: Arc::new(cid_factory),
             supported_versions: DEFAULT_SUPPORTED_VERSIONS.to_vec(),

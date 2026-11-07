@@ -319,6 +319,8 @@ async fn client_and_owner_registered_b_respond_on_the_exact_physical_fifo() {
                 panic!("owner B lost exact probe provenance before terminal")
             }
         };
+    wait_actor_ordered_delivery(&mut client_b).await;
+    wait_actor_ordered_delivery(&mut server_b).await;
     server_b.request_cancel();
     tokio::time::timeout(TEST_TIMEOUT, async {
         loop {

@@ -8,9 +8,12 @@ use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use tokio::task::JoinHandle;
 
+mod admission_failstop;
 mod maintenance;
+mod rebuild;
 pub(in crate::tuic) mod recovery;
 mod startup;
+mod uplink;
 type Saved<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,12 +42,47 @@ pub struct NodeHost {
     ready: Option<Arc<TuicUpstream>>,
     cleanup: Option<Saved<NodeShutdown>>,
     result: Option<NodeShutdown>,
+    controlled_rebuild: Option<usize>,
     deadline: Option<tokio::time::Instant>,
+}
+impl Drop for NodeHost {
+    fn drop(&mut self) {
+        // Losing this saved root cannot be postponed by diagnostic/actor Arcs.
+        // Clone only the original runtime under the ledger, then seal outside it.
+        let runtime = self
+            .ready
+            .as_ref()
+            .map(|data| data.udp_runtime.clone())
+            .or_else(|| self.resources.state().udp.as_ref().map(|udp| udp.runtime()));
+        if let Some(runtime) = runtime {
+            runtime.abandon_native_owner();
+        }
+        let unfinished_native = {
+            let state = self.resources.state();
+            state.backing_meter.budget_limit().is_some() && state.endpoint_created
+                && !state.endpoint_drained
+        };
+        if unfinished_native { self.resources.uplink_quarantine(); }
+    }
 }
 impl NodeHost {
     pub fn prepare(cfg: TuicClientConfig, metrics: Arc<Metrics>) -> Self {
+        Self::prepare_with_budget(cfg, metrics, None)
+    }
+    pub(crate) fn prepare_with_budget(
+        cfg: TuicClientConfig,
+        metrics: Arc<Metrics>,
+        budget: Option<&bytes::BackingBudget>,
+    ) -> Self {
         let count = cfg.tcp_pool.clamp(MIN_TUIC_TCP_POOL, MAX_TUIC_TCP_POOL);
-        let resources = Arc::new(StartupResources::new(count));
+        let resources = Arc::new(StartupResources::with_meter(
+            count,
+            // A2: the Node's Quinn/TUIC allocations use the protocol tier, which
+            // App backpressure can never consume.
+            budget
+                .map(bytes::BackingMeter::with_protocol_budget)
+                .unwrap_or_default(),
+        ));
         let config = cfg.clone();
         let owner = Arc::clone(&resources);
         let startup = Box::pin(async move {
@@ -69,8 +107,20 @@ impl NodeHost {
             ready: None,
             cleanup: None,
             result: None,
+            controlled_rebuild: None,
             deadline: None,
         }
+    }
+    pub(crate) fn bind_udp_parent(
+        &self,
+        parent: std::sync::Weak<dyn crate::shared::errors::QuietFailureSink>,
+    ) -> Result<(), ClientError> {
+        let mut state = self.resources.state();
+        if state.published || state.udp_parent.is_some() {
+            return Err(io_err("UDP parent", "cold binding already frozen"));
+        }
+        state.udp_parent = Some(parent);
+        Ok(())
     }
     pub async fn start(&mut self) -> NodeStartup {
         std::future::poll_fn(|cx| {
@@ -127,14 +177,6 @@ impl NodeHost {
         if closed || upstream.udp_runtime.node_stopping() {
             return Err(io_err("tuic node", "runtime stopped or quarantined"));
         }
-        if upstream.relay_policy.tuic_native_override() != TuicNativeOverride::None {
-            self.resources.record(ClientError::InvalidTarget(
-                "node-owned DATA requires a Generic TUIC profile until Native custody is wired"
-                    .into(),
-            ));
-            self.request_stop();
-            return Err(recorded_failure());
-        }
         if published {
             return Ok(Arc::clone(upstream));
         }
@@ -183,6 +225,7 @@ impl NodeHost {
                 return Err(recorded_failure());
             }
         }
+        upstream.udp_runtime.prepare_native(&self.resources)?;
         let Some(udp) = upstream.take_udp_shutdown() else {
             self.resources.state().quarantined = true;
             self.resources
@@ -216,11 +259,20 @@ impl NodeHost {
         if self.running.is_none() {
             let data = self.data()?;
             data.start_endpoint_recovery_monitor();
-            self.running = Some(Box::pin(recovery::run(
-                self.resources.clone(),
-                data,
-                self.config.clone(),
-            )));
+            self.running = Some(
+                match data.udp_runtime.native_recovery(
+                    self.resources.clone(),
+                    data.clone(),
+                    self.config.clone(),
+                )? {
+                    Some(work) => Box::pin(work),
+                    None => Box::pin(recovery::run(
+                        self.resources.clone(),
+                        data,
+                        self.config.clone(),
+                    )),
+                },
+            );
         }
         std::future::poll_fn(|cx| {
             let Some(work) = self.running.as_mut() else {
@@ -260,10 +312,26 @@ impl NodeHost {
         }
     }
     pub fn request_stop(&mut self) {
-        if self.deadline.is_some() {
+        let already_stopping = self.deadline.is_some();
+        let proposed = self
+            .ready
+            .as_ref()
+            .filter(|data| data.udp_runtime.native_enabled())
+            .map(|data| data.udp_runtime.request_stop())
+            .unwrap_or_else(|| self.resources.uplink_stop_deadline()
+                .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(15)));
+        let mut state = self.resources.state();
+        let deadline = state
+            .shutdown_deadline
+            .into_iter()
+            .chain(self.deadline)
+            .fold(proposed, std::cmp::min);
+        state.shutdown_deadline = Some(deadline);
+        drop(state);
+        self.deadline = Some(deadline);
+        if already_stopping {
             return;
         }
-        self.deadline = Some(tokio::time::Instant::now() + Duration::from_secs(15));
         self.resources.state().stopping = true;
         self.stop_running_admission();
         self.resources.stop_stats();
@@ -516,6 +584,9 @@ enum Retirement {
     Failed,
 }
 struct StartupState {
+    backing_meter: bytes::BackingMeter,
+    udp_parent: Option<std::sync::Weak<dyn crate::shared::errors::QuietFailureSink>>,
+    shutdown_deadline: Option<tokio::time::Instant>,
     endpoint: Option<Endpoint>,
     endpoint_drain: Option<quinn::EndpointDriverDrain>,
     endpoint_created: bool,
@@ -530,7 +601,8 @@ struct StartupState {
     stopping: bool,
     config_rejected: bool,
     udp: Option<node_runtime::UdpShutdown>,
-    uplink: Option<udp_send::UdpStreamSender>,
+    uplink: udp_send::UdpStreamSender,
+    uplink_parent: uplink::Parent,
     terminal: Option<TerminalPool>,
     task_limit: usize,
     poison_recorded: bool,
@@ -540,6 +612,8 @@ struct StartupState {
     quarantined: bool,
     attempts_started: u64,
     attempts_drained: u64,
+    #[cfg(test)]
+    retire_poll_pending: Arc<StdMutex<Vec<Option<usize>>>>,
     tasks_started: u64,
     tasks_joined: u64,
 }
@@ -551,11 +625,14 @@ impl std::fmt::Display for RecordedFailure {
     }
 }
 impl std::error::Error for RecordedFailure {}
-fn recorded_failure() -> ClientError {
+pub(super) fn recorded_failure() -> ClientError {
     ClientError::Io(io::Error::other(RecordedFailure))
 }
 
-pub(super) struct StartupResources(StdMutex<StartupState>);
+pub(super) struct StartupResources(
+    StdMutex<StartupState>,
+    std::sync::OnceLock<std::sync::Weak<crate::shared::errors::FailureOrder>>,
+);
 fn origin() -> FailureOrigin {
     FailureOrigin {
         phase: FailurePhase::Startup,
@@ -565,35 +642,48 @@ fn origin() -> FailureOrigin {
     }
 }
 impl StartupResources {
+    #[cfg(test)]
     fn new(pool: usize) -> Self {
-        Self(StdMutex::new(StartupState {
-            endpoint: None,
-            endpoint_drain: None,
-            endpoint_created: false,
-            endpoint_drained: false,
-            connections: (0..pool + 3).map(|_| None).collect(),
-            tasks: Vec::with_capacity(pool + 5),
-            recovery: recovery::State::new(pool),
-            task_limit: pool + 5,
-            monitor: None,
-            monitor_started: false,
-            monitor_joined: false,
-            published: false,
-            stopping: false,
-            config_rejected: false,
-            udp: None,
-            uplink: None,
-            terminal: None,
-            poison_recorded: false,
-            stats_stop: None,
-            first: None,
-            additional: 0,
-            quarantined: false,
-            attempts_started: 0,
-            attempts_drained: 0,
-            tasks_started: 0,
-            tasks_joined: 0,
-        }))
+        Self::with_meter(pool, bytes::BackingMeter::new())
+    }
+    fn with_meter(pool: usize, backing_meter: bytes::BackingMeter) -> Self {
+        Self(
+            StdMutex::new(StartupState {
+                backing_meter,
+                udp_parent: None,
+                shutdown_deadline: None,
+                endpoint: None,
+                endpoint_drain: None,
+                endpoint_created: false,
+                endpoint_drained: false,
+                connections: (0..pool + 3).map(|_| None).collect(),
+                tasks: Vec::with_capacity(pool + 5),
+                recovery: recovery::State::new(pool),
+                task_limit: pool + 5,
+                monitor: None,
+                monitor_started: false,
+                monitor_joined: false,
+                published: false,
+                stopping: false,
+                config_rejected: false,
+                udp: None,
+                uplink: udp_send::UdpStreamSender::Empty,
+                uplink_parent: uplink::Parent::Ready,
+                terminal: None,
+                poison_recorded: false,
+                stats_stop: None,
+                first: None,
+                additional: 0,
+                quarantined: false,
+                attempts_started: 0,
+                attempts_drained: 0,
+                #[cfg(test)]
+                retire_poll_pending: Arc::new(StdMutex::new(vec![None; pool + 3])),
+                tasks_started: 0,
+                tasks_joined: 0,
+            }),
+            std::sync::OnceLock::new(),
+        )
     }
     fn state(&self) -> std::sync::MutexGuard<'_, StartupState> {
         self.0.lock().unwrap_or_else(|poison| {
@@ -610,7 +700,66 @@ impl StartupResources {
             state
         })
     }
+    pub(super) fn bind_udp_clock(
+        &self,
+        clock: &crate::shared::errors::FailureClock,
+    ) -> Result<(), ClientError> {
+        if !clock.bound_to_meter(&self.state().backing_meter)
+            || self.1.set(Arc::downgrade(clock)).is_err()
+        {
+            self.state().backing_meter.quarantine();
+            return Err(io_err(
+                "UDP clock",
+                "original Node clock already frozen or foreign",
+            ));
+        }
+        Ok(())
+    }
+    pub(super) fn udp_cold_context(
+        &self,
+    ) -> (
+        bytes::BackingMeter,
+        Option<std::sync::Weak<dyn crate::shared::errors::QuietFailureSink>>,
+    ) {
+        let state = self.state();
+        (state.backing_meter.clone(), state.udp_parent.clone())
+    }
+    pub(in crate::tuic) fn fallback_admission(&self) -> crate::failover::FallbackAdmission {
+        use crate::failover::FallbackAdmission as Gate;
+        let state = self.state();
+        if state.quarantined {
+            Gate::Quarantined
+        } else if state.stopping {
+            Gate::Stopping
+        } else if state.config_rejected {
+            Gate::ConfigurationRejected
+        } else if !state.published {
+            Gate::Unpublished
+        } else if state
+            .connections
+            .iter()
+            .flatten()
+            .any(|entry| !entry.published)
+            || state.recovery.fallback_pending()
+        {
+            Gate::Pending
+        } else {
+            Gate::Allowed
+        }
+    }
     fn failure(&self, failure: RetainedFailure) {
+        // Upgrade outside the original ledger, publish Node -> Session once,
+        // then release the possibly last original clock outside every owner lock.
+        if let Some(clock) = self.1.get().and_then(std::sync::Weak::upgrade) {
+            let order = clock.retained(&failure);
+            if !clock.reported(order) {
+                self.failure_local(failure);
+            }
+        } else {
+            self.failure_local(failure);
+        }
+    }
+    fn failure_local(&self, failure: RetainedFailure) {
         let mut state = self.state();
         if state.first.is_none() {
             state.first = Some(failure);
@@ -625,9 +774,11 @@ impl StartupResources {
     fn record_startup_result(&self, error: ClientError) {
         let already_recorded = matches!(&error, ClientError::Io(io)
             if io.get_ref().is_some_and(|source| source.is::<RecordedFailure>()));
-        if !already_recorded {
-            self.failure(RetainedFailure::from_client_ref(origin(), &error));
-        }
+        let admission_q = matches!(&error, ClientError::Io(io) if io.get_ref()
+            .and_then(|source| source.downcast_ref::<quinn::owned_events::AdmissionError>())
+            .is_some_and(|cause| cause.0 == bytes::MeteredCopyError::Quarantined));
+        if admission_q { self.uplink_quarantine(); }
+        else if !already_recorded { self.failure(RetainedFailure::from_client_ref(origin(), &error)); }
         self.dispose(error);
     }
     fn dispose<T>(&self, value: T) {
@@ -764,9 +915,18 @@ impl StartupResources {
             }
         }
     }
+    fn native_quarantined(&self) -> bool {
+        self.1.get().is_some() && self.state().backing_meter.is_quarantined()
+    }
     async fn retire(&self, index: usize) -> Result<(), ClientError> {
+        #[cfg(test)]
+        let _probe_guard =
+            tests::RetireProbeGuard::new(self.state().retire_poll_pending.clone(), index);
         std::future::poll_fn(|cx| {
+            let already_native_q = self.native_quarantined();
             let mut state = self.state();
+            #[cfg(test)]
+            let retire_poll_pending = state.retire_poll_pending.clone();
             let Some(attempt) = state.connections.get_mut(index).and_then(Option::as_mut) else {
                 return Poll::Ready(Ok(()));
             };
@@ -786,6 +946,8 @@ impl StartupResources {
                 attempt.connection = None;
                 attempt.retirement = Retirement::Waiting(Box::pin(drain.drained()));
             }
+            #[cfg(test)]
+            let stable_id = attempt.published.then_some(attempt.stable_id).flatten();
             let outcome = match &mut attempt.retirement {
                 Retirement::Waiting(work) => {
                     catch_unwind(AssertUnwindSafe(|| work.as_mut().poll(cx)))
@@ -793,7 +955,19 @@ impl StartupResources {
                 _ => return Poll::Ready(Err(recorded_failure())),
             };
             if matches!(outcome, Ok(Poll::Pending)) {
+                #[cfg(test)]
+                {
+                    retire_poll_pending
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)[index] = stable_id;
+                }
                 return Poll::Pending;
+            }
+            #[cfg(test)]
+            {
+                retire_poll_pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)[index] = None;
             }
             let retired = std::mem::replace(&mut attempt.retirement, Retirement::Failed);
             let success = matches!(outcome, Ok(Poll::Ready(true)));
@@ -807,7 +981,7 @@ impl StartupResources {
             // Failed/unknown debt is sealed before any unknown destructor runs.
             match outcome {
                 Err(payload) => self.panic(payload),
-                Ok(Poll::Ready(false)) => {
+                Ok(Poll::Ready(false)) if !already_native_q => {
                     self.record(io_err("tuic candidate", "physical retirement failed"))
                 }
                 _ => {}
@@ -840,6 +1014,8 @@ impl StartupResources {
             if entry.published
                 && let Some(conn) = &entry.connection
             {
+                #[cfg(test)]
+                Self::trace_first_close(conn);
                 conn.close(0u32.into(), b"node_stop");
             }
         }
@@ -855,13 +1031,34 @@ impl StartupResources {
     }
     async fn cleanup(self: Arc<Self>, mut upstream: Option<Arc<TuicUpstream>>) -> NodeShutdown {
         self.stop_stats();
+        #[cfg(test)]
+        self.trace_cleanup("monitor.begin", None);
         let monitor = self.state().monitor.take();
+        let mut udp = self.state().udp.take();
         if let Some(task) = monitor {
-            self.join_task(task).await;
+            if let Some(runtime) = udp.as_ref().filter(|udp| udp.native_enabled()) {
+                let complete = match runtime.prepare_monitor_join(task) {
+                    Ok(work) => work.await,
+                    Err(task) => {
+                        self.state().monitor = Some(task);
+                        false
+                    }
+                };
+                if !complete {
+                    self.state().quarantined = true;
+                    self.state().udp = udp.take();
+                    return NodeShutdown::Quarantined;
+                }
+            } else {
+                self.join_task(task).await;
+            }
             self.state().monitor_joined = true;
         }
-        let udp = self.state().udp.take();
-        if let Some(mut udp) = udp {
+        #[cfg(test)]
+        self.trace_cleanup("monitor.end", None);
+        #[cfg(test)]
+        self.trace_cleanup("udp.begin", None);
+        if let Some(mut udp) = udp.take() {
             let result = udp.drive_shutdown().await;
             let (failure, additional) = udp.take_node_failure();
             if let Some(failure) = failure {
@@ -872,15 +1069,32 @@ impl StartupResources {
             state.quarantined |= result != node_runtime::UdpShutdownState::Settled;
             state.udp = Some(udp);
         }
+        #[cfg(test)]
+        self.trace_cleanup("udp.end", None);
+        #[cfg(test)]
+        self.trace_cleanup("source.begin", None);
         if let Some(data) = &upstream {
-            if !data.udp_runtime.settle_source().await {
-                self.state().quarantined = true;
-                self.record(io_err(
-                    "UDP generation",
-                    "original source inventory invalid during shutdown",
-                ));
+            let already_native_q = self.native_quarantined();
+            match data.udp_runtime.settle_source().await {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.state().quarantined = true;
+                    if !already_native_q {
+                        self.record(io_err(
+                            "UDP generation",
+                            "original source inventory invalid during shutdown",
+                        ));
+                    }
+                }
+                Err(_) => {
+                    self.state().quarantined = true;
+                }
             }
         }
+        #[cfg(test)]
+        self.trace_cleanup("source.end", None);
+        #[cfg(test)]
+        self.trace_cleanup("tasks.begin", None);
         loop {
             let task = self.state().tasks.pop();
             let Some(task) = task else {
@@ -889,19 +1103,33 @@ impl StartupResources {
             self.join_task(task.handle).await;
             self.state().tasks_joined += 1;
         }
+        #[cfg(test)]
+        self.trace_cleanup("tasks.end", None);
         // Before DATA publication, these are the initial current connections:
         // capture their original physical inventory before retiring them below.
         let published = self.state().published;
+        #[cfg(test)]
+        self.trace_cleanup("unpublished.begin", None);
         if published && self.retire_unpublished().await {
-            recovery::clear_uncommitted(&self);
+            recovery::settle_uncommitted(&self).await;
         }
+        #[cfg(test)]
+        self.trace_cleanup("unpublished.end", None);
         // Monitor has actually joined: reuse its original control timer role.
         // Arc Drop does not notify. Failed unwrap returns the exact Arc to this
         // saved future; observer cancellation cannot erase or replace it.
+        #[cfg(test)]
+        self.trace_cleanup("arc.begin", upstream.as_ref().map(Arc::strong_count));
         while let Some(data) = upstream.take() {
             match Arc::try_unwrap(data) {
                 Ok(mut data) => {
+                    #[cfg(test)]
+                    self.trace_cleanup("arc.unwrapped", None);
+                    #[cfg(test)]
+                    self.trace_cleanup("terminal.capture.begin", None);
                     let mut terminal = TerminalPool::capture(&mut data, &self).await;
+                    #[cfg(test)]
+                    self.trace_cleanup("terminal.capture.end", None);
                     let validation = terminal.validate(&self.state());
                     terminal.invalid =
                         validation.is_err() || self.state().recovery.release_failure.is_some();
@@ -911,14 +1139,14 @@ impl StartupResources {
                         self.record(error);
                     }
                     let tails = match data.udp_stream_sender.get_mut() {
-                        Ok(sender) => std::mem::take(sender),
+                        Ok(sender) => sender.empty_take(),
                         Err(poison) => {
                             self.state().quarantined = true;
                             self.record(io_err("tuic uplink", "poisoned physical inventory"));
-                            std::mem::take(poison.into_inner())
+                            poison.into_inner().empty_take()
                         }
                     };
-                    self.state().uplink = Some(tails);
+                    self.state().uplink = tails;
                     self.dispose(data);
                 }
                 Err(data) => {
@@ -930,12 +1158,18 @@ impl StartupResources {
         let count = self.state().connections.len();
         let mut physical_settled = true;
         for index in 0..count {
+            #[cfg(test)]
+            self.trace_cleanup("connection.begin", Some(index));
             physical_settled &= self.retire(index).await.is_ok();
+            #[cfg(test)]
+            self.trace_cleanup("connection.end", Some(index));
         }
         if !physical_settled && let Some(terminal) = self.state().terminal.as_mut() {
             terminal.invalid = true;
         }
 
+        #[cfg(test)]
+        self.trace_cleanup("terminal.witness.begin", None);
         loop {
             if self
                 .state()
@@ -964,37 +1198,51 @@ impl StartupResources {
                 }
             }
         }
-        {
-            let mut state = self.state();
-            if let Some(tails) = state.uplink.as_mut() {
-                if tails.settle_all() {
-                    state.uplink = None;
-                } else {
-                    state.quarantined = true;
-                }
-            }
-        }
+        #[cfg(test)]
+        self.trace_cleanup("terminal.witness.end", None);
+        #[cfg(test)]
+        self.trace_cleanup("uplink.begin", None);
+        self.retire_uplink().await;
+        #[cfg(test)]
+        self.trace_cleanup("uplink.end", None);
+        #[cfg(test)]
+        self.trace_cleanup("endpoint.begin", None);
         let (endpoint, drain) = {
             let mut state = self.state();
             (state.endpoint.take(), state.endpoint_drain.take())
         };
         drop(endpoint);
         if let Some(drain) = drain {
+            let already_native_q = self.native_quarantined();
             let success = drain.drained().await;
             let mut state = self.state();
             state.endpoint_drained = success;
             state.quarantined |= !success;
             drop(state);
-            if !success {
+            if !success && !already_native_q {
                 self.record(io_err("tuic endpoint", "driver release witness failed"));
             }
         }
+        #[cfg(test)]
+        self.trace_cleanup("endpoint.end", None);
+        let udp = self.state().udp.take();
+        if let Some(udp) = udp {
+            let monitored = self.state().monitor_started;
+            let retired = udp.retire_native(monitored);
+            self.state().quarantined |= !retired;
+            self.state().udp = Some(udp);
+        }
         let state = self.state();
+        let backing = state.backing_meter.snapshot();
         if state.quarantined
+            || backing.quarantined
+            || backing.allocations != 0
+            || backing.payload_bytes != 0
+            || backing.physical_bytes != 0
             || state.connections.iter().any(Option::is_some)
             || state.tasks_started != state.tasks_joined
             || (state.monitor_started && !state.monitor_joined)
-            || state.uplink.is_some()
+            || !state.uplink.is_empty()
             || state.terminal.is_some()
             || (state.endpoint_created && !state.endpoint_drained)
         {
@@ -1009,4 +1257,24 @@ impl StartupResources {
     }
 }
 #[cfg(test)]
+pub(crate) use tests::NativeNodeWeakObserver;
+#[cfg(test)]
 mod tests;
+
+impl crate::shared::errors::QuietFailureSink for StartupResources {
+    fn record_quiet(&self, failure: RetainedFailure) {
+        let panic = failure.facts().class == crate::shared::errors::FailureClass::Panic;
+        self.failure_local(failure);
+        if panic {
+            self.quarantine_quiet();
+        }
+    }
+    fn quarantine_quiet(&self) {
+        let mut state = self.state();
+        state.quarantined = true;
+        state.backing_meter.quarantine();
+    }
+    fn deadline_quiet(&self) -> Option<tokio::time::Instant> {
+        self.state().shutdown_deadline
+    }
+}

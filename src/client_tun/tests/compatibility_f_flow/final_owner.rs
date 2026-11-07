@@ -92,6 +92,9 @@ impl TunIo for LocalDevice<'_> {
     fn rx_take(&mut self) -> Option<bytes::BytesMut> {
         self.inner.rx_take()
     }
+    fn rx_take_packet(&mut self) -> Option<crate::device::RxPacket> {
+        self.inner.rx_take_packet()
+    }
     fn stage_rx_for_iface(&mut self) -> bool {
         self.inner.stage_rx_for_iface()
     }
@@ -101,7 +104,7 @@ impl TunIo for LocalDevice<'_> {
     fn queued_tx_bytes(&self) -> usize {
         self.inner.queued_tx_bytes()
     }
-    fn take_flushed_tcp_packets(&mut self) -> Vec<crate::device::TunFlushedTcpPacket> {
+    fn take_flushed_tcp_packets(&mut self) -> crate::device::FlushedTcpBatch<'_> {
         self.inner.take_flushed_tcp_packets()
     }
     fn tun_ingress_pump_snapshot(&self) -> crate::device::TunIngressPumpSnapshot {

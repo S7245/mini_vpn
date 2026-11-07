@@ -20,7 +20,7 @@ use super::super::super::{
     send_relay_reader_close, should_poll_relay_ack_drain_hint, should_poll_relay_remote_read_probe,
     tcp_diag_enabled,
 };
-use super::relay_reader::{ReaderRequest, run_relay_reader};
+use super::relay_reader::{ReaderOutput, ReaderRequest, run_relay_reader};
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 
@@ -31,10 +31,38 @@ pub(in crate::client_tun) struct GenericLaunchRequest {
     pub(in crate::client_tun) handle: SocketHandle,
     pub(in crate::client_tun) epoch: u64,
     pub(in crate::client_tun) stream: RelayStream,
-    pub(in crate::client_tun) rx: mpsc::Receiver<RelayCommand>,
-    pub(in crate::client_tun) back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
+    pub(in crate::client_tun) rx: crate::client_tun::uplink::Receiver,
+    pub(in crate::client_tun) back_tx: crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
     pub(in crate::client_tun) read_credit_rx: watch::Receiver<RelayReadCredit>,
     pub(in crate::client_tun) downlink_backpressure: DownlinkBackpressureConfig,
+}
+
+/// Cold Native carrier inputs retained by the original session Root until its
+/// final synchronous commit. The optional producer task is still prepared.
+pub(in crate::client_tun) struct NativeLaunchRequest {
+    pub(in crate::client_tun) uplink_observer: Option<crate::client_tun::uplink::Observer>,
+    pub(in crate::client_tun) handle: SocketHandle,
+    pub(in crate::client_tun) epoch: u64,
+    pub(in crate::client_tun) native: crate::upstream::NativeTcpRelayStream,
+    pub(in crate::client_tun) engine: crate::upstream::NativeTcpRelayEngine,
+    pub(in crate::client_tun) read_floor: bool,
+    pub(in crate::client_tun) rx: crate::client_tun::uplink::Receiver,
+    pub(in crate::client_tun) back_tx: crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
+    pub(in crate::client_tun) read_credit_rx: watch::Receiver<RelayReadCredit>,
+    pub(in crate::client_tun) downlink_backpressure: DownlinkBackpressureConfig,
+}
+
+/// The direct ByteOwned carrier and its one original D16 queue/budget identity.
+/// Root keeps this cold request until the physical F publication commit.
+pub(in crate::client_tun) struct D16LaunchRequest {
+    pub(in crate::client_tun) handle: SocketHandle,
+    pub(in crate::client_tun) epoch: u64,
+    pub(in crate::client_tun) native: crate::upstream::NativeTcpRelayStream,
+    pub(in crate::client_tun) queue: AsyncLeasedByteFlowQueue,
+    pub(in crate::client_tun) budget: crate::tcp_downlink_pump::D16GlobalByteBudget,
+    pub(in crate::client_tun) rx: crate::client_tun::uplink::Receiver,
+    pub(in crate::client_tun) back_tx: crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
+    pub(in crate::client_tun) read_credit_rx: watch::Receiver<RelayReadCredit>,
 }
 
 /// Starts the selected Generic relay exactly as the original root dispatch did.
@@ -112,8 +140,8 @@ pub(in crate::client_tun) async fn run_relay(
     handle: SocketHandle,
     epoch: u64,
     stream: RelayStream,
-    rx: mpsc::Receiver<RelayCommand>,
-    back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
+    rx: crate::client_tun::uplink::Receiver,
+    back_tx: crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
     read_credit_rx: watch::Receiver<RelayReadCredit>,
 ) {
     run_relay_with_engine(
@@ -133,8 +161,8 @@ pub(in crate::client_tun) async fn run_relay_thin(
     handle: SocketHandle,
     epoch: u64,
     stream: RelayStream,
-    rx: mpsc::Receiver<RelayCommand>,
-    back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
+    rx: crate::client_tun::uplink::Receiver,
+    back_tx: crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
     read_credit_rx: watch::Receiver<RelayReadCredit>,
 ) {
     run_relay_with_engine(
@@ -154,8 +182,8 @@ pub(in crate::client_tun) async fn run_relay_continuous(
     handle: SocketHandle,
     epoch: u64,
     stream: RelayStream,
-    rx: mpsc::Receiver<RelayCommand>,
-    back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
+    rx: crate::client_tun::uplink::Receiver,
+    back_tx: crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
     read_credit_rx: watch::Receiver<RelayReadCredit>,
 ) {
     run_relay_with_engine(
@@ -175,8 +203,8 @@ pub(in crate::client_tun) async fn run_relay_permit(
     handle: SocketHandle,
     epoch: u64,
     stream: RelayStream,
-    rx: mpsc::Receiver<RelayCommand>,
-    back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
+    rx: crate::client_tun::uplink::Receiver,
+    back_tx: crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
     read_credit_rx: watch::Receiver<RelayReadCredit>,
 ) {
     run_relay_with_engine(
@@ -196,8 +224,8 @@ pub(in crate::client_tun) async fn run_relay_ordered_egress_permit(
     handle: SocketHandle,
     epoch: u64,
     stream: RelayStream,
-    rx: mpsc::Receiver<RelayCommand>,
-    back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
+    rx: crate::client_tun::uplink::Receiver,
+    back_tx: crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
     read_credit_rx: watch::Receiver<RelayReadCredit>,
     queue_capacity_bytes: usize,
 ) {
@@ -218,8 +246,8 @@ pub(in crate::client_tun) async fn run_relay_with_engine(
     handle: SocketHandle,
     epoch: u64,
     stream: RelayStream,
-    rx: mpsc::Receiver<RelayCommand>,
-    back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
+    rx: crate::client_tun::uplink::Receiver,
+    back_tx: crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
     read_credit_rx: watch::Receiver<RelayReadCredit>,
     engine: TcpRelayEngine,
     ordered_egress_permit_queue_capacity_bytes: usize,
@@ -239,7 +267,7 @@ pub(in crate::client_tun) async fn run_relay_with_engine(
             handle,
             epoch,
             remote_reader,
-            back_tx: back_tx.clone(),
+            back_tx: ReaderOutput::Main(back_tx.clone()),
             read_credit_rx,
             signal_tx: reader_signal_tx,
             local_finish_seen: local_finish_seen.clone(),
@@ -516,7 +544,7 @@ impl GenericRelayMonitor {
 
     async fn run(
         &mut self,
-        back_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
+        back_tx: &crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
     ) -> (&'static str, &'static str) {
         let Self {
             signals,
@@ -673,479 +701,8 @@ impl GenericRelayMonitor {
     }
 }
 
-// Root-owned roles for the Generic/Legacy engine. Gates are opened only after the
-// original loop acknowledges publication. No detached outer task can certify joins.
-use super::relay_reader::{
-    PublishedReceipt, ReaderDiscardReceipt, ReaderOutcome, run_custodied_relay_reader_gated,
-};
-use super::relay_writer::{WriterDiscardReceipt, WriterOutcome, run_custodied_relay_writer_gated};
-use std::future::Future;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use tokio::sync::oneshot;
-
-enum Role<T> {
-    Empty,
-    Running(tokio::task::JoinHandle<T>),
-    Joined(T),
-    Failed(tokio::task::JoinError),
-}
-impl<T> Role<T> {
-    fn poll(&mut self, cx: &mut Context<'_>) {
-        if let Self::Running(task) = self {
-            match Pin::new(task).poll(cx) {
-                Poll::Ready(Ok(value)) => *self = Self::Joined(value),
-                Poll::Ready(Err(error)) => *self = Self::Failed(error),
-                Poll::Pending => {}
-            }
-        }
-    }
-}
-
-struct MonitorOutcome {
-    monitor: GenericRelayMonitor,
-    reason: (&'static str, &'static str),
-    panics: [Option<Box<dyn std::any::Any + Send>>; 2],
-    closed: bool,
-    drained: [bool; 2],
-    discarded: [usize; 2],
-    in_flight: bool,
-    started: bool,
-    back: Option<mpsc::Sender<(SocketHandle, RelayEvent)>>,
-}
-
-async fn run_custodied_monitor(
-    mut monitor: GenericRelayMonitor,
-    back: mpsc::Sender<(SocketHandle, RelayEvent)>,
-    mut stop: oneshot::Receiver<()>,
-    gate: oneshot::Receiver<()>,
-) -> MonitorOutcome {
-    let started = gate.await.is_ok();
-    let mut work = Box::pin(monitor.run(&back));
-    let result = if !started {
-        Ok(("root", "gate_cancelled"))
-    } else {
-        tokio::select! {
-            biased;
-            _ = &mut stop => Ok(("root", "stop")),
-            result = std::future::poll_fn(|cx| match catch_unwind(AssertUnwindSafe(|| work.as_mut().poll(cx))) {
-                Ok(Poll::Pending) => Poll::Pending,
-                Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
-                Err(panic) => Poll::Ready(Err(panic)),
-            }) => result,
-        }
-    };
-    let drop_panic = catch_unwind(AssertUnwindSafe(|| drop(work))).err();
-    let (reason, body_panic) = match result {
-        Ok(reason) => (reason, None),
-        Err(panic) => (("root", "monitor_panic"), Some(panic)),
-    };
-    MonitorOutcome {
-        monitor,
-        reason,
-        panics: [body_panic, drop_panic],
-        closed: false,
-        drained: [false; 2],
-        discarded: [0; 2],
-        in_flight: false,
-        started,
-        back: Some(back),
-    }
-}
-
-impl MonitorOutcome {
-    fn dispose(&mut self, cx: &mut Context<'_>) {
-        if self.in_flight {
-            return;
-        }
-        self.in_flight = true;
-        drop(self.back.take());
-        let signals = &mut self.monitor.signals;
-        if !self.closed {
-            signals.writer_signal_rx.close();
-            signals.reader_signal_rx.close();
-            self.closed = true;
-        }
-        for _ in 0..32 {
-            match signals.writer_signal_rx.poll_recv(cx) {
-                Poll::Ready(Some(_)) => {
-                    let Some(count) = self.discarded[0].checked_add(1) else {
-                        return;
-                    };
-                    self.discarded[0] = count;
-                }
-                Poll::Ready(None) => {
-                    self.drained[0] = true;
-                    break;
-                }
-                Poll::Pending => break,
-            }
-        }
-        for _ in 0..32 {
-            match signals.reader_signal_rx.poll_recv(cx) {
-                Poll::Ready(Some(_)) => {
-                    let Some(count) = self.discarded[1].checked_add(1) else {
-                        return;
-                    };
-                    self.discarded[1] = count;
-                }
-                Poll::Ready(None) => {
-                    self.drained[1] = true;
-                    break;
-                }
-                Poll::Pending => break,
-            }
-        }
-        self.in_flight = false;
-    }
-}
-
-pub(super) struct FlowRoles {
-    failures: FailureClock,
-    prepared: Option<GenericLaunchRequest>,
-    writer: Role<WriterOutcome>,
-    reader: Role<ReaderOutcome>,
-    monitor: Role<MonitorOutcome>,
-    starts: [Option<oneshot::Sender<()>>; 3],
-    stops: [Option<oneshot::Sender<()>>; 3],
-    pub(super) writer_receipt: Option<WriterDiscardReceipt>,
-    pub(super) reader_receipt: Option<ReaderDiscardReceipt>,
-    #[cfg(test)]
-    publication_probe: Option<Arc<super::receive_window::PublicationProbe>>,
-    started: bool,
-    stopping: bool,
-    preparation_interrupted: bool,
-    pub(super) panic: Option<Box<dyn std::any::Any + Send>>,
-}
-impl FlowRoles {
-    pub(super) fn new(request: GenericLaunchRequest) -> Self {
-        Self {
-            failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            prepared: Some(request),
-            writer: Role::Empty,
-            reader: Role::Empty,
-            monitor: Role::Empty,
-            starts: [None, None, None],
-            stops: [None, None, None],
-            writer_receipt: None,
-            reader_receipt: None,
-            #[cfg(test)]
-            publication_probe: None,
-            started: false,
-            stopping: false,
-            preparation_interrupted: false,
-            panic: None,
-        }
-    }
-
-    // Caller stores Self before invoking this preparation step.
-    pub(super) fn prepare(&mut self, window: super::receive_window::ReaderWindow) {
-        self.preparation_interrupted = true;
-        #[cfg(test)]
-        {
-            self.publication_probe = Some(window.probe());
-        }
-        let Some(request) = self.prepared.take() else {
-            return;
-        };
-        let GenericLaunchRequest {
-            engine,
-            handle,
-            epoch,
-            stream,
-            rx,
-            back_tx,
-            read_credit_rx,
-            ..
-        } = request;
-        if engine != TcpRelayEngine::Legacy {
-            return;
-        }
-        let (reader, writer) = tokio::io::split(stream);
-        let (writer_tx, writer_rx) = mpsc::channel(RELAY_CHANNEL_CAPACITY);
-        let (reader_tx, reader_rx) = mpsc::channel(RELAY_CHANNEL_CAPACITY);
-        let finish = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let signals = GenericRelaySignals {
-            handle,
-            epoch,
-            writer_signal_rx: writer_rx,
-            reader_signal_rx: reader_rx,
-            local_finish_seen: finish.clone(),
-            read_credit_probe_rx: read_credit_rx.clone(),
-        };
-        let now = tokio::time::Instant::now();
-        let diag_period = std::time::Duration::from_secs(RELAY_LIVE_DIAG_SECS);
-        let probe_period = std::time::Duration::from_millis(RELAY_REMOTE_READ_PROBE_INTERVAL_MS);
-        let mut diag_tick = tokio::time::interval_at(now + diag_period, diag_period);
-        diag_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut remote_read_probe_tick = tokio::time::interval_at(now + probe_period, probe_period);
-        remote_read_probe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let monitor = GenericRelayMonitor {
-            signals,
-            diag: RelayTaskDiag::default(),
-            close_timer: RelayCloseTimer::new(),
-            diag_tick,
-            remote_read_probe_tick,
-            published_hints: 0,
-            hint_in_flight: false,
-        };
-        let (start, gate) = oneshot::channel();
-        let (stop, stop_rx) = oneshot::channel();
-        self.starts[0] = Some(start);
-        self.stops[0] = Some(stop);
-        let writer_failures = Some(self.failures.clone());
-        self.writer = Role::Running(tokio::spawn(async move {
-            run_custodied_relay_writer_gated(
-                handle,
-                writer,
-                rx,
-                writer_tx,
-                stop_rx,
-                Some(gate),
-                writer_failures,
-            )
-            .await
-        }));
-        let (start, gate) = oneshot::channel();
-        let (stop, stop_rx) = oneshot::channel();
-        self.starts[1] = Some(start);
-        self.stops[1] = Some(stop);
-        let reader_request = ReaderRequest {
-            handle,
-            epoch,
-            remote_reader: reader,
-            back_tx: back_tx.clone(),
-            read_credit_rx,
-            signal_tx: reader_tx,
-            local_finish_seen: finish,
-            stop_rx,
-        };
-        let reader_failures = Some(self.failures.clone());
-        self.reader = Role::Running(tokio::spawn(async move {
-            run_custodied_relay_reader_gated(
-                reader_request,
-                Some(gate),
-                reader_failures,
-                Some(window),
-            )
-            .await
-        }));
-        let (start, gate) = oneshot::channel();
-        let (stop, stop_rx) = oneshot::channel();
-        self.starts[2] = Some(start);
-        self.stops[2] = Some(stop);
-        self.monitor = Role::Running(tokio::spawn(async move {
-            run_custodied_monitor(monitor, back_tx, stop_rx, gate).await
-        }));
-        self.preparation_interrupted = false;
-    }
-
-    pub(super) fn start(&mut self) {
-        if self.started {
-            return;
-        }
-        self.preparation_interrupted = true;
-        for gate in &mut self.starts {
-            if let Some(gate) = gate.take() {
-                let _ = gate.send(());
-            }
-        }
-        self.started = true;
-        self.preparation_interrupted = false;
-    }
-
-    pub(super) fn stop(&mut self) {
-        self.stopping = true;
-        for stop in &mut self.stops {
-            if let Some(stop) = stop.take() {
-                let _ = stop.send(());
-            }
-        }
-        if !self.started {
-            for gate in &mut self.starts {
-                drop(gate.take());
-            }
-        }
-    }
-
-    fn poll_handles(&mut self, cx: &mut Context<'_>) {
-        self.writer.poll(cx);
-        self.reader.poll(cx);
-        self.monitor.poll(cx);
-    }
-
-    /// A poisoned provider cannot be entered again; actual role joins still can.
-    /// Retain outcomes untouched (no remainder disposal) under this role owner.
-    pub(super) fn poll_fatal_joins(&mut self, cx: &mut Context<'_>) {
-        if self.panic.is_some() {
-            return;
-        }
-        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
-            self.stop();
-            self.poll_handles(cx);
-            if let Role::Joined(monitor) = &mut self.monitor {
-                if !monitor.closed {
-                    monitor.monitor.signals.writer_signal_rx.close();
-                    monitor.monitor.signals.reader_signal_rx.close();
-                    monitor.closed = true;
-                }
-            }
-        })) {
-            self.panic = Some(payload);
-        }
-    }
-
-    pub(super) fn poll(&mut self, cx: &mut Context<'_>, producer_stopped: bool) {
-        self.poll_handles(cx);
-        if self.stopping {
-            // Close real notification receivers first: a blocked terminal sender
-            // must be able to return before its actual JoinHandle can complete.
-            if let Role::Joined(monitor) = &mut self.monitor {
-                monitor.dispose(cx);
-            }
-            if !producer_stopped {
-                return;
-            }
-            if let Role::Joined(writer) = &mut self.writer {
-                if let Poll::Ready(receipt) = writer.remainder.poll_discard(cx, 32) {
-                    self.writer_receipt = Some(receipt);
-                }
-            }
-            if let Role::Joined(reader) = &mut self.reader {
-                self.reader_receipt = reader.remainder.discard_local();
-            }
-        }
-    }
-
-    pub(super) fn closed(&self) -> Option<(&'static str, &'static str)> {
-        match &self.monitor {
-            Role::Joined(outcome) => Some(outcome.reason),
-            Role::Failed(_) => Some(("root", "monitor_join_failed")),
-            _ if self.quarantined() => Some(("root", "role_quarantined")),
-            _ => None,
-        }
-    }
-
-    pub(super) fn published(&self) -> Option<PublishedReceipt> {
-        match &self.reader {
-            Role::Joined(outcome) => Some(outcome.remainder.published()),
-            _ => None,
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn test_queued_data(&self) -> Option<usize> {
-        self.publication_probe.as_ref()?.queued_lower_bound()
-    }
-
-    #[cfg(test)]
-    pub(super) fn test_outstanding_data(&self) -> Option<usize> {
-        self.publication_probe.as_ref()?.outstanding_lower_bound()
-    }
-
-    pub(super) fn read_total(&self) -> Option<usize> {
-        match &self.reader {
-            Role::Joined(outcome) => outcome.remainder.read_total(),
-            _ => None,
-        }
-    }
-
-    pub(super) fn published_hints(&self) -> Option<usize> {
-        match &self.monitor {
-            Role::Joined(outcome) => Some(outcome.monitor.published_hints),
-            _ => None,
-        }
-    }
-
-    pub(super) fn settled(&self) -> bool {
-        !self.quarantined()
-            && self.writer_receipt.is_some()
-            && self.reader_receipt.is_some()
-            && matches!(&self.monitor, Role::Joined(outcome) if outcome.drained == [true; 2])
-    }
-
-    pub(super) fn quarantined(&self) -> bool {
-        self.preparation_interrupted
-            || self.failures.load(std::sync::atomic::Ordering::SeqCst) == usize::MAX
-            || (self.started
-                && (matches!(&self.writer, Role::Joined(outcome) if !outcome.started)
-                    || matches!(&self.reader, Role::Joined(outcome) if !outcome.started)
-                    || matches!(&self.monitor, Role::Joined(outcome) if !outcome.started)))
-            || self.panic.is_some()
-            || matches!(self.writer, Role::Empty | Role::Failed(_))
-            || matches!(self.reader, Role::Empty | Role::Failed(_))
-            || matches!(self.monitor, Role::Empty | Role::Failed(_))
-            || matches!(&self.writer, Role::Joined(outcome) if outcome.panics.iter().any(Option::is_some) || outcome.remainder.quarantined())
-            || matches!(&self.reader, Role::Joined(outcome) if outcome.panics.iter().any(Option::is_some) || outcome.notification.in_flight || outcome.remainder.quarantined())
-            || matches!(&self.monitor, Role::Joined(outcome) if outcome.panics.iter().any(Option::is_some) || outcome.in_flight || outcome.monitor.hint_in_flight)
-    }
-
-    pub(super) fn join_count(&self) -> usize {
-        usize::from(matches!(self.writer, Role::Joined(_)))
-            + usize::from(matches!(self.reader, Role::Joined(_)))
-            + usize::from(matches!(self.monitor, Role::Joined(_)))
-    }
-
-    pub(super) fn running_count(&self) -> usize {
-        usize::from(matches!(self.writer, Role::Running(_)))
-            + usize::from(matches!(self.reader, Role::Running(_)))
-            + usize::from(matches!(self.monitor, Role::Running(_)))
-    }
-
-    pub(super) fn take_error(&mut self) -> Option<std::io::Error> {
-        let mut first = None;
-        if let Role::Joined(writer) = &self.writer {
-            if writer.result.failure.is_some() {
-                first = writer.error_order[0].map(|order| (order, 0));
-            }
-            if writer.result.shutdown_failure.is_some() {
-                if let Some(order) = writer.error_order[1] {
-                    if first.is_none_or(|(earlier, _)| order < earlier) {
-                        first = Some((order, 1));
-                    }
-                }
-            }
-        }
-        if let Role::Joined(reader) = &self.reader {
-            if reader.failure.is_some() {
-                if let Some(order) = reader.error_order {
-                    if first.is_none_or(|(earlier, _)| order < earlier) {
-                        first = Some((order, 2));
-                    }
-                }
-            }
-        }
-        match first?.1 {
-            0 => match &mut self.writer {
-                Role::Joined(value) => value.result.failure.take().map(|failure| failure.source),
-                _ => None,
-            },
-            1 => match &mut self.writer {
-                Role::Joined(value) => value.result.shutdown_failure.take(),
-                _ => None,
-            },
-            _ => match &mut self.reader {
-                Role::Joined(value) => value.failure.take(),
-                _ => None,
-            },
-        }
-    }
-}
-
-// Only failure paths allocate an ordinal; DATA processing never touches this clock.
-pub(super) type FailureClock = Arc<std::sync::atomic::AtomicUsize>;
-pub(super) fn stamp_failure(clock: &Option<FailureClock>) -> Option<usize> {
-    clock.as_ref().map(|clock| {
-        clock
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |value| value.checked_add(1),
-            )
-            .unwrap_or(usize::MAX)
-    })
-}
-
-#[cfg(test)]
-mod tests;
+pub(super) mod continuous;
+mod roles;
+pub(super) mod thin;
+pub(super) use roles::{FlowRoles, OriginalFailure};
+pub(in crate::client_tun) use roles::{FailureClock, stamp_failure};

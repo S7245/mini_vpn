@@ -105,6 +105,8 @@ async fn f_capacity_only_preparation_leaves_dirty_to_actual_tcp_effects() {
                     &mut failures,
                     "capacity_tracer",
                     Some(&dirty),
+                    #[cfg(all(test, feature = "harness"))]
+                    None,
                 )
                 .await;
                 assert!(

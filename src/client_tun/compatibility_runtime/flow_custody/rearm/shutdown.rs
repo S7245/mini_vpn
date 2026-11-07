@@ -4,10 +4,12 @@
 //! resets under the original deadline; DATA never enters this stop-only scan.
 //! Tests: local_reset/transaction children and compatibility_unadmitted_shutdown.
 
+use super::super::transaction::FLOW_SLOT_LIMIT;
 use super::*;
 
 const PHYSICAL_SCAN_PER_TURN: usize = 8;
 const MAX_PHYSICAL_SOCKETS: usize = 4352;
+const ROOT_SEEN_WORDS: usize = FLOW_SLOT_LIMIT.div_ceil(u64::BITS as usize);
 
 // A bare physical reset must never erase an unaccounted relay or owned resource.
 fn no_flow_resources_empty(ctx: &SocketCtx) -> bool {
@@ -46,19 +48,18 @@ fn physical_work(socket: &TcpSocket<'_>) -> bool {
         || socket.recv_queue() != 0
 }
 
+fn physical_endpoint(socket: &TcpSocket<'_>, ctx: &SocketCtx) -> bool {
+    ctx.local_port != 0
+        && socket.local_endpoint().is_none_or(|local| local.port == ctx.local_port)
+}
+
 fn physical_identity(
     handle: SocketHandle,
     socket: &TcpSocket<'_>,
     ctx: &SocketCtx,
     opens: &super::super::transaction::OpenCustody,
 ) -> bool {
-    if ctx.local_port == 0
-        || socket
-            .local_endpoint()
-            .is_some_and(|local| local.port != ctx.local_port)
-    {
-        return false;
-    }
+    if !physical_endpoint(socket, ctx) { return false; }
     match &ctx.flow_mirror {
         Some(mirror) => {
             ctx.local_reset.is_none()
@@ -69,6 +70,11 @@ fn physical_identity(
         None => no_flow_resources_empty(ctx),
     }
 }
+
+/// D64: periodic full census cadence while live flows remain (was 5 ms, which
+/// cost ≈0.09 of a debug core on a held drain).
+pub(in crate::client_tun) const SHUTDOWN_CENSUS_CADENCE: std::time::Duration =
+    std::time::Duration::from_millis(50);
 
 impl OpenDispatch {
     pub(in crate::client_tun) fn drain_shutdown_physical(
@@ -106,11 +112,7 @@ impl OpenDispatch {
                 let opens = owner.opens();
                 physical_identity(handle, socket, ctx, &opens)
                     && (ctx.flow_mirror.is_some()
-                        || !opens
-                            .slots
-                            .iter()
-                            .flatten()
-                            .any(|slot| slot.handle == handle))
+                        || !opens.slots.occupied().any(|slot| slot.handle == handle))
             };
             if !consistent {
                 if let Some(mirror) = &mut ctx.flow_mirror {
@@ -125,6 +127,26 @@ impl OpenDispatch {
         }
     }
 
+    /// Schedule the original full bidirectional check at stop, every
+    /// `SHUTDOWN_CENSUS_CADENCE` while flows are live (D64: a live flow cannot
+    /// complete, so the cadence only bounds detection latency), and every turn
+    /// once the live count is zero.
+    pub(in crate::client_tun) fn flow_shutdown_census_candidate(
+        &self,
+        last: Option<tokio::time::Instant>,
+        now: tokio::time::Instant,
+    ) -> bool {
+        if !self.flow_draining() {
+            return false;
+        }
+        last.is_none_or(|previous| {
+            now.saturating_duration_since(previous) >= SHUTDOWN_CENSUS_CADENCE
+        }) || self
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner.opens().live == 0)
+    }
+
     pub(in crate::client_tun) fn flow_shutdown_complete(
         &self,
         sockets: &SocketSet<'_>,
@@ -137,40 +159,89 @@ impl OpenDispatch {
         if !self.flow_draining() {
             return false;
         }
+        #[cfg(all(test, feature = "harness"))]
+        if let Some(bridge) = &self.relay_event_test_bridge {
+            bridge.observe_egress_shutdown(contexts);
+        }
+        #[cfg(test)]
+        let sampled = owner
+            .shutdown_census_runs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % 64
+            == 0;
+        #[cfg(test)]
+        let started = sampled.then(std::time::Instant::now);
         let mut opens = owner.opens();
+        #[cfg(test)]
+        let locked = started.map(|_| std::time::Instant::now());
         let leases = pool.audit_checked_leases(
             contexts
                 .values()
                 .filter_map(|ctx| ctx.flow_mirror.as_ref())
                 .filter_map(|mirror| mirror.live_lease()),
         );
-        let mut tcp_count = 0;
-        let mut consistent = true;
+        #[cfg(test)]
+        let leases_done = started.map(|_| std::time::Instant::now());
+        // Count the complete physical set independently. Every context below
+        // must inject into its own checked TCP slot; equal cardinality proves
+        // reverse coverage, including extra sockets with no context.
+        let (tcp_count, all_tcp) = sockets.iter().fold((0usize, true), |(count, valid), (_, socket)| {
+            match socket {
+                smoltcp::socket::Socket::Tcp(_) => (count + 1, valid),
+                _ => (count, false),
+            }
+        });
+        let mut consistent = opens.slots.len() == FLOW_SLOT_LIMIT && all_tcp;
         let mut pending = false;
-        for (handle, socket) in sockets.iter() {
-            let smoltcp::socket::Socket::Tcp(socket) = socket else {
+        // One-call scratch, never a cached certificate. The original root lock
+        // and exclusive contexts borrow cover both directions of this census.
+        let mut root_seen = [0u64; ROOT_SEEN_WORDS];
+        for (&handle, ctx) in contexts.iter_mut() {
+            let Some(socket) = sockets.try_get::<TcpSocket>(handle) else {
+                // Preserve the original error-only reverse pass and its Q
+                // effects below; no unqualified context is reset or released.
                 consistent = false;
                 continue;
             };
-            tcp_count += 1;
-            let Some(ctx) = contexts.get_mut(&handle) else {
-                consistent = false;
-                continue;
-            };
-            if !physical_identity(handle, socket, ctx, &opens) {
-                consistent = false;
-                if let Some(mirror) = &mut ctx.flow_mirror {
+            let endpoint_matches = physical_endpoint(socket, ctx);
+            if let Some(mirror) = &mut ctx.flow_mirror {
+                // One immutable Root borrow and one receipt/epoch check feed
+                // both directions of this same census. matches_physical(id)
+                // proves outer handle/epoch plus the entire inner Flow id;
+                // repeating it with that already-equal inner id adds no fact.
+                let row = opens.slots.get(mirror.id.index).and_then(Option::as_ref)
+                    .filter(|slot| slot.matches_physical(mirror.id))
+                    .and_then(|slot| match &slot.phase {
+                        super::super::transaction::OpenPhase::Flow(flow) => Some(flow),
+                        _ => None,
+                    });
+                let epoch_matches = mirror.matches_epoch(ctx.conn_epoch);
+                if !endpoint_matches || ctx.local_reset.is_some()
+                    || mirror.id.handle != handle || !epoch_matches || row.is_none()
+                {
+                    consistent = false;
                     mirror.quarantined = true;
                 }
-            }
-            if let Some(mirror) = &mut ctx.flow_mirror {
-                if mirror
-                    .live_lease()
-                    .is_some_and(|lease| !leases.accepts(lease))
-                {
+                if mirror.live_lease().is_some_and(|lease| !leases.accepts(lease)) {
                     mirror.quarantined = true;
                     consistent = false;
                 }
+                let valid = row.is_some_and(|flow| {
+                    let valid = epoch_matches && !mirror.quarantined
+                        && (ctx.conn_epoch != flow.id.epoch
+                            || flow.fake_ip == mirror.live_lease().map(|lease| lease.receipt()));
+                    if !valid { mirror.quarantined = true; }
+                    valid
+                });
+                if valid {
+                    let bit = 1u64 << (mirror.id.index % u64::BITS as usize);
+                    match root_seen.get_mut(mirror.id.index / u64::BITS as usize) {
+                        Some(word) if *word & bit == 0 => *word |= bit,
+                        _ => consistent = false,
+                    }
+                }
+            } else {
+                consistent &= endpoint_matches && no_flow_resources_empty(ctx);
             }
             if let Some(reset) = &ctx.local_reset {
                 pending = true;
@@ -178,6 +249,8 @@ impl OpenDispatch {
             }
             pending |= ctx.flow_mirror.is_none() && physical_work(socket);
         }
+        #[cfg(test)]
+        let sockets_done = started.map(|_| std::time::Instant::now());
         consistent &= tcp_count == contexts.len() && tcp_count <= MAX_PHYSICAL_SOCKETS;
         if !consistent {
             // Error-only reverse physical lookup; never allocate this on DATA
@@ -195,43 +268,56 @@ impl OpenDispatch {
             }
             for (handle, ctx) in contexts.iter_mut() {
                 // An overflowing inventory is uncertain, never clean zero.
-                if !bounded || !handles.contains(handle) {
+                if !bounded || !handles.contains(handle) || sockets.try_get::<TcpSocket>(*handle).is_none() {
                     if let Some(mirror) = &mut ctx.flow_mirror {
                         mirror.quarantined = true;
                     }
                 }
             }
         }
+        // Freeze the physical result before root checks can add a failure. The
+        // error-only reverse pass above may have newly quarantined mirrors, so
+        // that path MUST re-run the original context check, not trust old bits.
+        let physical_consistent = consistent;
         // Validate every actual row even after an earlier physical failure.
         // A corrupt inner handle is used only to inspect, never to mutate a peer.
-        for (index, slot) in opens.slots.iter_mut().enumerate() {
-            let Some(slot) = slot else { continue };
-            let valid = match &slot.phase {
-                super::super::transaction::OpenPhase::Flow(flow) => {
-                    flow.id.index == index
-                        && slot.matches_physical(flow.id)
-                        && contexts.get_mut(&flow.id.handle).is_some_and(|ctx| {
-                            let Some(mirror) = &mut ctx.flow_mirror else {
-                                return false;
-                            };
-                            if !mirror.matches_slot(slot) {
-                                return false;
-                            }
-                            // Only a proven retained receipt permits advanced
-                            // epoch and no live lease. Original epoch needs the
-                            // original row's exact acquisition capability.
-                            let valid = mirror.matches_epoch(ctx.conn_epoch)
-                                && !mirror.quarantined
-                                && (ctx.conn_epoch != flow.id.epoch
-                                    || flow.fake_ip
-                                        == mirror.live_lease().map(|lease| lease.receipt()));
-                            if !valid {
-                                mirror.quarantined = true;
-                            }
-                            valid
-                        })
+        // D62: the occupancy index is part of the census, both directions.
+        if !opens.slots.occupancy_consistent() {
+            consistent = false;
+        }
+        for (index, slot) in opens.slots.occupied_mut() {
+            let valid = if physical_consistent {
+                root_seen
+                    .get(index / u64::BITS as usize)
+                    .is_some_and(|word| *word & (1u64 << (index % u64::BITS as usize)) != 0)
+            } else {
+                match &slot.phase {
+                    super::super::transaction::OpenPhase::Flow(flow) => {
+                        flow.id.index == index
+                            && slot.matches_physical(flow.id)
+                            && contexts.get_mut(&flow.id.handle).is_some_and(|ctx| {
+                                let Some(mirror) = &mut ctx.flow_mirror else {
+                                    return false;
+                                };
+                                if !mirror.matches_slot(slot) {
+                                    return false;
+                                }
+                                // Only a proven retained receipt permits advanced
+                                // epoch and no live lease. Original epoch needs the
+                                // original row's exact acquisition capability.
+                                let valid = mirror.matches_epoch(ctx.conn_epoch)
+                                    && !mirror.quarantined
+                                    && (ctx.conn_epoch != flow.id.epoch
+                                        || flow.fake_ip
+                                            == mirror.live_lease().map(|lease| lease.receipt()));
+                                if !valid {
+                                    mirror.quarantined = true;
+                                }
+                                valid
+                            })
+                    }
+                    _ => false,
                 }
-                _ => false,
             };
             if !valid {
                 consistent = false;
@@ -240,19 +326,55 @@ impl OpenDispatch {
                 }
             }
         }
+        #[cfg(test)]
+        let reverse_done = started.map(|_| std::time::Instant::now());
         let physical = leases.complete() && consistent;
-        if !physical {
+        let root_consistent = opens.audit_flows();
+        #[cfg(test)]
+        let cost = if let (
+            Some(started),
+            Some(locked),
+            Some(leases_done),
+            Some(sockets_done),
+            Some(reverse_done),
+        ) = (started, locked, leases_done, sockets_done, reverse_done)
+        {
+            Some((
+                locked.duration_since(started),
+                leases_done.duration_since(locked),
+                sockets_done.duration_since(leases_done),
+                reverse_done.duration_since(sockets_done),
+                reverse_done.elapsed(),
+            ))
+        } else {
+            None
+        };
+        if !physical || !root_consistent {
             owner.ledger().quarantined = true;
         }
-        opens
+        let complete = opens
             .flow
             .as_ref()
             .is_some_and(|a| a.identity_fault.is_none())
             && physical
+            && root_consistent
             && !pending
             && opens.live == 0
-            && opens.audit_flows()
-            && !owner.ledger().quarantined
+            && !owner.ledger().quarantined;
+        #[cfg(test)]
+        {
+            drop(opens);
+            if let Some((lock, lease, sockets, reverse, root)) = cost {
+                println!(
+                    "B826 CensusCost session={} run={} lock={lock:?} lease={lease:?} sockets={sockets:?} reverse={reverse:?} root={root:?}",
+                    Arc::as_ptr(owner) as usize,
+                    owner
+                        .shutdown_census_runs
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                );
+            }
+        }
+        complete
     }
 }
 

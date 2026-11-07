@@ -84,6 +84,14 @@ pub(in crate::client_tun) struct RearmIntent {
 }
 
 impl RearmIntent {
+    fn reason_for_d16(self) -> Option<(&'static str, &'static str)> {
+        match self.kind {
+            RearmKind::Reasoned {
+                direction, reason, ..
+            } => Some((direction, reason)),
+            RearmKind::BarePhysical => None,
+        }
+    }
     fn bind(mut self, ctx: Option<&SocketCtx>) -> Self {
         self.flow = ctx
             .and_then(|ctx| ctx.flow_mirror.as_ref())
@@ -177,7 +185,32 @@ fn request_close_or_rearm(gate: RearmGate<'_>, mut disposition: RearmDisposition
         RearmDisposition::Execute(request) => request.intent,
     };
     if let RearmGate::OriginalLoop(dispatch) = gate {
-        if dispatch.request_flow_close(intent.handle, intent.epoch, intent.flow) {
+        let terminal_ctx = match &mut disposition {
+            RearmDisposition::Execute(request) => match request.intent.kind {
+                RearmKind::Reasoned {
+                    direction,
+                    reason,
+                    snapshot: _,
+                } => {
+                    let snapshot = SocketCloseSnapshot::from_socket(request.socket);
+                    d16_dead_socket_preclear_witness(snapshot)
+                        .then(|| {
+                            d16_terminal_cause_for_rearm(request.ctx, snapshot, direction, reason)
+                                .map(|cause| (&mut *request.ctx, cause))
+                        })
+                        .flatten()
+                }
+                RearmKind::BarePhysical => None,
+            },
+            RearmDisposition::Gate(_) => None,
+        };
+        if dispatch.request_flow_close(
+            intent.handle,
+            intent.epoch,
+            intent.flow,
+            intent.reason_for_d16(),
+            terminal_ctx,
+        ) {
             return;
         }
     }
@@ -190,6 +223,9 @@ fn request_close_or_rearm(gate: RearmGate<'_>, mut disposition: RearmDisposition
         _ => None,
     };
     if let RearmDisposition::Execute(request) = &mut disposition {
+        if !request.ctx.preflight_downlink_clear() {
+            return;
+        }
         if (flow_mode || request.ctx.local_reset.is_some())
             && !LocalReset::prepare(request.ctx, request.socket, deadline)
         {
@@ -206,6 +242,10 @@ fn request_close_or_rearm(gate: RearmGate<'_>, mut disposition: RearmDisposition
             execute_legacy_physical_rearm(request, authorization);
         }
     }
+}
+
+fn d16_dead_socket_preclear_witness(snapshot: SocketCloseSnapshot) -> bool {
+    snapshot.tcp_state == TcpState::Closed && !snapshot.active && !snapshot.can_send
 }
 
 fn execute_legacy_physical_rearm(
@@ -347,6 +387,9 @@ fn physical_rearm(
     ctx.local_fin_pending_since_secs = None;
     ctx.local_fin_last_remote_progress_secs = None;
     ctx.clear_downlink_pending();
+    if !ctx.downlink_inflight_permits.is_empty() {
+        return;
+    }
     ctx.pending_relay_close = None;
     ctx.pending_relay_close_since_secs = None;
     ctx.pending_relay_close_last_progress_secs = None;
@@ -453,6 +496,25 @@ fn reap_dead_slots_with_gate(
         let intent =
             RearmIntent::reasoned(handle, epoch, "local", "dead_slot_reap", Some(snapshot));
         let intent = intent.bind(socket_ctxs.get(&handle));
+        if plan.should_reap
+            && socket_ctxs
+                .get(&handle)
+                .is_some_and(|ctx| ctx.flow_mirror.is_some() && ctx.d16_downlink_queue.is_some())
+        {
+            if let Some(ctx) = socket_ctxs.get_mut(&handle) {
+                request_close_or_rearm(
+                    gate,
+                    RearmDisposition::Execute(RearmRequest::new(
+                        intent,
+                        sockets.get_mut::<TcpSocket>(handle),
+                        ctx,
+                        fake_pool,
+                        now_secs,
+                    )),
+                );
+            }
+            continue;
+        }
         if plan.should_reap && !gate_legacy_rearm(gate, intent) {
             continue;
         }
@@ -731,7 +793,13 @@ pub(in crate::client_tun) fn legacy_bare_rearm_from_loop(
 
 pub(in crate::client_tun) fn gate_legacy_rearm(gate: RearmGate<'_>, intent: RearmIntent) -> bool {
     if let RearmGate::OriginalLoop(dispatch) = gate {
-        if dispatch.request_flow_close(intent.handle, intent.epoch, intent.flow) {
+        if dispatch.request_flow_close(
+            intent.handle,
+            intent.epoch,
+            intent.flow,
+            intent.reason_for_d16(),
+            None,
+        ) {
             return false;
         }
     }
@@ -831,6 +899,8 @@ pub(in crate::client_tun) use physical_flow::{
 };
 
 mod local_reset;
-pub(in crate::client_tun) use local_reset::{LocalReset, flush_tx_and_release_downlink_permits};
+pub(in crate::client_tun) use local_reset::{
+    LocalReset, ResetProof, flush_tx_and_release_downlink_permits, poll_egress_cycle,
+};
 
 mod shutdown;

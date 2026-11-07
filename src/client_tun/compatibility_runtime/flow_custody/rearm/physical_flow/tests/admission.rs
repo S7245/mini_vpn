@@ -201,7 +201,7 @@ async fn failed_checked_admission_preserves_rx_and_nonzero_custody_without_retry
     })
     .await
     .unwrap();
-    let (global_tx, _global_rx) = mpsc::channel(4);
+    let (global_tx, _global_rx) = crate::client_tun::relay_channel::channel(4);
     let (owned_action_tx, _owned_rx) = mpsc::channel(4);
     crate::client_tun::HandshakeCompletion::from_loop(
         &dispatch,
@@ -280,7 +280,7 @@ async fn flow_and_local_reset_conflict_retains_both_physical_owners() {
         server.sockets.get_mut::<TcpSocket>(handle),
         None
     ));
-    let (global_tx, _global_rx) = mpsc::channel(4);
+    let (global_tx, _global_rx) = crate::client_tun::relay_channel::channel(4);
     let (owned_action_tx, _owned_rx) = mpsc::channel(4);
     for _ in 0..2 {
         let mut completion = crate::client_tun::HandshakeCompletion {

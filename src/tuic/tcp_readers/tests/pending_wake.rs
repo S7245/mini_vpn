@@ -222,69 +222,6 @@ async fn direct_native_all_terminal_paths_cancel_but_empty_chunk_does_not() {
     }
 }
 
-struct ChunkSequence(std::collections::VecDeque<io::Result<Option<NativeTcpChunk>>>);
-
-#[async_trait::async_trait]
-impl TuicOrderedNativeChunkSource for ChunkSequence {
-    async fn read_ordered_native_chunk(&mut self, _: usize) -> io::Result<Option<NativeTcpChunk>> {
-        match self.0.pop_front() {
-            Some(result) => result,
-            None => std::future::pending().await,
-        }
-    }
-}
-
-#[tokio::test(start_paused = true)]
-async fn pump_native_immediate_and_buffered_terminals_cancel_owned_wake() {
-    for buffered in [false, true] {
-        for outcome in [ReadOutcome::Eof, ReadOutcome::Error] {
-            let mut items = std::collections::VecDeque::new();
-            if buffered {
-                items.push_back(ReadOutcome::Data.chunk());
-            }
-            items.push_back(outcome.chunk());
-            let expected = items.len();
-            let mut reader = TuicNativeOrderedPumpReader::spawn_from_source(
-                ChunkSequence(items),
-                lease(),
-                None,
-                None,
-            );
-            for _ in 0..8 {
-                if reader.rx.len() == expected {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-            assert_eq!(
-                reader.rx.len(),
-                expected,
-                "real pump must publish actual source outcomes"
-            );
-            let (count, waker) = counter();
-            let mut cx = Context::from_waker(&waker);
-            if buffered {
-                reader.arm_pending_self_wake(&mut cx, tokio::time::Instant::now().into_std());
-                assert!(reader.poll_read_chunk(&mut cx, 8).is_ready());
-                assert!(
-                    reader.pending_self_wake.deadline().is_none(),
-                    "data progress cancels"
-                );
-                assert!(reader.pending_eof || reader.pending_error.is_some());
-            }
-            reader.arm_pending_self_wake(&mut cx, tokio::time::Instant::now().into_std());
-            assert!(reader.poll_read_chunk(&mut cx, 8).is_ready());
-            assert!(reader.pending_self_wake.deadline().is_none());
-            (&mut reader.task)
-                .await
-                .expect("terminal source ends the actual pump");
-            drop(reader);
-            tick().await;
-            assert_eq!(count.0.load(Ordering::SeqCst), 0);
-        }
-    }
-}
-
 #[tokio::test]
 async fn real_unordered_reader_arms_from_transport_then_clears_data_eof_and_reset() {
     let (server, client, addr) = crate::tuic::d16_quinn_test_endpoints();
@@ -347,6 +284,7 @@ async fn real_unordered_reader_arms_from_transport_then_clears_data_eof_and_rese
             1 => assert!(result.unwrap().is_none()),
             _ => assert!(result.is_err()),
         }
+        assert_eq!(reader.source_read_bytes(), Some(usize::from(kind == 0)));
         assert!(reader.pending_self_wake.deadline().is_none());
         drop(reader);
         assert!(

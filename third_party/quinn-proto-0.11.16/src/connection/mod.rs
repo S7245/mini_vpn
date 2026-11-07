@@ -1,6 +1,5 @@
 use std::{
     cmp,
-    collections::VecDeque,
     convert::TryFrom,
     fmt, io, mem,
     net::{IpAddr, SocketAddr},
@@ -9,7 +8,7 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
-use frame::StreamMetaVec;
+use control_inventory::records::{PreparedStreams, StreamFrames};
 
 use rand::{rngs::StdRng, RngExt, SeedableRng};
 use thiserror::Error;
@@ -20,13 +19,12 @@ use crate::{
     cid_queue::CidQueue,
     coding::BufMutExt,
     config::{ServerConfig, TransportConfig},
-    crypto::{self, KeyPair, Keys, PacketKey},
+    crypto::{self, KeyPair, PacketKey},
     frame::{self, Close, Datagram, FrameStruct, NewConnectionId, NewToken},
     packet::{
         FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket, LongType, Packet,
         PacketNumber, PartialDecode, SpaceId,
     },
-    range_set::ArrayRangeSet,
     shared::{
         ConnectionEvent, ConnectionEventInner, ConnectionId, DatagramConnectionEvent, EcnCodepoint,
         EndpointEvent, EndpointEventInner,
@@ -38,13 +36,21 @@ use crate::{
     MIN_INITIAL_SIZE, TIMER_GRANULARITY,
 };
 
+mod application_events;
+use application_events::QueuedEvent;
 mod ack_frequency;
 use ack_frequency::AckFrequencyState;
 
 mod assembler;
 pub use assembler::Chunk;
 
+pub(crate) mod cid_frames;
+mod cold_inventory;
+mod endpoint_reply;
+pub(crate) use cold_inventory::ColdResources;
+pub(crate) use endpoint_reply::PreparedReply;
 mod cid_state;
+pub(crate) mod event_inventory;
 use cid_state::CidState;
 
 mod datagrams;
@@ -70,8 +76,12 @@ mod packet_builder;
 use packet_builder::PacketBuilder;
 
 mod packet_crypto;
+mod key_update;
+mod control_frames;
+mod receive_packet;
 use packet_crypto::{PrevCrypto, ZeroRttCrypto};
 
+mod migration_disposal;
 mod paths;
 pub use paths::RttEstimator;
 use paths::{PathData, PathResponses};
@@ -79,13 +89,22 @@ use paths::{PathData, PathResponses};
 pub(crate) mod qlog;
 
 mod send_buffer;
+mod storage;
 
+mod cid_retirement;
+mod control_inventory;
+mod crypto_output;
 mod spaces;
 #[cfg(fuzzing)]
-pub use spaces::Retransmits;
+pub use control_inventory::Retransmits;
 #[cfg(not(fuzzing))]
-use spaces::Retransmits;
-use spaces::{PacketNumberFilter, PacketSpace, SendableFrames, SentPacket, ThinRetransmits};
+use control_inventory::Retransmits;
+use control_inventory::ThinRetransmits;
+use spaces::{PacketNumberFilter, PacketSpace, SendableFrames};
+mod sent_history;
+#[cfg(feature = "sent-history-observe")]
+pub use sent_history::observe as sent_history_observe;
+use sent_history::{PacketClass, PacketPermit, RecoveryKind, ReserveError, SentPacket};
 
 mod stats;
 pub use stats::{ConnectionStats, FrameStats, PathStats, UdpStats};
@@ -131,6 +150,7 @@ pub enum SuccessorServiceTurnStartError {
     Busy,
     NotEstablished,
     ZeroWindow,
+    Admission(bytes::MeteredCopyError),
 }
 
 #[derive(Debug)]
@@ -228,7 +248,7 @@ pub use streams::StreamsState;
 #[cfg(not(fuzzing))]
 use streams::StreamsState;
 pub use streams::{
-    Chunks, ClosedStream, FinishError, ReadError, ReadableError, RecvStream, RecvStreamProgress,
+    Chunks, ClosedStream, FinishError, PriorityError, ReadError, ReadableError, RecvStream, RecvStreamProgress,
     SendStream, SendStreamProgress, ShouldTransmit, StreamEvent, Streams, WriteError, Written,
 };
 
@@ -276,6 +296,8 @@ use timer::{Timer, TimerTable};
 /// call to [`handle_event`](Self::handle_event) at that same instant; however
 /// events or timeouts with different instants must not be interleaved.
 pub struct Connection {
+    #[cfg(test)]
+    crypto_barriers: [usize; 3],
     endpoint_config: Arc<EndpointConfig>,
     endpoint_pacing: Option<ConnectionEndpointPacing>,
     config: Arc<TransportConfig>,
@@ -298,6 +320,7 @@ pub struct Connection {
     prev_path: Option<(ConnectionId, PathData)>,
     state: State,
     side: ConnectionSide,
+    registration_key: Option<crate::RegistrationKey>,
     /// Whether or not 0-RTT was enabled during the handshake. Does not imply acceptance.
     zero_rtt_enabled: bool,
     /// Set if 0-RTT is supported, then cleared when no longer needed.
@@ -314,8 +337,8 @@ pub struct Connection {
     /// The value that the server included in the Source Connection ID field of a Retry packet, if
     /// one was received
     retry_src_cid: Option<ConnectionId>,
-    events: VecDeque<Event>,
-    endpoint_events: VecDeque<EndpointEventInner>,
+    events: application_events::Queue,
+    endpoint_events: event_inventory::EventInventory,
     /// Whether the spin bit is in use for this connection
     spin_enabled: bool,
     /// Outgoing spin bit state
@@ -341,6 +364,8 @@ pub struct Connection {
     authentication_failures: u64,
     /// Why the connection was lost, if it has been
     error: Option<ConnectionError>,
+    #[cfg(test)]
+    history_rejection: Option<(SpaceId, u64, u64, usize)>,
     /// Identifies Data-space packet numbers to skip. Not used in earlier spaces.
     packet_number_filter: PacketNumberFilter,
 
@@ -387,11 +412,18 @@ pub struct Connection {
     stats: ConnectionStats,
     /// QUIC version used for the connection.
     version: u32,
+    prepared_disposal: Option<crate::endpoint::ConnectionDisposal>,
 }
 
 impl Connection {
+    /// Receive backing authority configured for this connection's endpoint.
+    #[doc(hidden)]
+    pub fn receive_backing_meter(&self) -> Option<bytes::BackingMeter> {
+        self.endpoint_config.receive_backing_meter.clone()
+    }
     pub(crate) fn new(
         endpoint_config: Arc<EndpointConfig>,
+        cold: ColdResources,
         endpoint_pacing: Option<ConnectionEndpointPacing>,
         config: Arc<TransportConfig>,
         init_cid: ConnectionId,
@@ -406,12 +438,30 @@ impl Connection {
         allow_mtud: bool,
         rng_seed: [u8; 32],
         side_args: SideArgs,
-    ) -> Self {
+    ) -> Result<Self, TransportError> {
+        let [initial_history, handshake_history, data_history] = cold.packets;
+        let [initial_ranges, handshake_ranges, data_ranges] = cold.ack_ranges;
+        let mut data_space = PacketSpace::new(now);
+        data_space.sent_packets = data_history;
+        data_space.pending = Retransmits::with_records(
+            cold.records.as_ref(),
+            control_inventory::records::CreditKey::pending(SpaceId::Data),
+        );
+        data_space.pending_acks = spaces::PendingAcks::with_ranges(data_ranges);
+        data_space.pending_cids = cid_frames::Frames::empty(cold.cids.as_ref());
+        let endpoint_events = cold.events;
         let pref_addr_cid = side_args.pref_addr_cid();
         let path_validated = side_args.path_validated();
-        let connection_side = ConnectionSide::from(side_args);
+        let connection_side =
+            ConnectionSide::prepare(side_args, endpoint_config.receive_backing_meter.as_ref())?;
         let side = connection_side.side();
         let initial_space = PacketSpace {
+            sent_packets: initial_history,
+            pending: Retransmits::with_records(
+                cold.records.as_ref(),
+                control_inventory::records::CreditKey::pending(SpaceId::Initial),
+            ),
+            pending_acks: spaces::PendingAcks::with_ranges(initial_ranges),
             crypto: Some(crypto.initial_keys(&init_cid, side)),
             ..PacketSpace::new(now)
         };
@@ -421,18 +471,22 @@ impl Connection {
             client_hello: None,
         });
         let mut rng = StdRng::from_seed(rng_seed);
+        let initial_cids = if pref_addr_cid.is_some() { 2 } else { 1 };
+        let local_cid_state = if cold.native_registration {
+            CidState::new_native(cid_gen.cid_len(), now, initial_cids)?
+        } else {
+            CidState::new(cid_gen.cid_len(), cid_gen.cid_lifetime(), now, initial_cids)
+        };
+        let stream_meter = endpoint_config.receive_backing_meter.clone();
+        let application_events = application_events::Queue::new(stream_meter.clone());
         let mut this = Self {
+            datagrams: DatagramState::new(endpoint_config.receive_backing_meter.clone()),
             endpoint_config,
             endpoint_pacing,
             crypto,
             handshake_cid: loc_cid,
             rem_handshake_cid: rem_cid,
-            local_cid_state: CidState::new(
-                cid_gen.cid_len(),
-                cid_gen.cid_lifetime(),
-                now,
-                if pref_addr_cid.is_some() { 2 } else { 1 },
-            ),
+            local_cid_state,
             path: PathData::new(remote, allow_mtud, None, 0, now, &config),
             path_counter: 0,
             allow_mtud,
@@ -440,6 +494,8 @@ impl Connection {
             prev_path: None,
             state,
             side: connection_side,
+            registration_key: cold.registration_key,
+            prepared_disposal: None,
             zero_rtt_enabled: false,
             zero_rtt_crypto: None,
             key_phase: false,
@@ -454,11 +510,23 @@ impl Connection {
             orig_rem_cid: rem_cid,
             initial_dst_cid: init_cid,
             retry_src_cid: None,
-            events: VecDeque::new(),
-            endpoint_events: VecDeque::new(),
+            events: application_events,
+            endpoint_events,
             spin_enabled: config.allow_spin && rng.random_ratio(7, 8),
             spin: false,
-            spaces: [initial_space, PacketSpace::new(now), PacketSpace::new(now)],
+            spaces: [
+                initial_space,
+                PacketSpace {
+                    sent_packets: handshake_history,
+                    pending: Retransmits::with_records(
+                        cold.records.as_ref(),
+                        control_inventory::records::CreditKey::pending(SpaceId::Handshake),
+                    ),
+                    pending_acks: spaces::PendingAcks::with_ranges(handshake_ranges),
+                    ..PacketSpace::new(now)
+                },
+                data_space,
+            ],
             highest_space: SpaceId::Initial,
             prev_crypto: None,
             next_crypto: None,
@@ -471,6 +539,8 @@ impl Connection {
             timers: TimerTable::default(),
             authentication_failures: 0,
             error: None,
+            #[cfg(test)]
+            history_rejection: None,
             #[cfg(test)]
             packet_number_filter: match config.deterministic_packet_numbers {
                 false => PacketNumberFilter::new(&mut rng),
@@ -500,11 +570,13 @@ impl Connection {
                 config.send_window,
                 config.receive_window,
                 config.stream_receive_window,
+                stream_meter,
             ),
-            datagrams: DatagramState::default(),
             config,
             rem_cids: CidQueue::new(rem_cid),
             rng,
+            #[cfg(test)]
+            crypto_barriers: [0; 3],
             stats: ConnectionStats::default(),
             version,
         };
@@ -513,10 +585,10 @@ impl Connection {
         }
         if side.is_client() {
             // Kick off the connection
-            this.write_crypto();
+            this.write_crypto()?;
             this.init_0rtt();
         }
-        this
+        Ok(this)
     }
 
     #[cfg(test)]
@@ -591,15 +663,22 @@ impl Connection {
     /// Detach endpoint pacing state when the external connection driver is torn down.
     #[doc(hidden)]
     pub fn endpoint_pacing_detach(&mut self, now: Instant) -> bool {
-        let Some(mut pacing) = self.endpoint_pacing.take() else {
+        if self
+            .endpoint_pacing
+            .as_ref()
+            .is_some_and(ConnectionEndpointPacing::is_native)
+            && !self.is_drained()
+        {
+            return false;
+        }
+        let Some(pacing) = self.endpoint_pacing.as_mut() else {
             return false;
         };
-        let detached = pacing.detach(now).is_ok();
-        debug_assert!(
-            detached,
-            "endpoint pacing detach must match a live connection"
-        );
-        detached
+        if pacing.detach(now).is_err() {
+            return false;
+        }
+        self.endpoint_pacing.take();
+        true
     }
 
     fn endpoint_pacing_begin_transmit_poll(&self) -> bool {
@@ -649,6 +728,16 @@ impl Connection {
     }
 
     fn endpoint_pacing_expose_socket_batch(&mut self) -> bool {
+        if self
+            .endpoint_config
+            .receive_backing_meter
+            .as_ref()
+            .filter(|m| m.budget_limit().is_some())
+            .is_some_and(|m| m.admit_precharged().is_err())
+        {
+            self.endpoint_events.quarantine();
+            return false;
+        }
         self.endpoint_pacing
             .as_mut()
             .is_none_or(ConnectionEndpointPacing::expose_socket_batch)
@@ -697,7 +786,24 @@ impl Connection {
     /// Return endpoint-facing events
     #[must_use]
     pub fn poll_endpoint_events(&mut self) -> Option<EndpointEvent> {
-        self.endpoint_events.pop_front().map(EndpointEvent)
+        self.endpoint_events
+            .pop_front()
+            .map(|event| EndpointEvent(event, self.registration_key))
+    }
+
+    /// Take the actual terminal proof after real protocol abandonment/drain.
+    /// Ordinary pending requests are disposed with their original queue credits.
+    #[doc(hidden)]
+    pub fn take_drained_event(&mut self) -> Option<EndpointEvent> {
+        if !self.is_drained() {
+            return None;
+        }
+        while let Some(event) = self.poll_endpoint_events() {
+            if event.is_drained() {
+                return Some(event);
+            }
+        }
+        None
     }
 
     /// Provide control over streams
@@ -711,24 +817,33 @@ impl Connection {
 
     /// Provide control over streams
     #[must_use]
-    pub fn recv_stream(&mut self, id: StreamId) -> RecvStream<'_> {
+    /// `now` starts one synchronous stream transaction in the caller's protocol
+    /// clock. Drop the view (including any Chunks) before awaiting or advancing
+    /// that clock; create a fresh view for the next operation.
+    pub fn recv_stream(&mut self, id: StreamId, now: Instant) -> RecvStream<'_> {
         assert!(id.dir() == Dir::Bi || id.initiator() != self.side.side());
         RecvStream {
             id,
-            state: &mut self.streams,
-            pending: &mut self.spaces[SpaceId::Data].pending,
+            owner: streams::StreamOwner::Connection {
+                connection: self,
+                now,
+            },
         }
     }
 
     /// Provide control over streams
     #[must_use]
-    pub fn send_stream(&mut self, id: StreamId) -> SendStream<'_> {
+    /// `now` starts one synchronous stream transaction in the caller's protocol
+    /// clock. Drop the view (including any Chunks) before awaiting or advancing
+    /// that clock; create a fresh view for the next operation.
+    pub fn send_stream(&mut self, id: StreamId, now: Instant) -> SendStream<'_> {
         assert!(id.dir() == Dir::Bi || id.initiator() == self.side.side());
         SendStream {
             id,
-            state: &mut self.streams,
-            pending: &mut self.spaces[SpaceId::Data].pending,
-            conn_state: &self.state,
+            owner: streams::StreamOwner::Connection {
+                connection: self,
+                now,
+            },
         }
     }
 
@@ -748,6 +863,10 @@ impl Connection {
         max_datagrams: usize,
         buf: &mut Vec<u8>,
     ) -> Option<Transmit> {
+        if self.endpoint_events.quarantined() {
+            self.fail_control_inventory(now, "packet inventory authority lost");
+            return None;
+        }
         assert!(max_datagrams != 0);
         if !self.endpoint_pacing_begin_transmit_poll() {
             return None;
@@ -758,6 +877,7 @@ impl Connection {
         };
 
         let mut num_datagrams = 0;
+        let mut last_finished_packet = None;
         // Position in `buf` of the first byte of the current UDP datagram. When coalescing QUIC
         // packets, this can be earlier than the start of the current QUIC packet.
         let mut datagram_start = 0;
@@ -769,12 +889,9 @@ impl Connection {
             Err(()) => return None,
         }
 
-        // If we need to send a probe, make sure we have something to send.
-        for space in SpaceId::iter() {
-            let request_immediate_ack =
-                space == SpaceId::Data && self.peer_supports_ack_frequency();
-            self.spaces[space].maybe_queue_probe(request_immediate_ack, &self.streams);
-        }
+        // Probe frame movement belongs to the same eligible-packet gate as
+        // history admission. Predict demand first; prepare each space once.
+        let mut probe_prepared = [false; 3];
 
         // Check whether we need to send a close message
         let close = match self.state {
@@ -818,6 +935,7 @@ impl Connection {
         let mut congestion_blocked = false;
         let mut endpoint_blocked = false;
         let mut endpoint_bulk_blocked = false;
+        let mut history_exhausted = false;
         let mut endpoint_reservation: Option<DatagramReservation> = None;
 
         // Iterate over all spaces and find data to send
@@ -837,18 +955,29 @@ impl Connection {
             let frame_space_1rtt =
                 segment_size.saturating_sub(self.predict_1rtt_overhead(Some(pn)));
 
-            // Is there data or a close message to send in this space?
-            let can_send = self.space_can_send(space_id, frame_space_1rtt);
-            if can_send.is_empty() && (!close || self.spaces[space_id].crypto.is_none()) {
+            let mut data_allowed = self.spaces[space_id].sent_packets.ordinary_ready();
+            let has_keys = self.spaces[space_id].crypto.is_some()
+                || (space_id == SpaceId::Data
+                    && self.zero_rtt_crypto.is_some()
+                    && self.side.is_client());
+            let probe_needed = !close
+                && has_keys
+                && !probe_prepared[space_id as usize]
+                && self.spaces[space_id].loss_probes != 0;
+            // Read-only prediction: no retransmit moves before eligibility.
+            let mut can_send = self.space_can_send(space_id, frame_space_1rtt, data_allowed);
+            can_send.other |= probe_needed;
+            if can_send.is_empty() && (!close || !has_keys) {
                 space_idx += 1;
                 continue;
             }
 
-            let mut ack_eliciting = !self.spaces[space_id].pending.is_empty(&self.streams)
+            let mut ack_eliciting = self.spaces[space_id].pending_is_sendable(&self.streams)
                 || self.spaces[space_id].ping_pending
-                || self.spaces[space_id].immediate_ack_pending;
+                || self.spaces[space_id].immediate_ack_pending
+                || probe_needed;
             if space_id == SpaceId::Data {
-                ack_eliciting |= self.can_send_1rtt(frame_space_1rtt);
+                ack_eliciting |= self.can_send_1rtt(frame_space_1rtt, data_allowed);
             }
 
             pad_datagram_to_mtu |= space_id == SpaceId::Data && self.config.pad_to_mtu;
@@ -871,6 +1000,7 @@ impl Connection {
             } else {
                 unreachable!("tried to send {:?} packet without keys", space_id)
             };
+            let mut new_datagram_size = None;
             if !coalesce || buf_capacity - buf_end < MIN_PACKET_SPACE + tag_len {
                 // We need to send 1 more datagram and extend the buffer for that.
 
@@ -930,8 +1060,12 @@ impl Connection {
                                 0 => segment_size,
                                 _ => std::cmp::min(segment_size, usize::from(INITIAL_MTU)),
                             };
-                            let class =
-                                self.endpoint_pacing_class(space_id, close, frame_space_1rtt);
+                            let class = self.endpoint_pacing_class(
+                                space_id,
+                                close,
+                                frame_space_1rtt,
+                                data_allowed,
+                            );
                             endpoint_blocked = self
                                 .endpoint_pacing_reserve_datagram(class, delay, planned_bytes, now)
                                 .is_err();
@@ -984,6 +1118,7 @@ impl Connection {
                         builder.pad_to(segment_size as u16);
                     }
 
+                    last_finished_packet = Some(builder.exact_number);
                     builder.finish_and_track(now, self, sent_frames.take(), buf);
                     let datagram_bytes = buf.len() - datagram_start;
                     if !self.endpoint_pacing_settle_datagram(
@@ -1014,7 +1149,11 @@ impl Connection {
                         if space_id == SpaceId::Data {
                             let frame_space_1rtt =
                                 segment_size.saturating_sub(self.predict_1rtt_overhead(Some(pn)));
-                            if self.space_can_send(space_id, frame_space_1rtt).is_empty() {
+                            if self
+                                .space_can_send(space_id, frame_space_1rtt, data_allowed)
+                                .is_empty()
+                                && !probe_needed
+                            {
                                 break;
                             }
                         }
@@ -1031,7 +1170,8 @@ impl Connection {
                 } else {
                     segment_size
                 };
-                let class = self.endpoint_pacing_class(space_id, close, frame_space_1rtt);
+                let class =
+                    self.endpoint_pacing_class(space_id, close, frame_space_1rtt, data_allowed);
                 endpoint_reservation = match self.endpoint_pacing_reserve_datagram(
                     class,
                     now,
@@ -1045,7 +1185,111 @@ impl Connection {
                         break;
                     }
                 };
-                if loss_probe {
+                new_datagram_size = Some(next_datagram_size_limit);
+            } else {
+                // We can append/coalesce the next packet into the current
+                // datagram.
+                // Finish current packet without adding extra padding
+                if let Some(builder) = builder_storage.take() {
+                    last_finished_packet = Some(builder.exact_number);
+                    builder.finish_and_track(now, self, sent_frames.take(), buf);
+                }
+            }
+
+            // Both transport and endpoint eligibility now hold. Reserve before
+            // moving original probe frames, changing PN/key state, or allocating
+            // another datagram. Full cannot turn a blocked send into a failure.
+            let history = if close {
+                None
+            } else {
+                match self.reserve_sent_packet(space_id) {
+                    Ok(permit) => Some(permit),
+                    Err(error) => {
+                        if new_datagram_size.is_some() {
+                            // No new bytes exist: Drop cancels this exact ticket.
+                            drop(endpoint_reservation.take());
+                        } else if !self.endpoint_pacing_settle_datagram(
+                            endpoint_reservation.take(),
+                            buf.len() - datagram_start,
+                        ) {
+                            return None;
+                        }
+                        if matches!(error, ReserveError::Quarantined) {
+                            return None;
+                        }
+                        self.fail_sent_history_capacity(now, space_id);
+                        history_exhausted = true;
+                        break;
+                    }
+                }
+            };
+            data_allowed = history.as_ref().is_some_and(PacketPermit::allows_data);
+            if probe_needed {
+                let request_immediate_ack =
+                    space_id == SpaceId::Data && self.peer_supports_ack_frequency();
+                if let Err((error, frames)) =
+                    self.spaces[space_id].maybe_queue_probe(request_immediate_ack, &self.streams)
+                {
+                    self.record_first_error(error.into());
+                    self.fail_control_inventory(now, "control inventory probe failed");
+                    drop(frames); // Known cleanup after original first/close custody.
+                    if new_datagram_size.is_some() {
+                        drop(endpoint_reservation.take());
+                    } else if !self.endpoint_pacing_settle_datagram(
+                        endpoint_reservation.take(),
+                        buf.len() - datagram_start,
+                    ) {
+                        return None;
+                    }
+                    history_exhausted = true;
+                    break;
+                }
+                probe_prepared[space_id as usize] = true;
+            }
+            // Same cold owner admits the packet descriptor and the first
+            // ordinary STREAM node before PN/key/encoding. Ordinary Full is
+            // represented by no STREAM credit, never by closing UDP/control.
+            let pending = &self.spaces[space_id].pending;
+            let admission = if close {
+                Ok(control_inventory::records::PreparedPacket::default())
+            } else {
+                (|| {
+                    let records = control_inventory::records::PacketRecords::prepare(
+                        &pending.reset_stream,
+                        &pending.stop_sending,
+                    )?;
+                    let streams = PreparedStreams::prepare(
+                        &pending.reset_stream,
+                        space_id == SpaceId::Data
+                            && data_allowed
+                            && self.streams.can_send_stream_data(),
+                    )?;
+                    let crypto = pending.crypto.prepare_packet(segment_size)?;
+                    Ok::<_, ()>(control_inventory::records::PreparedPacket {
+                        records,
+                        streams,
+                        crypto,
+                    })
+                })()
+            };
+            let prepared_packet = match admission {
+                Ok(admission) => admission,
+                Err(()) => {
+                    self.fail_control_inventory(now, "packet metadata admission failed");
+                    if new_datagram_size.is_some() {
+                        drop(endpoint_reservation.take());
+                    } else if !self.endpoint_pacing_settle_datagram(
+                        endpoint_reservation.take(),
+                        buf.len() - datagram_start,
+                    ) {
+                        return None;
+                    }
+                    history_exhausted = true;
+                    break;
+                }
+            };
+            if let Some(next_datagram_size_limit) = new_datagram_size {
+                if self.spaces[space_id].loss_probes != 0 {
                     self.spaces[space_id].loss_probes -= 1;
                 }
                 buf_capacity += next_datagram_size_limit;
@@ -1070,13 +1314,6 @@ impl Connection {
                     0,
                     "datagrams in a GSO batch must be aligned to the segment size"
                 );
-            } else {
-                // We can append/coalesce the next packet into the current
-                // datagram.
-                // Finish current packet without adding extra padding
-                if let Some(builder) = builder_storage.take() {
-                    builder.finish_and_track(now, self, sent_frames.take(), buf);
-                }
             }
 
             debug_assert!(buf_capacity - buf.len() >= MIN_PACKET_SPACE);
@@ -1110,6 +1347,7 @@ impl Connection {
                 buf_capacity,
                 datagram_start,
                 ack_eliciting,
+                history,
                 self,
             )?);
             coalesce = coalesce && !builder.short_header;
@@ -1225,8 +1463,11 @@ impl Connection {
                 }
             }
 
-            let sent =
-                self.populate_packet(now, space_id, buf, builder.max_size, builder.exact_number);
+            let sent = self.populate_packet(now, space_id, buf, builder, prepared_packet);
+            if self.endpoint_events.quarantined() {
+                self.fail_control_inventory(now, "packet settlement authority lost");
+                return None;
+            }
             if sent.successor_service_turn {
                 builder.pad_to(self.path.current_mtu());
             }
@@ -1283,12 +1524,16 @@ impl Connection {
                 builder.pad_to(segment_size as u16);
             }
 
-            let last_packet_number = builder.exact_number;
+            last_finished_packet = Some(builder.exact_number);
             builder.finish_and_track(now, self, sent_frames, buf);
             let datagram_bytes = buf.len() - datagram_start;
             if !self.endpoint_pacing_settle_datagram(endpoint_reservation.take(), datagram_bytes) {
                 return None;
             }
+        }
+        // A refused next packet may leave a completed prefix with no builder.
+        // Every encoded batch still receives exactly one congestion receipt.
+        if let Some(last_packet_number) = last_finished_packet {
             self.path
                 .congestion
                 .on_sent(now, buf.len() as u64, last_packet_number);
@@ -1301,6 +1546,10 @@ impl Connection {
             );
         }
 
+        if history_exhausted && buf.is_empty() {
+            return self.poll_transmit(now, max_datagrams, buf);
+        }
+
         // Endpoint bulk backpressure sits below the application, just like path pacing. It cannot
         // prove that no application bytes are queued; control-only waits retain upstream behavior.
         self.app_limited = buf.is_empty() && !congestion_blocked && !endpoint_bulk_blocked;
@@ -1308,6 +1557,14 @@ impl Connection {
         // Send MTU probe if necessary
         if buf.is_empty() && self.state.is_established() {
             let space_id = SpaceId::Data;
+            // MTU discovery is optional. Defer it without changing MTUD state
+            // when no control record is available; ACK/PTO/Close own terminal policy.
+            let Ok(history) = self.spaces[space_id]
+                .sent_packets
+                .reserve(PacketClass::Control)
+            else {
+                return None;
+            };
             let mut next_mtud = self.path.mtud.clone();
             let Some(probe_size) = next_mtud
                 .poll_transmit(now, self.packet_number_filter.peek(&self.spaces[space_id]))
@@ -1340,6 +1597,7 @@ impl Connection {
                 buf_capacity,
                 0,
                 true,
+                Some(history),
                 self,
             )?;
 
@@ -1451,6 +1709,7 @@ impl Connection {
             buf_capacity,
             0,
             false,
+            None,
             self,
         ) else {
             self.endpoint_pacing_cancel_waiter();
@@ -1492,6 +1751,7 @@ impl Connection {
         space_id: SpaceId,
         close: bool,
         frame_space_1rtt: usize,
+        data_allowed: bool,
     ) -> PacingTrafficClass {
         let application_datagram_ready = self
             .datagrams
@@ -1502,14 +1762,20 @@ impl Connection {
             space_id,
             close,
             self.spaces[space_id].loss_probes != 0,
-            self.streams.can_send_stream_data()
-                || application_datagram_ready
-                || self.successor_service_turn_wants_packet(),
+            data_allowed
+                && (self.can_send_budgeted_stream_data()
+                    || application_datagram_ready
+                    || self.successor_service_turn_wants_packet()),
         )
     }
 
     /// Indicate what types of frames are ready to send for the given space
-    fn space_can_send(&self, space_id: SpaceId, frame_space_1rtt: usize) -> SendableFrames {
+    fn space_can_send(
+        &self,
+        space_id: SpaceId,
+        frame_space_1rtt: usize,
+        data_allowed: bool,
+    ) -> SendableFrames {
         if self.spaces[space_id].crypto.is_none()
             && (space_id != SpaceId::Data
                 || self.zero_rtt_crypto.is_none()
@@ -1520,7 +1786,7 @@ impl Connection {
         }
         let mut can_send = self.spaces[space_id].can_send(&self.streams);
         if space_id == SpaceId::Data {
-            can_send.other |= self.can_send_1rtt(frame_space_1rtt);
+            can_send.other |= self.can_send_1rtt(frame_space_1rtt, data_allowed);
         }
         can_send
     }
@@ -1531,6 +1797,53 @@ impl Connection {
     /// (including application `Event`s, `EndpointEvent`s and outgoing datagrams) that should be
     /// extracted through the relevant methods.
     pub fn handle_event(&mut self, event: ConnectionEvent) {
+        if self
+            .handle_event_with_admission(event, |_| Some(()))
+            .is_err()
+        {
+            self.endpoint_events.quarantine();
+        }
+    }
+
+    /// Obtain caller-owned admission before any protocol state or packet buffer
+    /// changes. Rejection returns the exact encrypted event for retry/disposal;
+    /// the granted token stays live across the complete coalesced operation.
+    #[doc(hidden)]
+    pub fn handle_event_with_admission<T>(
+        &mut self,
+        event: ConnectionEvent,
+        admit: impl FnOnce(&ConnectionEvent) -> Option<T>,
+    ) -> Result<T, ConnectionEvent> {
+        let Some(token) = admit(&event) else {
+            return Err(event);
+        };
+        if !self.endpoint_events.begin(event.datagram_len()) {
+            return Err(event);
+        }
+        let guard = self.endpoint_events.guard();
+        self.handle_admitted_event(event);
+        self.endpoint_events.finish();
+        guard.finish();
+        Ok(token)
+    }
+
+    #[doc(hidden)]
+    pub fn quarantine_event_inventory(&self) {
+        self.endpoint_events.quarantine();
+    }
+
+    #[doc(hidden)]
+    pub fn event_inventory_quarantined(&self) -> bool {
+        self.endpoint_events.quarantined()
+    }
+
+    /// Non-consuming protocol failure for the facade's failure settlement.
+    #[doc(hidden)]
+    pub fn retained_error(&self) -> Option<ConnectionError> {
+        self.error.clone()
+    }
+
+    fn handle_admitted_event(&mut self, event: ConnectionEvent) {
         use ConnectionEventInner::*;
         match event.0 {
             Datagram(DatagramConnectionEvent {
@@ -1550,11 +1863,23 @@ impl Connection {
 
                 let was_anti_amplification_blocked = self.path.anti_amplification_blocked(1);
 
-                self.stats.udp_rx.datagrams += 1;
-                self.stats.udp_rx.bytes += first_decode.len() as u64;
+                match (remaining, self.packet_batch_meter(remote)) {
+                    (Some(data), Some(meter)) => {
+                        let length = first_decode.len() + data.len();
+                        if self.handle_packet_batch(now, remote, ecn, first_decode, data, meter) {
+                            return;
+                        }
+                        self.stats.udp_rx.datagrams += 1;
+                        self.stats.udp_rx.bytes += length as u64;
+                        self.path.total_recvd = self.path.total_recvd.saturating_add(length as u64);
+                    }
+                    (remaining, _) => {
                 let data_len = first_decode.len();
-
-                self.handle_decode(now, remote, ecn, first_decode);
+                if self.handle_decode(now, remote, ecn, first_decode, remaining.is_none()) {
+                    return;
+                }
+                self.stats.udp_rx.datagrams += 1;
+                self.stats.udp_rx.bytes += data_len as u64;
                 // The current `path` might have changed inside `handle_decode`,
                 // since the packet could have triggered a migration. Make sure
                 // the data received is accounted for the most recent path by accessing
@@ -1564,6 +1889,9 @@ impl Connection {
                 if let Some(data) = remaining {
                     self.stats.udp_rx.bytes += data.len() as u64;
                     self.handle_coalesced(now, remote, ecn, data);
+                }
+
+                    }
                 }
 
                 self.config.qlog_sink.emit_recovery_metrics(
@@ -1580,16 +1908,21 @@ impl Connection {
                     self.set_loss_detection_timer(now);
                 }
             }
-            NewIdentifiers(ids, now) => {
-                self.local_cid_state.new_cids(&ids, now);
-                ids.into_iter().rev().for_each(|frame| {
-                    self.spaces[SpaceId::Data].pending.new_cids.push(frame);
-                });
-                // Update Timer::PushNewCid
-                if self.timers.get(Timer::PushNewCid).is_none_or(|x| x <= now) {
-                    self.reset_cid_retirement();
+            RegistrationRefused(key, now, reason) => {
+                if key == self.registration_key {
+                    self.fail_control_inventory(now, reason);
                 }
             }
+            IdentifierCapacityUnavailable(failure) => {
+                if self.error.is_none() {
+                    self.kill(
+                        TransportError::INTERNAL_ERROR("CID frame capacity invariant failed")
+                            .into(),
+                    );
+                }
+                drop(failure);
+            }
+            NewIdentifiers(ids, now) => self.install_unprepared_identifiers(ids, now),
         }
     }
 
@@ -1603,6 +1936,16 @@ impl Connection {
     /// `Instant` that was output by `poll_timeout`; however spurious extra calls will simply
     /// no-op and therefore are safe.
     pub fn handle_timeout(&mut self, now: Instant) {
+        if !self.endpoint_events.begin_control(2) {
+            return;
+        }
+        let guard = self.endpoint_events.guard();
+        self.handle_admitted_timeout(now);
+        self.endpoint_events.finish();
+        guard.finish();
+    }
+
+    fn handle_admitted_timeout(&mut self, now: Instant) {
         for &timer in &Timer::VALUES {
             if !self.timers.is_expired(timer, now) {
                 continue;
@@ -1749,6 +2092,9 @@ impl Connection {
         let target_bytes = self.path.congestion.window();
         let path_generation = self.path.generation();
         let mut turn = SuccessorServiceTurn::new(target_bytes, path_generation)?;
+        // Own the actual terminal event slot before any packet is adopted.
+        self.events.reserve(1, self.application_event_holds())
+            .map_err(SuccessorServiceTurnStartError::Admission)?;
         // Authentication is queued before this turn starts. Adopt every ordinary Data-space
         // packet already consuming congestion authority so the turn cannot succeed past
         // unacknowledged authentication bytes. A PLPMTUD probe is not a protocol prerequisite and
@@ -1859,7 +2205,7 @@ impl Connection {
 
     /// Whether there are any pending retransmits
     pub fn has_pending_retransmits(&self) -> bool {
-        !self.spaces[SpaceId::Data].pending.is_empty(&self.streams)
+        !self.spaces[SpaceId::Data].pending_is_empty(&self.streams)
     }
 
     /// Look up whether we're the client or server of this Connection
@@ -1968,44 +2314,56 @@ impl Connection {
             }
         };
 
-        // Avoid DoS from unreasonably huge ack ranges by filtering out just the new acks.
-        let mut newly_acked = ArrayRangeSet::new();
+        // Keep original range validation order. A later invalid range cancels
+        // only prepared marks; it retains the original protocol error and the
+        // already-recorded largest-ACK observation, never claims full rollback.
+        let mut selected = self.spaces[space]
+            .sent_packets
+            .begin_recovery(RecoveryKind::Ack)?;
         for range in ack.iter() {
-            self.packet_number_filter.check_ack(space, range.clone())?;
-            for (&pn, _) in self.spaces[space].sent_packets.range(range) {
-                newly_acked.insert_one(pn);
+            if let Err(error) = self.packet_number_filter.check_ack(space, range.clone()) {
+                let _ = self.spaces[space].sent_packets.cancel_recovery(selected);
+                return Err(error);
             }
+            self.spaces[space]
+                .sent_packets
+                .select_recovery(&mut selected, range)?;
         }
-
-        if newly_acked.is_empty() {
+        if selected.is_empty() {
+            selected.finish()?;
             return Ok(());
         }
-
+        // Preserve upstream ECN's merged-range count, not packet count.
+        let newly_acked_ranges = self.spaces[space].sent_packets.recovery_ranges(&selected)?;
+        selected.begin_commit()?;
         let mut ack_eliciting_acked = false;
-        for packet in newly_acked.elts() {
-            if let Some(info) = self.spaces[space].take(packet) {
-                if let Some(acked) = info.largest_acked {
-                    // Assume ACKs for all packets below the largest acknowledged in `packet` have
-                    // been received. This can cause the peer to spuriously retransmit if some of
-                    // our earlier ACKs were lost, but allows for simpler state tracking. See
-                    // discussion at
-                    // https://www.rfc-editor.org/rfc/rfc9000.html#name-limiting-ranges-by-tracking
-                    self.spaces[space].pending_acks.subtract_below(acked);
-                }
-                ack_eliciting_acked |= info.ack_eliciting;
+        let mut cursor = 0;
+        while let Some((packet, info)) = self.spaces[space].take_recovery(&mut selected, cursor)? {
+            cursor = packet + 1;
+            if let Some(acked) = info.largest_acked {
+                // Assume ACKs for all packets below the largest acknowledged in `packet` have
+                // been received. This can cause the peer to spuriously retransmit if some of
+                // our earlier ACKs were lost, but allows for simpler state tracking. See
+                // discussion at
+                // https://www.rfc-editor.org/rfc/rfc9000.html#name-limiting-ranges-by-tracking
+                self.spaces[space].pending_acks.subtract_below(acked);
+            }
+            ack_eliciting_acked |= info.ack_eliciting;
 
-                // Notify MTU discovery that a packet was acked, because it might be an MTU probe
-                let mtu_updated = self.path.mtud.on_acked(space, packet, info.size);
-                if mtu_updated {
-                    self.path
-                        .congestion
-                        .on_mtu_update(self.path.mtud.current_mtu());
-                }
+            // Notify MTU discovery that a packet was acked, because it might be an MTU probe
+            let mtu_updated = self.path.mtud.on_acked(space, packet, info.size);
+            if mtu_updated {
+                self.path
+                    .congestion
+                    .on_mtu_update(self.path.mtud.current_mtu());
+            }
 
-                // Notify ack frequency that a packet was acked, because it might contain an ACK_FREQUENCY frame
-                self.ack_frequency.on_acked(packet);
+            // Notify ack frequency that a packet was acked, because it might contain an ACK_FREQUENCY frame
+            self.ack_frequency.on_acked(packet);
 
-                self.on_packet_acked(now, info);
+            if let Err(error) = self.on_packet_acked(now, info) {
+                self.spaces[space].sent_packets.close_recovery(selected, &self.state)?;
+                return Err(TransportError::INTERNAL_ERROR(streams::inventory_reason(error)));
             }
         }
 
@@ -2034,7 +2392,12 @@ impl Connection {
         }
 
         // Must be called before crypto/pto_count are clobbered
-        self.detect_lost_packets(now, space, true);
+        if let Err(error) = self.detect_lost_packets(now, space, true) {
+            if self.state.is_closed() {
+                self.spaces[space].sent_packets.close_recovery(selected, &self.state)?;
+            }
+            return Err(error);
+        }
 
         if self.peer_completed_address_validation() {
             self.pto_count = 0;
@@ -2049,7 +2412,7 @@ impl Connection {
                 // reordering.
                 if new_largest {
                     let sent = self.spaces[space].largest_acked_packet_sent;
-                    self.process_ecn(now, space, newly_acked.len() as u64, ecn, sent);
+                    self.process_ecn(now, space, newly_acked_ranges as u64, ecn, sent);
                 }
             } else {
                 // We always start out sending ECN, so any ack that doesn't acknowledge it disables it.
@@ -2059,7 +2422,7 @@ impl Connection {
         }
 
         self.set_loss_detection_timer(now);
-        Ok(())
+        selected.finish()
     }
 
     /// Process a new ECN block from an in-order ACK
@@ -2091,7 +2454,7 @@ impl Connection {
 
     // Not timing-aware, so it's safe to call this for inferred acks, such as arise from
     // high-latency handshakes
-    fn on_packet_acked(&mut self, now: Instant, info: SentPacket) {
+    fn on_packet_acked(&mut self, now: Instant, info: SentPacket) -> Result<(), bytes::MeteredCopyError> {
         let successor_service_turn = info.successor_service_turn;
         let transport_write_demand = info.transport_write_demand;
         let path_generation = info.path_generation;
@@ -2115,18 +2478,28 @@ impl Connection {
         }
 
         // Update state for confirmed delivery of frames
-        if let Some(retransmits) = info.retransmits.get() {
-            for (id, _) in retransmits.reset_stream.iter() {
-                self.streams.reset_acked(*id);
-            }
+        for (id, _) in info.retransmits.reset_iter() {
+            self.streams.reset_acked(id);
         }
 
-        for frame in info.stream_frames {
-            self.streams.received_ack_of(frame);
-        }
+        let mut refused = None;
+        info.stream_frames.dispose_with(|frame| {
+            use control_inventory::records::StreamDisposition;
+            if refused.is_some() { return StreamDisposition::Closed; }
+            match self.streams.received_ack_of(frame) {
+                Ok(()) => StreamDisposition::Applied,
+                Err(error) => {
+                    self.fail_control_inventory(now, streams::inventory_reason(error));
+                    refused = Some(error);
+                    StreamDisposition::Closed
+                }
+            }
+        });
+        if let Some(error) = refused { return Err(error); }
         if successor_service_turn {
             self.note_successor_service_turn_packet_acked(path_generation, packet_size);
         }
+        Ok(())
     }
 
     fn successor_service_turn_wants_packet(&self) -> bool {
@@ -2168,14 +2541,24 @@ impl Connection {
     }
 
     fn publish_successor_service_turn_outcome(&mut self) {
+        // An active turn holds this slot throughout send/ACK/loss/close. A
+        // broken physical promise retains the original outcome under Q.
+        if self.successor_service_turn.is_some() && !self.events.funded(1, usize::from(self.datagrams.send_blocked)) {
+            if let Some(meter) = &self.endpoint_config.receive_backing_meter { meter.quarantine(); }
+            self.record_first_error(application_events::event_error(bytes::MeteredCopyError::Quarantined).into());
+            return;
+        }
         let outcome = self
             .successor_service_turn
             .as_mut()
             .and_then(SuccessorServiceTurn::take_outcome);
         if let Some(outcome) = outcome {
+            if self.events.push_reserved(QueuedEvent::SuccessorServiceTurn { outcome }, usize::from(self.datagrams.send_blocked)).is_err() {
+                if let Some(turn) = self.successor_service_turn.as_mut() { turn.outcome = Some(outcome); }
+                self.record_first_error(application_events::event_error(bytes::MeteredCopyError::Quarantined).into());
+                return;
+            }
             self.successor_service_turn = None;
-            self.events
-                .push_back(Event::SuccessorServiceTurn { outcome });
         }
     }
 
@@ -2198,7 +2581,12 @@ impl Connection {
     fn on_loss_detection_timeout(&mut self, now: Instant) {
         if let Some((_, pn_space)) = self.loss_time_and_space() {
             // Time threshold loss Detection
-            self.detect_lost_packets(now, pn_space, false);
+            if let Err(error) = self.detect_lost_packets(now, pn_space, false) {
+                if self.error.is_none() {
+                    self.kill(error.into());
+                }
+                return;
+            }
             self.set_loss_detection_timer(now);
             return;
         }
@@ -2232,8 +2620,17 @@ impl Connection {
         self.set_loss_detection_timer(now);
     }
 
-    fn detect_lost_packets(&mut self, now: Instant, pn_space: SpaceId, due_to_ack: bool) {
-        let mut lost_packets = Vec::<u64>::new();
+    fn detect_lost_packets(
+        &mut self,
+        now: Instant,
+        pn_space: SpaceId,
+        due_to_ack: bool,
+    ) -> Result<(), TransportError> {
+        let mut selected = self.spaces[pn_space]
+            .sent_packets
+            .begin_recovery(RecoveryKind::Loss)?;
+        let mut lost_count = 0;
+        let mut largest_lost = None;
         let mut lost_mtu_probe = None;
         let in_flight_mtu_probe = self.path.mtud.in_flight_mtu_probe();
         let rtt = self.path.rtt.conservative();
@@ -2255,7 +2652,10 @@ impl Connection {
         let space = &mut self.spaces[pn_space];
         space.loss_time = None;
 
-        for (&packet, info) in space.sent_packets.range(0..largest_acked_packet) {
+        for (&packet, info) in space
+            .sent_packets
+            .recovery_range_mut(0..largest_acked_packet)
+        {
             if prev_packet != Some(packet.wrapping_sub(1)) {
                 // An intervening packet was acknowledged
                 persistent_congestion_start = None;
@@ -2264,14 +2664,16 @@ impl Connection {
             // Packets sent before now - loss_delay are deemed lost.
             // However, we avoid this subtraction as it can panic and there's no
             // saturating equivalent of this substraction operation with a Duration.
-            let packet_too_old = now.saturating_duration_since(info.time_sent) >= loss_delay;
-            if packet_too_old || largest_acked_packet >= packet + packet_threshold {
-                if Some(packet) == in_flight_mtu_probe {
+            if sent_history::packet_is_lost(now, info.time_sent, packet, largest_acked_packet, loss_delay, packet_threshold) {
+                // Probe identity belongs to DATA's packet-number namespace.
+                if pn_space == SpaceId::Data && Some(packet) == in_flight_mtu_probe {
                     // Lost MTU probes are not included in `lost_packets`, because they should not
                     // trigger a congestion control response
                     lost_mtu_probe = in_flight_mtu_probe;
                 } else {
-                    lost_packets.push(packet);
+                    selected.select(info);
+                    lost_count += 1;
+                    largest_lost = Some((packet, info.time_sent));
                     size_of_lost_packets += info.size as u64;
                     if info.ack_eliciting && due_to_ack {
                         match persistent_congestion_start {
@@ -2305,20 +2707,24 @@ impl Connection {
             prev_packet = Some(packet);
         }
 
-        // OnPacketsLost
-        if let Some(largest_lost) = lost_packets.last().cloned() {
+        selected.begin_commit()?;
+        // OnPacketsLost: preserve the original complete first-pass statistics
+        // before moving the first selected record into retransmission custody.
+        if let Some((largest_lost, largest_lost_sent)) = largest_lost {
             let old_bytes_in_flight = self.path.in_flight.bytes;
-            let largest_lost_sent = self.spaces[pn_space].sent_packets[&largest_lost].time_sent;
-            self.stats.path.lost_packets += lost_packets.len() as u64;
+            self.stats.path.lost_packets += lost_count;
             self.stats.path.lost_bytes += size_of_lost_packets;
             trace!(
-                "packets lost: {:?}, bytes lost: {}",
-                lost_packets,
-                size_of_lost_packets
+                lost_count,
+                largest_lost,
+                bytes_lost = size_of_lost_packets,
+                "packets lost"
             );
-
-            for &packet in &lost_packets {
-                let info = self.spaces[pn_space].take(packet).unwrap(); // safe: lost_packets is populated just above
+            let mut cursor = 0;
+            while let Some((packet, info)) =
+                self.spaces[pn_space].take_recovery(&mut selected, cursor)?
+            {
+                cursor = packet + 1;
                 self.config.qlog_sink.emit_packet_lost(
                     packet,
                     &info,
@@ -2334,10 +2740,27 @@ impl Connection {
                     );
                 }
                 self.remove_in_flight(&info);
-                for frame in info.stream_frames {
-                    self.streams.retransmit(frame);
+                let mut refused = None;
+                info.stream_frames.dispose_with(|frame| {
+                    use control_inventory::records::StreamDisposition;
+                    if refused.is_some() { return StreamDisposition::Closed; }
+                    match self.streams.retransmit(frame) {
+                        Ok(()) => StreamDisposition::Applied,
+                        Err(error) => {
+                            self.fail_control_inventory(now, streams::inventory_reason(error));
+                            refused = Some(error);
+                            StreamDisposition::Closed
+                        }
+                    }
+                });
+                if let Some(error) = refused {
+                    // This packet has left History. The original root has
+                    // closed; dispose its remaining metadata without requeue.
+                    drop(info.retransmits);
+                    self.spaces[pn_space].sent_packets.close_recovery(selected, &self.state)?;
+                    return Err(TransportError::INTERNAL_ERROR(streams::inventory_reason(error)));
                 }
-                self.spaces[pn_space].pending |= info.retransmits;
+                self.requeue_control_records(now, pn_space, info.retransmits)?;
                 self.path.mtud.on_non_probe_lost(packet, info.size);
             }
 
@@ -2378,6 +2801,7 @@ impl Connection {
             self.path.mtud.on_probe_lost();
             self.stats.path.lost_plpmtud_probes += 1;
         }
+        selected.finish()
     }
 
     fn loss_time_and_space(&self) -> Option<(Instant, SpaceId)> {
@@ -2491,7 +2915,7 @@ impl Connection {
         packet: Option<u64>,
         spin: bool,
         is_1rtt: bool,
-    ) {
+    ) -> Result<(), TransportError> {
         self.total_authed_packets += 1;
         self.reset_keep_alive(now);
         self.reset_idle_timeout(now, space_id);
@@ -2508,7 +2932,7 @@ impl Connection {
 
         let packet = match packet {
             Some(x) => x,
-            None => return,
+            None => return Ok(()),
         };
         if self.side.is_server() {
             if self.spaces[SpaceId::Initial].crypto.is_some() && space_id == SpaceId::Handshake {
@@ -2521,7 +2945,7 @@ impl Connection {
             }
         }
         let space = &mut self.spaces[space_id];
-        space.pending_acks.insert_one(packet, now);
+        space.pending_acks.insert_one(packet, now)?;
         if packet >= space.rx_packet {
             space.rx_packet = packet;
             // Update outgoing spin bit, inverting iff we're the client
@@ -2535,6 +2959,7 @@ impl Connection {
             now,
             self.orig_rem_cid,
         );
+        Ok(())
     }
 
     fn reset_idle_timeout(&mut self, now: Instant, space: SpaceId) {
@@ -2577,6 +3002,31 @@ impl Connection {
         packet: InitialPacket,
         remaining: Option<BytesMut>,
     ) -> Result<(), ConnectionError> {
+        let length = packet
+            .header_data
+            .len()
+            .saturating_add(packet.payload.len())
+            .saturating_add(remaining.as_ref().map_or(0, BytesMut::len));
+        if !self.endpoint_events.begin(Some(length)) {
+            return Err(ConnectionError::LocallyClosed);
+        }
+        let guard = self.endpoint_events.guard();
+        let result =
+            self.handle_admitted_first_packet(now, remote, ecn, packet_number, packet, remaining);
+        self.endpoint_events.finish();
+        guard.finish();
+        result
+    }
+
+    fn handle_admitted_first_packet(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        ecn: Option<EcnCodepoint>,
+        packet_number: u64,
+        packet: InitialPacket,
+        remaining: Option<BytesMut>,
+    ) -> Result<(), ConnectionError> {
         let span = trace_span!("first recv");
         let _guard = span.enter();
         debug_assert!(self.side.is_server());
@@ -2597,9 +3047,9 @@ impl Connection {
             Some(packet_number),
             false,
             false,
-        );
+        )?;
 
-        self.process_decrypted_packet(now, remote, Some(packet_number), packet.into())?;
+        self.process_decrypted_packet(now, remote, Some(packet_number), Packet::from(packet).freeze())?;
         if let Some(data) = remaining {
             self.handle_coalesced(now, remote, ecn, data);
         }
@@ -2680,6 +3130,7 @@ impl Connection {
             ));
         }
 
+        let space_id = space;
         let space = &mut self.spaces[space];
         let max = end.saturating_sub(space.crypto_stream.bytes_read());
         if max > self.config.crypto_buffer_size as u64 {
@@ -2688,81 +3139,45 @@ impl Connection {
 
         space
             .crypto_stream
-            .insert(crypto.offset, crypto.data.clone(), payload_len)
-            .map_err(|_| TransportError::INTERNAL_ERROR("too many gaps in crypto stream buffer"))?;
+            .insert_checked(
+                crypto.offset,
+                crypto.data.clone(),
+                payload_len,
+                self.endpoint_config.receive_backing_meter.as_ref(),
+            )
+            .map_err(|error| match error {
+                assembler::InsertError::TooManyChunks => {
+                    TransportError::INTERNAL_ERROR("too many gaps in crypto stream buffer")
+                }
+                assembler::InsertError::Capacity(error) => {
+                    trace!(?error, "receive inventory admission refused");
+                    TransportError::INTERNAL_ERROR("receive inventory admission refused")
+                }
+                assembler::InsertError::AuthorityMismatch => {
+                    TransportError::INTERNAL_ERROR("receive backing authority mismatch")
+                }
+            })?;
 
-        while let Some(chunk) = space.crypto_stream.read(usize::MAX, true) {
+        self.drain_crypto(space_id)
+    }
+
+    fn drain_crypto(&mut self, space_id: SpaceId) -> Result<(), TransportError> {
+        let space = &mut self.spaces[space_id];
+        while let Some(chunk) = space.crypto_stream.read_checked(usize::MAX, true)
+            .map_err(|_| {
+                if let Some(meter) = &self.endpoint_config.receive_backing_meter { meter.quarantine(); }
+                TransportError::INTERNAL_ERROR("receive descriptor inventory lost during CRYPTO read")
+            })? {
             trace!("consumed {} CRYPTO bytes", chunk.bytes.len());
             if self.crypto.read_handshake(&chunk.bytes)? {
-                self.events.push_back(Event::HandshakeDataReady);
+                let held = usize::from(self.successor_service_turn.is_some()) + usize::from(self.datagrams.send_blocked);
+                self.events.reserve(1, held).map_err(application_events::event_error)?;
+                self.events.push_reserved(QueuedEvent::HandshakeDataReady, held)
+                    .map_err(|_| application_events::event_error(bytes::MeteredCopyError::Quarantined))?;
             }
         }
 
         Ok(())
-    }
-
-    fn write_crypto(&mut self) {
-        loop {
-            let space = self.highest_space;
-            let mut outgoing = Vec::new();
-            if let Some(crypto) = self.crypto.write_handshake(&mut outgoing) {
-                match space {
-                    SpaceId::Initial => {
-                        self.upgrade_crypto(SpaceId::Handshake, crypto);
-                    }
-                    SpaceId::Handshake => {
-                        self.upgrade_crypto(SpaceId::Data, crypto);
-                    }
-                    _ => unreachable!("got updated secrets during 1-RTT"),
-                }
-            }
-            if outgoing.is_empty() {
-                if space == self.highest_space {
-                    break;
-                } else {
-                    // Keys updated, check for more data to send
-                    continue;
-                }
-            }
-            let offset = self.spaces[space].crypto_offset;
-            let outgoing = Bytes::from(outgoing);
-            if let State::Handshake(ref mut state) = self.state {
-                if space == SpaceId::Initial && offset == 0 && self.side.is_client() {
-                    state.client_hello = Some(outgoing.clone());
-                }
-            }
-            self.spaces[space].crypto_offset += outgoing.len() as u64;
-            trace!("wrote {} {:?} CRYPTO bytes", outgoing.len(), space);
-            self.spaces[space].pending.crypto.push_back(frame::Crypto {
-                offset,
-                data: outgoing,
-            });
-        }
-    }
-
-    /// Switch to stronger cryptography during handshake
-    fn upgrade_crypto(&mut self, space: SpaceId, crypto: Keys) {
-        debug_assert!(
-            self.spaces[space].crypto.is_none(),
-            "already reached packet space {space:?}"
-        );
-        trace!("{:?} keys ready", space);
-        if space == SpaceId::Data {
-            // Precompute the first key update
-            self.next_crypto = Some(
-                self.crypto
-                    .next_1rtt_keys()
-                    .expect("handshake should be complete"),
-            );
-        }
-
-        self.spaces[space].crypto = Some(crypto);
-        debug_assert!(space as usize > self.highest_space as usize);
-        self.highest_space = space;
-        if space == SpaceId::Data && self.side.is_client() {
-            // Discard 0-RTT keys because 1-RTT keys are available.
-            self.zero_rtt_crypto = None;
-        }
     }
 
     fn discard_space(&mut self, now: Instant, space_id: SpaceId) {
@@ -2778,8 +3193,7 @@ impl Connection {
         space.crypto = None;
         space.time_of_last_ack_eliciting_packet = None;
         space.loss_time = None;
-        let sent_packets = mem::take(&mut space.sent_packets);
-        for packet in sent_packets.into_values() {
+        while let Some(packet) = self.spaces[space_id].sent_packets.drain_next() {
             self.remove_in_flight(&packet);
         }
         self.set_loss_detection_timer(now)
@@ -2803,7 +3217,7 @@ impl Connection {
             ) {
                 Ok((partial_decode, rest)) => {
                     remaining = rest;
-                    self.handle_decode(now, remote, ecn, partial_decode);
+                    self.handle_decode(now, remote, ecn, partial_decode, false);
                 }
                 Err(e) => {
                     trace!("malformed header: {}", e);
@@ -2813,188 +3227,18 @@ impl Connection {
         }
     }
 
-    fn handle_decode(
-        &mut self,
-        now: Instant,
-        remote: SocketAddr,
-        ecn: Option<EcnCodepoint>,
-        partial_decode: PartialDecode,
-    ) {
-        if let Some(decoded) = packet_crypto::unprotect_header(
-            partial_decode,
-            &self.spaces,
-            self.zero_rtt_crypto.as_ref(),
-            self.peer_params.stateless_reset_token,
-        ) {
-            self.handle_packet(now, remote, ecn, decoded.packet, decoded.stateless_reset);
-        }
-    }
-
-    fn handle_packet(
-        &mut self,
-        now: Instant,
-        remote: SocketAddr,
-        ecn: Option<EcnCodepoint>,
-        packet: Option<Packet>,
-        stateless_reset: bool,
-    ) {
-        self.stats.udp_rx.ios += 1;
-        if let Some(ref packet) = packet {
-            trace!(
-                "got {:?} packet ({} bytes) from {} using id {}",
-                packet.header.space(),
-                packet.payload.len() + packet.header_data.len(),
-                remote,
-                packet.header.dst_cid(),
-            );
-        }
-
-        if self.is_handshaking() && remote != self.path.remote {
-            debug!("discarding packet with unexpected remote during handshake");
-            return;
-        }
-
-        let was_closed = self.state.is_closed();
-        let was_drained = self.state.is_drained();
-
-        let decrypted = match packet {
-            None => Err(None),
-            Some(mut packet) => self
-                .decrypt_packet(now, &mut packet)
-                .map(move |number| (packet, number)),
-        };
-        let result = match decrypted {
-            _ if stateless_reset => {
-                debug!("got stateless reset");
-                Err(ConnectionError::Reset)
-            }
-            Err(Some(e)) => {
-                warn!("illegal packet: {}", e);
-                Err(e.into())
-            }
-            Err(None) => {
-                debug!("failed to authenticate packet");
-                self.authentication_failures += 1;
-                let integrity_limit = self.spaces[self.highest_space]
-                    .crypto
-                    .as_ref()
-                    .unwrap()
-                    .packet
-                    .local
-                    .integrity_limit();
-                if self.authentication_failures > integrity_limit {
-                    Err(TransportError::AEAD_LIMIT_REACHED("integrity limit violated").into())
-                } else {
-                    return;
-                }
-            }
-            Ok((packet, number)) => {
-                let span = match number {
-                    Some(pn) => trace_span!("recv", space = ?packet.header.space(), pn),
-                    None => trace_span!("recv", space = ?packet.header.space()),
-                };
-                let _guard = span.enter();
-
-                let is_duplicate = |n| self.spaces[packet.header.space()].dedup.insert(n);
-                if number.is_some_and(is_duplicate) {
-                    debug!("discarding possible duplicate packet");
-                    return;
-                } else if self.state.is_handshake() && packet.header.is_short() {
-                    // TODO: SHOULD buffer these to improve reordering tolerance.
-                    trace!("dropping short packet during handshake");
-                    return;
-                } else {
-                    if let Header::Initial(InitialHeader { ref token, .. }) = packet.header {
-                        if let State::Handshake(ref hs) = self.state {
-                            if self.side.is_server() && token != &hs.expected_token {
-                                // Clients must send the same retry token in every Initial. Initial
-                                // packets can be spoofed, so we discard rather than killing the
-                                // connection.
-                                warn!("discarding Initial with invalid retry token");
-                                return;
-                            }
-                        }
-                    }
-
-                    if !self.state.is_closed() {
-                        let spin = match packet.header {
-                            Header::Short { spin, .. } => spin,
-                            _ => false,
-                        };
-                        self.on_packet_authenticated(
-                            now,
-                            packet.header.space(),
-                            ecn,
-                            number,
-                            spin,
-                            packet.header.is_1rtt(),
-                        );
-                    }
-
-                    self.process_decrypted_packet(now, remote, number, packet)
-                }
-            }
-        };
-
-        // State transitions for error cases
-        if let Err(conn_err) = result {
-            self.error = Some(conn_err.clone());
-            self.state = match conn_err {
-                ConnectionError::ApplicationClosed(reason) => State::closed(reason),
-                ConnectionError::ConnectionClosed(reason) => State::closed(reason),
-                ConnectionError::Reset
-                | ConnectionError::TransportError(TransportError {
-                    code: TransportErrorCode::AEAD_LIMIT_REACHED,
-                    ..
-                }) => State::Drained,
-                ConnectionError::TimedOut => {
-                    unreachable!("timeouts aren't generated by packet processing");
-                }
-                ConnectionError::TransportError(err) => {
-                    debug!("closing connection due to transport error: {}", err);
-                    State::closed(err)
-                }
-                ConnectionError::VersionMismatch => State::Draining,
-                ConnectionError::LocallyClosed => {
-                    unreachable!("LocallyClosed isn't generated by packet processing");
-                }
-                ConnectionError::CidsExhausted => {
-                    unreachable!("CidsExhausted isn't generated by packet processing");
-                }
-            };
-        }
-
-        if !was_closed && self.state.is_closed() {
-            self.close_common();
-            if !self.state.is_drained() {
-                self.set_close_timer(now);
-            }
-        }
-        if !was_drained && self.state.is_drained() {
-            self.endpoint_events.push_back(EndpointEventInner::Drained);
-            // Close timer may have been started previously, e.g. if we sent a close and got a
-            // stateless reset in response
-            self.timers.stop(Timer::Close);
-        }
-
-        // Transmit CONNECTION_CLOSE if necessary
-        if let State::Closed(_) = self.state {
-            self.close = remote == self.path.remote;
-        }
-    }
-
     fn process_decrypted_packet(
         &mut self,
         now: Instant,
         remote: SocketAddr,
         number: Option<u64>,
-        packet: Packet,
+        packet: Packet<Bytes>,
     ) -> Result<(), ConnectionError> {
         let state = match self.state {
             State::Established => {
                 match packet.header.space() {
                     SpaceId::Data => self.process_payload(now, remote, number.unwrap(), packet)?,
-                    _ if packet.header.has_frames() => self.process_early_payload(now, packet)?,
+                    _ if packet.header.has_frames() => self.process_early_payload(now, packet, None)?,
                     _ => {
                         trace!("discarding unexpected pre-handshake packet");
                     }
@@ -3002,7 +3246,7 @@ impl Connection {
                 return Ok(());
             }
             State::Closed(_) => {
-                for result in frame::Iter::new(packet.payload.freeze())? {
+                for result in frame::Iter::new(packet.payload)? {
                     let frame = match result {
                         Ok(frame) => frame,
                         Err(err) => {
@@ -3057,44 +3301,55 @@ impl Connection {
                 }
 
                 trace!("retrying with CID {}", rem_cid);
-                let client_hello = state.client_hello.take().unwrap();
+                let client_hello = state.client_hello.take().ok_or_else(|| {
+                    TransportError::INTERNAL_ERROR("Retry ClientHello custody missing")
+                })?;
                 self.retry_src_cid = Some(rem_cid);
                 self.rem_cids.update_initial_cid(rem_cid);
                 self.rem_handshake_cid = rem_cid;
 
                 let space = &mut self.spaces[SpaceId::Initial];
                 if let Some(info) = space.take(0) {
-                    self.on_packet_acked(now, info);
+                    if let Err(error) = self.on_packet_acked(now, info) {
+                        return Err(TransportError::INTERNAL_ERROR(streams::inventory_reason(error)).into());
+                    }
                 };
 
                 self.discard_space(now, SpaceId::Initial); // Make sure we clean up after any retransmitted Initials
+                let initial_history = mem::take(&mut self.spaces[SpaceId::Initial].sent_packets);
+                let mut initial_ranges =
+                    mem::take(&mut self.spaces[SpaceId::Initial].pending_acks.ranges);
+                initial_ranges.clear();
+                let initial_pending = self.spaces[SpaceId::Initial].pending.empty_like();
                 self.spaces[SpaceId::Initial] = PacketSpace {
+                    pending: initial_pending,
+                    sent_packets: initial_history,
+                    pending_acks: spaces::PendingAcks::with_ranges(initial_ranges),
                     crypto: Some(self.crypto.initial_keys(&rem_cid, self.side.side())),
                     next_packet_number: self.spaces[SpaceId::Initial].next_packet_number,
-                    crypto_offset: client_hello.len() as u64,
+                    crypto_offset: client_hello.frame.data.len() as u64,
                     ..PacketSpace::new(now)
                 };
                 self.spaces[SpaceId::Initial]
                     .pending
                     .crypto
-                    .push_back(frame::Crypto {
-                        offset: 0,
-                        data: client_hello,
-                    });
+                    .push_back(client_hello);
 
                 // Retransmit all 0-RTT data
-                let zero_rtt = mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
-                for info in zero_rtt.into_values() {
+                while let Some(info) = self.spaces[SpaceId::Data].sent_packets.drain_next() {
                     self.remove_in_flight(&info);
-                    self.spaces[SpaceId::Data].pending |= info.retransmits;
+                    self.requeue_control_records(now, SpaceId::Data, info.retransmits)?;
                 }
-                self.streams.retransmit_all_for_0rtt();
+                if let Err(error) = self.streams.retransmit_all_for_0rtt() {
+                    self.fail_control_inventory(now, streams::inventory_reason(error));
+                    return Err(TransportError::INTERNAL_ERROR(streams::inventory_reason(error)).into());
+                }
 
                 let token_len = packet.payload.len() - 16;
                 let ConnectionSide::Client { ref mut token, .. } = self.side else {
                     unreachable!("we already short-circuited if we're server");
                 };
-                *token = packet.payload.freeze().split_to(token_len);
+                *token = packet.payload.slice(..token_len);
                 self.state = State::Handshake(state::Handshake {
                     expected_token: Bytes::new(),
                     rem_cid_set: false,
@@ -3116,7 +3371,7 @@ impl Connection {
                 }
                 self.on_path_validated();
 
-                self.process_early_payload(now, packet)?;
+                self.process_early_payload(now, packet, None)?;
                 if self.state.is_closed() {
                     return Ok(());
                 }
@@ -3145,12 +3400,14 @@ impl Connection {
                             self.streams.zero_rtt_rejected();
 
                             // Discard already-queued frames
-                            self.spaces[SpaceId::Data].pending = Retransmits::default();
+                            self.spaces[SpaceId::Data].pending =
+                                self.spaces[SpaceId::Data].pending.empty_like();
+                            self.spaces[SpaceId::Data].pending_cids.discard();
 
                             // Discard 0-RTT packets
-                            let sent_packets =
-                                mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
-                            for packet in sent_packets.into_values() {
+                            while let Some(packet) =
+                                self.spaces[SpaceId::Data].sent_packets.drain_next()
+                            {
                                 self.remove_in_flight(&packet);
                             }
                         } else {
@@ -3160,7 +3417,11 @@ impl Connection {
                     }
                     if let Some(token) = params.stateless_reset_token {
                         self.endpoint_events
-                            .push_back(EndpointEventInner::ResetToken(self.path.remote, token));
+                            .push_back(EndpointEventInner::ResetToken(
+                                now,
+                                self.path.remote,
+                                token,
+                            ));
                     }
                     self.handle_peer_params(params)?;
                     self.issue_first_cids(now);
@@ -3170,7 +3431,7 @@ impl Connection {
                     self.discard_space(now, SpaceId::Handshake);
                 }
 
-                self.events.push_back(Event::Connected);
+                self.push_application_event(QueuedEvent::Connected)?;
                 self.state = State::Established;
                 trace!("established");
                 Ok(())
@@ -3180,12 +3441,10 @@ impl Connection {
             }) => {
                 if !state.rem_cid_set {
                     trace!("switching remote CID to {}", rem_cid);
-                    let mut state = state.clone();
                     self.rem_cids.update_initial_cid(rem_cid);
                     self.rem_handshake_cid = rem_cid;
                     self.orig_rem_cid = rem_cid;
                     state.rem_cid_set = true;
-                    self.state = State::Handshake(state);
                 } else if rem_cid != self.rem_handshake_cid {
                     debug!(
                         "discarding packet with mismatched remote CID: {} != {}",
@@ -3195,7 +3454,7 @@ impl Connection {
                 }
 
                 let starting_space = self.highest_space;
-                self.process_early_payload(now, packet)?;
+                self.process_early_payload(now, packet, None)?;
 
                 if self.side.is_server()
                     && starting_space == SpaceId::Initial
@@ -3249,12 +3508,13 @@ impl Connection {
     fn process_early_payload(
         &mut self,
         now: Instant,
-        packet: Packet,
+        packet: Packet<Bytes>,
+        idle_flight: Option<&mut control_inventory::records::CryptoEntry>,
     ) -> Result<(), TransportError> {
         debug_assert_ne!(packet.header.space(), SpaceId::Data);
         let payload_len = packet.payload.len();
         let mut ack_eliciting = false;
-        for result in frame::Iter::new(packet.payload.freeze())? {
+        for result in frame::Iter::new(packet.payload)? {
             let frame = result?;
             let span = match frame {
                 Frame::Padding => continue,
@@ -3276,7 +3536,7 @@ impl Connection {
                     self.on_ack_received(now, packet.header.space(), ack)?;
                 }
                 Frame::Close(reason) => {
-                    self.error = Some(reason.into());
+                    self.record_first_error(reason.into());
                     self.state = State::Draining;
                     return Ok(());
                 }
@@ -3296,7 +3556,10 @@ impl Connection {
                 .set_immediate_ack_required();
         }
 
-        self.write_crypto();
+        match idle_flight {
+            Some(flight) => self.write_idle_crypto(flight)?,
+            None => self.write_crypto()?,
+        }
         Ok(())
     }
 
@@ -3305,9 +3568,9 @@ impl Connection {
         now: Instant,
         remote: SocketAddr,
         number: u64,
-        packet: Packet,
+        packet: Packet<Bytes>,
     ) -> Result<(), TransportError> {
-        let payload = packet.payload.freeze();
+        let payload = packet.payload;
         let mut is_probing_packet = true;
         let mut close = None;
         let payload_len = payload.len();
@@ -3365,7 +3628,15 @@ impl Connection {
                     self.read_crypto(SpaceId::Data, &frame, payload_len)?;
                 }
                 Frame::Stream(frame) => {
-                    if self.streams.received(frame, payload_len)?.should_transmit() {
+                    if self
+                        .streams
+                        .received_checked(
+                            frame,
+                            payload_len,
+                            self.endpoint_config.receive_backing_meter.as_ref(),
+                        )?
+                        .should_transmit()
+                    {
                         self.spaces[SpaceId::Data].pending.max_data = true;
                     }
                 }
@@ -3373,210 +3644,17 @@ impl Connection {
                     self.on_ack_received(now, SpaceId::Data, ack)?;
                 }
                 Frame::Padding | Frame::Ping => {}
-                Frame::Close(reason) => {
-                    close = Some(reason);
-                }
-                Frame::PathChallenge(token) => {
-                    self.path_responses.push(number, token, remote);
-                    if remote == self.path.remote {
-                        // PATH_CHALLENGE on active path, possible off-path packet forwarding
-                        // attack. Send a non-probing packet to recover the active path.
-                        match self.peer_supports_ack_frequency() {
-                            true => self.immediate_ack(),
-                            false => self.ping(),
-                        }
-                    }
-                }
-                Frame::PathResponse(token) => {
-                    if self.path.challenge == Some(token) && remote == self.path.remote {
-                        trace!("new path validated");
-                        self.timers.stop(Timer::PathValidation);
-                        self.path.challenge = None;
-                        self.path.validated = true;
-                        if let Some((_, ref mut prev_path)) = self.prev_path {
-                            prev_path.challenge = None;
-                            prev_path.challenge_pending = false;
-                        }
-                    } else {
-                        debug!(token, "ignoring invalid PATH_RESPONSE");
-                    }
-                }
-                Frame::MaxData(bytes) => {
-                    self.streams.received_max_data(bytes);
-                }
-                Frame::MaxStreamData { id, offset } => {
-                    self.streams.received_max_stream_data(id, offset)?;
-                }
-                Frame::MaxStreams { dir, count } => {
-                    self.streams.received_max_streams(dir, count)?;
-                }
-                Frame::ResetStream(frame) => {
-                    if self.streams.received_reset(frame)?.should_transmit() {
-                        self.spaces[SpaceId::Data].pending.max_data = true;
-                    }
-                }
-                Frame::DataBlocked { offset } => {
-                    debug!(offset, "peer claims to be blocked at connection level");
-                }
-                Frame::StreamDataBlocked { id, offset } => {
-                    self.on_stream_data_blocked(id, offset)?;
-                }
-                Frame::StreamsBlocked { dir, limit } => {
-                    if limit > MAX_STREAM_COUNT {
-                        return Err(TransportError::FRAME_ENCODING_ERROR(
-                            "unrepresentable stream limit",
-                        ));
-                    }
-                    debug!(
-                        "peer claims to be blocked opening more than {} {} streams",
-                        limit, dir
-                    );
-                }
-                Frame::StopSending(frame::StopSending { id, error_code }) => {
-                    if id.initiator() != self.side.side() {
-                        if id.dir() == Dir::Uni {
-                            debug!("got STOP_SENDING on recv-only {}", id);
-                            return Err(TransportError::STREAM_STATE_ERROR(
-                                "STOP_SENDING on recv-only stream",
-                            ));
-                        }
-                    } else if self.streams.is_local_unopened(id) {
-                        return Err(TransportError::STREAM_STATE_ERROR(
-                            "STOP_SENDING on unopened stream",
-                        ));
-                    }
-                    self.streams.received_stop_sending(id, error_code);
-                }
-                Frame::RetireConnectionId { sequence } => {
-                    let allow_more_cids = self
-                        .local_cid_state
-                        .on_cid_retirement(sequence, self.peer_params.issue_cids_limit())?;
-                    self.endpoint_events
-                        .push_back(EndpointEventInner::RetireConnectionId(
-                            now,
-                            sequence,
-                            allow_more_cids,
-                        ));
-                }
-                Frame::NewConnectionId(frame) => {
-                    trace!(
-                        sequence = frame.sequence,
-                        id = %frame.id,
-                        retire_prior_to = frame.retire_prior_to,
-                    );
-                    if self.rem_cids.active().is_empty() {
-                        return Err(TransportError::PROTOCOL_VIOLATION(
-                            "NEW_CONNECTION_ID when CIDs aren't in use",
-                        ));
-                    }
-                    if frame.retire_prior_to > frame.sequence {
-                        return Err(TransportError::PROTOCOL_VIOLATION(
-                            "NEW_CONNECTION_ID retiring unissued CIDs",
-                        ));
-                    }
-
-                    use crate::cid_queue::InsertError;
-                    match self.rem_cids.insert(frame) {
-                        Ok(None) => {}
-                        Ok(Some((retired, reset_token))) => {
-                            let pending_retired =
-                                &mut self.spaces[SpaceId::Data].pending.retire_cids;
-                            /// Ensure `pending_retired` cannot grow without bound. Limit is
-                            /// somewhat arbitrary but very permissive.
-                            const MAX_PENDING_RETIRED_CIDS: u64 = CidQueue::LEN as u64 * 10;
-                            // We don't bother counting in-flight frames because those are bounded
-                            // by congestion control.
-                            if (pending_retired.len() as u64)
-                                .saturating_add(retired.end.saturating_sub(retired.start))
-                                > MAX_PENDING_RETIRED_CIDS
-                            {
-                                return Err(TransportError::CONNECTION_ID_LIMIT_ERROR(
-                                    "queued too many retired CIDs",
-                                ));
-                            }
-                            pending_retired.extend(retired);
-                            self.set_reset_token(reset_token);
-                        }
-                        Err(InsertError::ExceedsLimit) => {
-                            return Err(TransportError::CONNECTION_ID_LIMIT_ERROR(""));
-                        }
-                        Err(InsertError::Retired) => {
-                            trace!("discarding already-retired");
-                            // RETIRE_CONNECTION_ID might not have been previously sent if e.g. a
-                            // range of connection IDs larger than the active connection ID limit
-                            // was retired all at once via retire_prior_to.
-                            self.spaces[SpaceId::Data]
-                                .pending
-                                .retire_cids
-                                .push(frame.sequence);
-                            continue;
-                        }
-                    };
-
-                    if self.side.is_server() && self.rem_cids.active_seq() == 0 {
-                        // We're a server still using the initial remote CID for the client, so
-                        // let's switch immediately to enable clientside stateless resets.
-                        self.update_rem_cid();
-                    }
-                }
-                Frame::NewToken(NewToken { token }) => {
-                    let ConnectionSide::Client {
-                        token_store,
-                        server_name,
-                        ..
-                    } = &self.side
-                    else {
-                        return Err(TransportError::PROTOCOL_VIOLATION("client sent NEW_TOKEN"));
-                    };
-                    if token.is_empty() {
-                        return Err(TransportError::FRAME_ENCODING_ERROR("empty token"));
-                    }
-                    trace!("got new token");
-                    token_store.insert(server_name, token);
-                }
                 Frame::Datagram(datagram) => {
                     if self
                         .datagrams
                         .received(datagram, &self.config.datagram_receive_buffer_size)?
                     {
-                        self.events.push_back(Event::DatagramReceived);
+                        self.push_application_event(QueuedEvent::DatagramReceived)?;
                     }
                 }
-                Frame::AckFrequency(ack_frequency) => {
-                    // This frame can only be sent in the Data space
-                    let space = &mut self.spaces[SpaceId::Data];
-
-                    if !self
-                        .ack_frequency
-                        .ack_frequency_received(&ack_frequency, &mut space.pending_acks)?
-                    {
-                        // The AckFrequency frame is stale (we have already received a more recent one)
-                        continue;
-                    }
-
-                    // Our `max_ack_delay` has been updated, so we may need to adjust its associated
-                    // timeout
-                    if let Some(timeout) = space
-                        .pending_acks
-                        .max_ack_delay_timeout(self.ack_frequency.max_ack_delay)
-                    {
-                        self.timers.set(Timer::MaxAckDelay, timeout);
-                    }
-                }
-                Frame::ImmediateAck => {
-                    // This frame can only be sent in the Data space
-                    self.spaces[SpaceId::Data]
-                        .pending_acks
-                        .set_immediate_ack_required();
-                }
-                Frame::HandshakeDone => {
-                    if self.side.is_server() {
-                        return Err(TransportError::PROTOCOL_VIOLATION(
-                            "client sent HANDSHAKE_DONE",
-                        ));
-                    }
-                    if self.spaces[SpaceId::Handshake].crypto.is_some() {
-                        self.discard_space(now, SpaceId::Handshake);
+                frame => {
+                    if let Some(reason) = self.process_control_frame(now, remote, number, frame)? {
+                        close = Some(reason);
                     }
                 }
             }
@@ -3603,7 +3681,7 @@ impl Connection {
         self.streams.queue_max_stream_id(pending);
 
         if let Some(reason) = close {
-            self.error = Some(reason.into());
+            self.record_first_error(reason.into());
             self.state = State::Draining;
             self.close = true;
         }
@@ -3619,62 +3697,82 @@ impl Connection {
                 server_config.migration,
                 "migration-initiating packets should have been dropped immediately"
             );
-            self.migrate(now, remote);
-            // Break linkability, if possible
-            self.update_rem_cid();
+            // Hold every retirement before path/RTT/CC or active CID changes.
+            let prepared = self.prepare_remote_cid(None)?;
+            self.migrate(now, remote)?;
+            // Break linkability, if possible, on the new path.
+            self.commit_remote_cid(prepared, now);
             self.spin = false;
         }
 
         Ok(())
     }
 
-    fn migrate(&mut self, now: Instant, remote: SocketAddr) {
-        self.fail_successor_service_turn(SuccessorServiceTurnFailure::PathChanged);
+    fn migrate(&mut self, now: Instant, remote: SocketAddr) -> Result<(), TransportError> {
         trace!(%remote, "migration initiated");
-        self.path_counter = self.path_counter.wrapping_add(1);
+        let generation = self
+            .path_counter
+            .checked_add(1)
+            .ok_or_else(|| TransportError::INTERNAL_ERROR("path generation exhausted"))?;
         // Reset rtt/congestion state for new path unless it looks like a NAT rebinding.
         // Note that the congestion window will not grow until validation terminates. Helps mitigate
         // amplification attacks performed by spoofing source addresses.
-        let mut new_path = if remote.is_ipv4() && remote.ip() == self.path.remote.ip() {
-            PathData::from_previous(remote, &self.path, self.path_counter, now)
-        } else {
-            let peer_max_udp_payload_size =
-                u16::try_from(self.peer_params.max_udp_payload_size.into_inner())
-                    .unwrap_or(u16::MAX);
-            PathData::new(
-                remote,
-                self.allow_mtud,
-                Some(peer_max_udp_payload_size),
-                self.path_counter,
-                now,
-                &self.config,
-            )
-        };
-        new_path.challenge = Some(self.rng.random());
-        new_path.challenge_pending = true;
+        let mut path_disposal = migration_disposal::PathDisposal::prepare(
+            self.endpoint_config.receive_backing_meter.clone(),
+            || {
+                let mut new_path = if remote.is_ipv4() && remote.ip() == self.path.remote.ip() {
+                    PathData::from_previous(remote, &self.path, generation, now)
+                } else {
+                    let peer_max_udp_payload_size =
+                        u16::try_from(self.peer_params.max_udp_payload_size.into_inner())
+                            .unwrap_or(u16::MAX);
+                    PathData::new(
+                        remote,
+                        self.allow_mtud,
+                        Some(peer_max_udp_payload_size),
+                        generation,
+                        now,
+                        &self.config,
+                    )
+                };
+                new_path.challenge = Some(self.rng.random());
+                new_path.challenge_pending = true;
+                new_path
+            },
+        );
         let prev_pto = self.pto(SpaceId::Data);
 
-        let mut prev = mem::replace(&mut self.path, new_path);
-        if let Some(pacing) = self.endpoint_pacing.as_mut() {
-            let pacing_migrated = pacing.migrate(self.path_counter).is_ok();
-            debug_assert!(
-                pacing_migrated,
-                "endpoint pacing path generation must be unique"
-            );
-        }
+        // All capacity rejection precedes mutation of Path, its key and timers.
+        // Opaque wake/drop effects remain held until the matching root commits.
+        let pacing_effects = self
+            .endpoint_pacing
+            .as_mut()
+            .map(|pacing| pacing.migrate_deferred(generation))
+            .transpose()
+            .map_err(|_| {
+                TransportError::INTERNAL_ERROR("pacing migration inventory unavailable")
+            })?;
+        self.fail_successor_service_turn(SuccessorServiceTurnFailure::PathChanged);
+        self.path_counter = generation;
+        path_disposal.install(&mut self.path);
         // Don't clobber the original path if the previous one hasn't been validated yet
-        if prev.challenge.is_none() {
-            prev.challenge = Some(self.rng.random());
-            prev.challenge_pending = true;
-            // We haven't updated the remote CID yet, this captures the remote CID we were using on
-            // the previous path.
-            self.prev_path = Some((self.rem_cids.active(), prev));
-        }
+        // The active CID still belongs to the old path. Retire displaced paths
+        // without invoking their opaque controller destructors during commit.
+        path_disposal.retain_validated_previous(
+            &mut self.prev_path,
+            self.rem_cids.active(),
+            || self.rng.random(),
+        );
 
         self.timers.set(
             Timer::PathValidation,
             now + 3 * cmp::max(self.pto(SpaceId::Data), prev_pto),
         );
+        drop(path_disposal);
+        if let Some(effects) = pacing_effects {
+            effects.finish();
+        }
+        Ok(())
     }
 
     fn on_stream_data_blocked(&mut self, id: StreamId, offset: u64) -> Result<(), TransportError> {
@@ -3708,30 +3806,10 @@ impl Connection {
         self.on_stream_data_blocked(id, offset)
     }
 
-    /// Handle a change in the local address, i.e. an active migration
-    pub fn local_address_changed(&mut self) {
-        self.update_rem_cid();
-        self.ping();
-    }
-
-    /// Switch to a previously unused remote connection ID, if possible
-    fn update_rem_cid(&mut self) {
-        let (reset_token, retired) = match self.rem_cids.next() {
-            Some(x) => x,
-            None => return,
-        };
-
-        // Retire the current remote CID and any CIDs we had to skip.
-        self.spaces[SpaceId::Data]
-            .pending
-            .retire_cids
-            .extend(retired);
-        self.set_reset_token(reset_token);
-    }
-
-    fn set_reset_token(&mut self, reset_token: ResetToken) {
+    fn set_reset_token(&mut self, reset_token: ResetToken, now: Instant) {
         self.endpoint_events
             .push_back(EndpointEventInner::ResetToken(
+                now,
                 self.path.remote,
                 reset_token,
             ));
@@ -3761,12 +3839,24 @@ impl Connection {
         now: Instant,
         space_id: SpaceId,
         buf: &mut Vec<u8>,
-        max_size: usize,
-        pn: u64,
+        builder: &PacketBuilder,
+        prepared_packet: control_inventory::records::PreparedPacket,
     ) -> SentFrames {
-        let mut sent = SentFrames::default();
+        let control_inventory::records::PreparedPacket {
+            records: packet_records,
+            streams: prepared_streams,
+            crypto: mut crypto_splits,
+        } = prepared_packet;
+        let mut application_event_failed = false;
+        let max_size = builder.max_size;
+        let pn = builder.exact_number;
+        let data_allowed = builder.allows_data();
+        let mut sent = SentFrames {
+            retransmits: ThinRetransmits::with_records(packet_records),
+            ..Default::default()
+        };
         let successor_service_turn =
-            space_id == SpaceId::Data && self.successor_service_turn_wants_packet();
+            space_id == SpaceId::Data && data_allowed && self.successor_service_turn_wants_packet();
         let space = &mut self.spaces[space_id];
         let is_0rtt = space_id == SpaceId::Data && space.crypto.is_none();
         space.pending_acks.maybe_ack_non_eliciting();
@@ -3874,44 +3964,50 @@ impl Connection {
 
         // CRYPTO
         while buf.len() + frame::Crypto::SIZE_BOUND < max_size && !is_0rtt {
-            let mut frame = match space.pending.crypto.pop_front() {
+            let mut record = match space.pending.crypto.pop_front() {
                 Some(x) => x,
                 None => break,
             };
-
-            // Calculate the maximum amount of crypto data we can store in the buffer.
-            // Since the offset is known, we can reserve the exact size required to encode it.
-            // For length we reserve 2bytes which allows to encode up to 2^14,
-            // which is more than what fits into normally sized QUIC frames.
             let max_crypto_data_size = max_size
                 - buf.len()
-                - 1 // Frame Type
-                - VarInt::size(unsafe { VarInt::from_u64_unchecked(frame.offset) })
-                - 2; // Maximum encoded length for frame size, given we send less than 2^14 bytes
-
-            let len = frame
+                - 1
+                - VarInt::size(unsafe { VarInt::from_u64_unchecked(record.frame.offset) })
+                - 2;
+            let len = record
+                .frame
                 .data
                 .len()
-                .min(2usize.pow(14) - 1)
+                .min((1 << 14) - 1)
                 .min(max_crypto_data_size);
-
-            let data = frame.data.split_to(len);
-            let truncated = frame::Crypto {
-                offset: frame.offset,
-                data,
+            let outgoing = if len < record.frame.data.len() {
+                let Some(mut split) = crypto_splits.split_ticket() else {
+                    // This is an invariant failure, never ordinary capacity
+                    // admission after PN. The original root retains shared Q.
+                    space.pending.crypto.quarantine();
+                    space.pending.crypto.push_front(record);
+                    break;
+                };
+                record.begin_mutation();
+                split.begin_mutation();
+                split.frame = frame::Crypto {
+                    offset: record.frame.offset,
+                    data: record.frame.data.split_to(len),
+                };
+                record.frame.offset += len as u64;
+                space.pending.crypto.push_front(record);
+                split
+            } else {
+                record.begin_mutation();
+                record
             };
             trace!(
                 "CRYPTO: off {} len {}",
-                truncated.offset,
-                truncated.data.len()
+                outgoing.frame.offset,
+                outgoing.frame.data.len()
             );
-            truncated.encode(buf);
+            outgoing.frame.encode(buf);
             self.stats.frame_tx.crypto += 1;
-            sent.retransmits.get_or_create().crypto.push_back(truncated);
-            if !frame.data.is_empty() {
-                frame.offset += len as u64;
-                space.pending.crypto.push_front(frame);
-            }
+            sent.retransmits.get_or_create().crypto.push_back(outgoing);
         }
 
         if space_id == SpaceId::Data {
@@ -3926,45 +4022,57 @@ impl Connection {
 
         // NEW_CONNECTION_ID
         while buf.len() + NewConnectionId::SIZE_BOUND < max_size {
-            let issued = match space.pending.new_cids.pop() {
+            let issued = match space.pending_cids.pop_sendable() {
                 Some(x) => x,
                 None => break,
             };
+            let value = issued.value();
             trace!(
-                sequence = issued.sequence,
-                id = %issued.id,
+                sequence = value.sequence,
+                id = %value.id,
                 "NEW_CONNECTION_ID"
             );
             frame::NewConnectionId {
-                sequence: issued.sequence,
-                retire_prior_to: self.local_cid_state.retire_prior_to(),
-                id: issued.id,
-                reset_token: issued.reset_token,
+                sequence: value.sequence,
+                // A lost old CID can be requeued after retirement advances.
+                // RFC 9000 §19.15 forbids a boundary above this frame's sequence;
+                // lower retransmitted boundaries cannot undo peer retirement.
+                retire_prior_to: self.local_cid_state.retire_prior_to().min(value.sequence),
+                id: value.id,
+                reset_token: value.reset_token,
             }
             .encode(buf);
-            sent.retransmits.get_or_create().new_cids.push(issued);
+            issued.mark_encoded();
+            self.local_cid_state.mark_encoded(value.sequence);
+            sent.retransmits.new_cids.push(issued);
             self.stats.frame_tx.new_connection_id += 1;
         }
 
         // RETIRE_CONNECTION_ID
         while buf.len() + frame::RETIRE_CONNECTION_ID_SIZE_BOUND < max_size {
-            let seq = match space.pending.retire_cids.pop() {
+            let mut record = match space.pending.retire_cids.pop() {
                 Some(x) => x,
                 None => break,
             };
+            let seq = record.value();
+            record.begin_mutation();
             trace!(sequence = seq, "RETIRE_CONNECTION_ID");
             buf.write(frame::FrameType::RETIRE_CONNECTION_ID);
             buf.write_var(seq);
-            sent.retransmits.get_or_create().retire_cids.push(seq);
+            sent.retransmits.get_or_create().retire_cids.push(record);
             self.stats.frame_tx.retire_connection_id += 1;
         }
 
         // DATAGRAM
         let mut sent_datagrams = false;
-        while buf.len() + Datagram::SIZE_BOUND < max_size && space_id == SpaceId::Data {
+        while data_allowed
+            && buf.len() + Datagram::SIZE_BOUND < max_size
+            && space_id == SpaceId::Data
+        {
             match self.datagrams.write(buf, max_size) {
                 true => {
                     sent_datagrams = true;
+                    sent.application_datagram = true;
                     sent.non_retransmits = true;
                     self.stats.frame_tx.datagram += 1;
                 }
@@ -3972,8 +4080,11 @@ impl Connection {
             }
         }
         if self.datagrams.send_blocked && sent_datagrams {
-            self.events.push_back(Event::DatagramsUnblocked);
-            self.datagrams.send_blocked = false;
+            if self.events.push_reserved(QueuedEvent::DatagramsUnblocked, usize::from(self.successor_service_turn.is_some())).is_ok() {
+                self.datagrams.send_blocked = false;
+            } else {
+                application_event_failed = true;
+            }
         }
 
         // NEW_TOKEN
@@ -4016,16 +4127,23 @@ impl Connection {
         }
 
         // STREAM
-        if space_id == SpaceId::Data {
-            sent.stream_frames =
-                self.streams
-                    .write_stream_frames(buf, max_size, self.config.send_fairness);
+        if space_id == SpaceId::Data && data_allowed {
+            sent.stream_frames = self
+                .streams
+                .write_stream_frames(buf, max_size, self.config.send_fairness, prepared_streams)
+                .unwrap_or_else(|error| {
+                    self.fail_control_inventory(now, streams::inventory_reason(error));
+                    StreamFrames::default()
+                });
             sent.transport_write_demand = self
                 .streams
                 .owns_transport_write_demand(&sent.stream_frames);
             self.stats.frame_tx.stream += sent.stream_frames.len() as u64;
         }
 
+        if application_event_failed {
+            self.fail_control_inventory(now, "application event inventory mismatch");
+        }
         sent
     }
 
@@ -4116,71 +4234,6 @@ impl Connection {
         self.path.mtud.on_peer_max_udp_payload_size_received(
             u16::try_from(self.peer_params.max_udp_payload_size.into_inner()).unwrap_or(u16::MAX),
         );
-    }
-
-    fn decrypt_packet(
-        &mut self,
-        now: Instant,
-        packet: &mut Packet,
-    ) -> Result<Option<u64>, Option<TransportError>> {
-        let result = packet_crypto::decrypt_packet_body(
-            packet,
-            &self.spaces,
-            self.zero_rtt_crypto.as_ref(),
-            self.key_phase,
-            self.prev_crypto.as_ref(),
-            self.next_crypto.as_ref(),
-        )?;
-
-        let result = match result {
-            Some(r) => r,
-            None => return Ok(None),
-        };
-
-        if result.outgoing_key_update_acked {
-            if let Some(prev) = self.prev_crypto.as_mut() {
-                prev.end_packet = Some((result.number, now));
-                self.set_key_discard_timer(now, packet.header.space());
-            }
-        }
-
-        if result.incoming_key_update {
-            trace!("key update authenticated");
-            self.update_keys(Some((result.number, now)), true);
-            self.set_key_discard_timer(now, packet.header.space());
-        }
-
-        Ok(Some(result.number))
-    }
-
-    fn update_keys(&mut self, end_packet: Option<(u64, Instant)>, remote: bool) {
-        trace!("executing key update");
-        // Generate keys for the key phase after the one we're switching to, store them in
-        // `next_crypto`, make the contents of `next_crypto` current, and move the current keys into
-        // `prev_crypto`.
-        let new = self
-            .crypto
-            .next_1rtt_keys()
-            .expect("only called for `Data` packets");
-        self.key_phase_size = new
-            .local
-            .confidentiality_limit()
-            .saturating_sub(KEY_UPDATE_MARGIN);
-        let old = mem::replace(
-            &mut self.spaces[SpaceId::Data]
-                .crypto
-                .as_mut()
-                .unwrap() // safe because update_keys() can only be triggered by short packets
-                .packet,
-            mem::replace(self.next_crypto.as_mut().unwrap(), new),
-        );
-        self.spaces[SpaceId::Data].sent_with_keys = 0;
-        self.prev_crypto = Some(PrevCrypto {
-            crypto: old,
-            end_packet,
-            update_unacked: remote,
-        });
-        self.key_phase = !self.key_phase;
     }
 
     fn peer_supports_ack_frequency(&self) -> bool {
@@ -4302,23 +4355,29 @@ impl Connection {
         self.path.current_mtu()
     }
 
+    fn can_send_budgeted_stream_data(&self) -> bool {
+        self.streams.can_send_stream_data()
+            && PreparedStreams::ready(&self.spaces[SpaceId::Data].pending.reset_stream)
+    }
+
     /// Whether we have 1-RTT data to send
     ///
     /// See also `self.space(SpaceId::Data).can_send()`
-    fn can_send_1rtt(&self, max_size: usize) -> bool {
-        self.streams.can_send_stream_data()
-            || self.successor_service_turn_wants_packet()
+    fn can_send_1rtt(&self, max_size: usize, data_allowed: bool) -> bool {
+        (data_allowed
+            && (self.can_send_budgeted_stream_data()
+                || self.successor_service_turn_wants_packet()
+                || self
+                    .datagrams
+                    .outgoing
+                    .front()
+                    .is_some_and(|x| x.size(true) <= max_size)))
             || self.path.challenge_pending
             || self
                 .prev_path
                 .as_ref()
                 .is_some_and(|(_, x)| x.challenge_pending)
             || !self.path_responses.is_empty()
-            || self
-                .datagrams
-                .outgoing
-                .front()
-                .is_some_and(|x| x.size(true) <= max_size)
     }
 
     /// Update counters to account for a packet becoming acknowledged, lost, or abandoned
@@ -4335,9 +4394,17 @@ impl Connection {
     }
 
     /// Terminate the connection instantly, without sending a close packet
+    /// All connection failure producers retain one original cause. A later
+    /// protocol event still performs its original lifecycle transition.
+    fn record_first_error(&mut self, reason: ConnectionError) {
+        if self.error.is_none() {
+            self.error = Some(reason);
+        }
+    }
+
     fn kill(&mut self, reason: ConnectionError) {
         self.close_common();
-        self.error = Some(reason);
+        self.record_first_error(reason);
         self.state = State::Drained;
         self.endpoint_events.push_back(EndpointEventInner::Drained);
     }
@@ -4455,14 +4522,23 @@ impl ConnectionSide {
     }
 }
 
-impl From<SideArgs> for ConnectionSide {
-    fn from(side: SideArgs) -> Self {
-        match side {
+impl ConnectionSide {
+    fn prepare(
+        side: SideArgs,
+        meter: Option<&bytes::BackingMeter>,
+    ) -> Result<Self, TransportError> {
+        Ok(match side {
             SideArgs::Client {
                 token_store,
                 server_name,
             } => Self::Client {
-                token: token_store.take(&server_name).unwrap_or_default(),
+                token: match meter.filter(|m| m.budget_limit().is_some()) {
+                    Some(meter) => token_store
+                        .take_metered(&server_name, meter)
+                        .map_err(|_| TransportError::INTERNAL_ERROR("token cache take refused"))?,
+                    None => token_store.take(&server_name),
+                }
+                .unwrap_or_default(),
                 token_store,
                 server_name,
             },
@@ -4471,7 +4547,7 @@ impl From<SideArgs> for ConnectionSide {
                 pref_addr_cid: _,
                 path_validated: _,
             } => Self::Server { server_config },
-        }
+        })
     }
 }
 
@@ -4572,7 +4648,6 @@ impl From<ConnectionError> for io::Error {
 }
 
 #[allow(unreachable_pub)] // fuzzing only
-#[derive(Clone)]
 pub enum State {
     Handshake(state::Handshake),
     Established,
@@ -4610,7 +4685,6 @@ mod state {
     use super::*;
 
     #[allow(unreachable_pub)] // fuzzing only
-    #[derive(Clone)]
     pub struct Handshake {
         /// Whether the remote CID has been set by the peer yet
         ///
@@ -4623,7 +4697,7 @@ mod state {
         /// First cryptographic message
         ///
         /// Only set for clients
-        pub(super) client_hello: Option<Bytes>,
+        pub(super) client_hello: Option<control_inventory::records::CryptoEntry>,
     }
 
     #[allow(unreachable_pub)] // fuzzing only
@@ -4693,9 +4767,10 @@ const KEY_UPDATE_MARGIN: u64 = 10_000;
 struct SentFrames {
     retransmits: ThinRetransmits,
     largest_acked: Option<u64>,
-    stream_frames: StreamMetaVec,
+    stream_frames: StreamFrames,
     /// Whether the packet contains non-retransmittable frames (like datagrams)
     non_retransmits: bool,
+    application_datagram: bool,
     requires_padding: bool,
     successor_service_turn: bool,
     transport_write_demand: bool,
@@ -4726,6 +4801,9 @@ fn negotiate_max_idle_timeout(x: Option<VarInt>, y: Option<VarInt>) -> Option<Du
         (Some(x), Some(y)) => Some(Duration::from_millis(cmp::min(x, y).0)),
     }
 }
+
+#[cfg(test)]
+mod event_capacity_probe;
 
 #[cfg(test)]
 mod tests {

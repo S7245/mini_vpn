@@ -1,11 +1,11 @@
 use tracing::{debug, trace};
 
-use crate::Instant;
 use crate::connection::spaces::PacketSpace;
 use crate::crypto::{HeaderKey, KeyPair, PacketKey};
 use crate::packet::{Packet, PartialDecode, SpaceId};
 use crate::token::ResetToken;
-use crate::{RESET_TOKEN_SIZE, TransportError};
+use crate::Instant;
+use crate::{TransportError, RESET_TOKEN_SIZE};
 
 /// Removes header protection of a packet, or returns `None` if the packet was dropped
 pub(super) fn unprotect_header(
@@ -74,12 +74,22 @@ pub(super) fn decrypt_packet_body(
     prev_crypto: Option<&PrevCrypto>,
     next_crypto: Option<&KeyPair<Box<dyn PacketKey>>>,
 ) -> Result<Option<DecryptPacketResult>, Option<TransportError>> {
+    let rx_packet = spaces[packet.header.space()].rx_packet;
+    decrypt_packet_body_at(packet, spaces, zero_rtt_crypto, conn_key_phase, prev_crypto, next_crypto, rx_packet)
+}
+
+/// The original authentication algorithm with a packet-local previous PN.
+/// Coalesced preparation advances this value without publishing PacketSpace.
+pub(super) fn decrypt_packet_body_at(
+    packet: &mut Packet, spaces: &[PacketSpace; 3], zero_rtt_crypto: Option<&ZeroRttCrypto>,
+    conn_key_phase: bool, prev_crypto: Option<&PrevCrypto>,
+    next_crypto: Option<&KeyPair<Box<dyn PacketKey>>>, rx_packet: u64,
+) -> Result<Option<DecryptPacketResult>, Option<TransportError>> {
     if !packet.header.is_protected() {
         // Unprotected packets also don't have packet numbers
         return Ok(None);
     }
     let space = packet.header.space();
-    let rx_packet = spaces[space].rx_packet;
     let number = packet.header.number().ok_or(None)?.expand(rx_packet + 1);
     let packet_key_phase = packet.header.key_phase();
 

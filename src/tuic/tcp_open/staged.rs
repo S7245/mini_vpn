@@ -1,4 +1,4 @@
-//! Retained Generic TUIC open for the control root. Owns every acquired lease,
+//! Retained TUIC open for the control root. Owns every acquired lease,
 //! half, CONNECT cursor and retirement witness before the next control turn.
 //! No task, timer, reconnect/probe future or DATA dispatch is created here.
 //! The root must join actual carrier users before settle. Tests: ../tests/staged.rs.
@@ -15,15 +15,15 @@ pub(super) fn create(
     if upstream.udp_runtime.node_stopping() {
         return Err(TcpOpenUnavailable::Unsupported);
     }
-    if upstream.relay_policy.tuic_native_override() != TuicNativeOverride::None {
-        return Err(TcpOpenUnavailable::Unsupported);
-    }
     if matches!(&request.target, TargetAddr::DomainPort { host, .. } if host.is_empty() || host.len() > 255)
     {
         return Err(TcpOpenUnavailable::InvalidTarget);
     }
     let header = encode_connect(&request.target);
     Ok(Attempt {
+        failed_replacement_slots: vec![false; upstream.tcp_pool_slots.len()],
+        failed_replacement: false,
+        receipt: None,
         runtime: upstream.udp_runtime.clone(),
         upstream: Some(upstream),
         request,
@@ -45,6 +45,9 @@ pub(super) struct Attempt {
     header: Option<Vec<u8>>,
     header_len: usize,
     state: State,
+    failed_replacement_slots: Vec<bool>,
+    failed_replacement: bool,
+    receipt: Option<node::recovery::Receipt>,
     failure: Option<ClientError>,
     cancel_requested: bool,
     settle_deadline: Option<Instant>,
@@ -57,7 +60,20 @@ enum State {
     Acquiring,
     Reserved(TcpPoolSlotReservation),
     Recovering(node::recovery::Ticket),
-    Maintenance(TcpPoolAuxiliaryReplacementPreparation),
+    Maintenance {
+        replacement: TcpPoolAuxiliaryReplacementPreparation,
+        deadline: tokio::time::Instant,
+    },
+    HealthyRecovering {
+        ticket: node::recovery::Ticket,
+        index: usize,
+    },
+    ProbePending {
+        reservation: TcpPoolSlotReservation,
+        kind: node::recovery::ProbeKind,
+        deadline: tokio::time::Instant,
+    },
+    Probing(node::recovery::Ticket),
     Opening(TcpPoolConnectionSelection),
     Stream(StreamAttempt),
     Transferred(Custody),
@@ -141,7 +157,12 @@ impl StreamAttempt {
     }
 }
 
-struct ReadyGeneration {
+enum ReadyGeneration {
+    Connection(ReadyConnection),
+    Probe(node::recovery::ProbeKind),
+}
+
+struct ReadyConnection {
     conn: Connection,
     open_state: Arc<TcpPoolOpenState>,
     write_pressure: Arc<TcpWritePressure>,
@@ -149,6 +170,7 @@ struct ReadyGeneration {
     generation: u64,
     age: Option<u64>,
     auth_attempts: u64,
+    replacement_installed: bool,
 }
 
 fn maintenance(message: &'static str) -> ClientError {
@@ -158,6 +180,7 @@ fn maintenance(message: &'static str) -> ClientError {
 fn ready_generation(
     upstream: &TuicUpstream,
     reservation: &TcpPoolSlotReservation,
+    receipt: &mut Option<node::recovery::Receipt>,
 ) -> Result<Option<ReadyGeneration>, ClientError> {
     let slot = upstream
         .tcp_pool_slots
@@ -185,6 +208,12 @@ fn ready_generation(
     if let Some(error) = current.transport.close_reason() {
         return Err(ClientError::Io(io::Error::other(error)));
     }
+    // Keep the one-time proof across a contended slot; only consume it after
+    // validating the original reservation against the actual generation.
+    let proof = receipt
+        .take()
+        .and_then(|proof| proof.consume_proof(reservation));
+    let replacement_installed = proof == Some(node::recovery::Proof::Replacement);
     let now = upstream.clock.elapsed().as_secs();
     let path = current.transport.stats().path;
     let fresh = TcpPoolPathObservation::Known {
@@ -198,18 +227,16 @@ fn ready_generation(
         || reservation.qualification != TcpPoolForwardQualification::Qualified
         || reservation.black_holes_current != Some(path.black_holes_detected)
         || fresh.successor_service_readiness().is_stale()
-        || (reservation.active_before == 0 && current.open_state.needs_reconnect(reservation.index))
-        || should_probe_tcp_pool_generation(
-            reservation.index,
-            now,
-            current.open_state.last_success_secs().unwrap_or(0),
-            reservation.active_before == 0,
-            false,
-        )
     {
         return Err(maintenance("TUIC ready pool requires maintenance"));
     }
-    Ok(Some(ReadyGeneration {
+    if let Some(kind) = upstream.node_probe_kind(reservation, current, proof.is_some()) {
+        if upstream.udp_runtime.node_owned() {
+            return Ok(Some(ReadyGeneration::Probe(kind)));
+        }
+        return Err(maintenance("TUIC ready pool requires maintenance"));
+    }
+    Ok(Some(ReadyGeneration::Connection(ReadyConnection {
         conn: current.transport.clone(),
         open_state: current.open_state.clone(),
         write_pressure: current.write_pressure.clone(),
@@ -217,7 +244,8 @@ fn ready_generation(
         generation: current.open_state.generation(),
         age: current.open_state.last_success_age_secs(now),
         auth_attempts: current.auth_attempts,
-    }))
+        replacement_installed,
+    })))
 }
 
 impl Attempt {
@@ -311,21 +339,24 @@ impl Attempt {
         match &mut self.state {
             State::Unstarted => self.state = State::Acquiring,
             State::Acquiring => {
-                let observations = upstream.sample_tcp_pool_observations();
-                let replacement = upstream.tcp_pool_replacement_allowed();
-                match upstream.tcp_pool_admission.try_decide_once(
-                    &observations,
-                    &replacement,
-                    &[],
-                    false,
+                let snapshots = upstream.sample_staged_tcp_pool();
+                match upstream.tcp_pool_admission.try_decide_staged_once(
+                    &snapshots,
+                    &self.failed_replacement_slots,
+                    self.failed_replacement,
                 ) {
                     Ok(TcpPoolAdmissionDecision::ReserveCurrent(mut reservation)) => {
                         reservation.lease.retain_until_release();
                         self.state = State::Reserved(reservation);
                     }
                     Ok(TcpPoolAdmissionDecision::ReplaceAuxiliary(replacement)) => {
-                        self.state = State::Maintenance(replacement);
-                        self.fail(maintenance("TUIC ready pool requires replacement"), now);
+                        self.state = State::Maintenance {
+                            replacement,
+                            deadline: tokio::time::Instant::now() + TUIC_RECONNECT_TIMEOUT,
+                        };
+                        if !upstream.udp_runtime.node_owned() {
+                            self.fail(maintenance("TUIC ready pool requires replacement"), now);
+                        }
                     }
                     Err(
                         TcpPoolAdmissionRoundError::Contended
@@ -350,6 +381,85 @@ impl Attempt {
             State::Recovering(ticket) => match upstream.observe_aux_recovery(*ticket) {
                 Ok(true) => self.state = State::Acquiring,
                 Ok(false) => {}
+                Err(error) => self.fail(error, now),
+            },
+            State::Maintenance { replacement, .. } => {
+                let Some(slot) = upstream.tcp_pool_slots.get(replacement.index) else {
+                    self.fail(maintenance("healthy replacement slot missing"), now);
+                    return;
+                };
+                let Ok(slot) = slot.state.try_lock() else {
+                    return;
+                };
+                let State::Maintenance {
+                    replacement,
+                    deadline,
+                } = std::mem::replace(&mut self.state, State::Unstarted)
+                else {
+                    return;
+                };
+                let index = replacement.index;
+                match upstream.submit_healthy_replacement(replacement, slot, deadline) {
+                    Ok(ticket) => self.state = State::HealthyRecovering { ticket, index },
+                    Err(node::recovery::SubmissionFailure { error, settled }) => {
+                        if settled {
+                            self.failed_replacement_slots[index] = true;
+                            self.failed_replacement = true;
+                            self.state = State::Acquiring;
+                        } else {
+                            self.fail(error, now);
+                        }
+                    }
+                }
+            }
+            State::HealthyRecovering { ticket, index } => {
+                match upstream.poll_maintenance_receipt(*ticket) {
+                    Ok(Some(receipt)) => {
+                        self.receipt = Some(receipt);
+                        self.state = State::Acquiring;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        if upstream.healthy_fallback_allowed(*ticket) {
+                            self.failed_replacement_slots[*index] = true;
+                            self.failed_replacement = true;
+                            self.state = State::Acquiring;
+                        } else {
+                            self.fail(error, now);
+                        }
+                    }
+                }
+            }
+            State::ProbePending { reservation, .. } => {
+                let Some(slot) = upstream.tcp_pool_slots.get(reservation.index) else {
+                    self.fail(maintenance("probe slot missing"), now);
+                    return;
+                };
+                let Ok(slot) = slot.state.try_lock() else {
+                    return;
+                };
+                let State::ProbePending {
+                    reservation,
+                    kind,
+                    deadline,
+                } = std::mem::replace(&mut self.state, State::Unstarted)
+                else {
+                    return;
+                };
+                match upstream.submit_probe(reservation, slot, kind, deadline) {
+                    Ok(ticket) => self.state = State::Probing(ticket),
+                    Err(node::recovery::ProbeSubmissionFailure { error, reservation }) => {
+                        self.state = State::Reserved(reservation);
+                        self.fail(error, now);
+                    }
+                }
+            }
+            State::Probing(ticket) => match upstream.poll_maintenance_receipt(*ticket) {
+                Ok(Some(receipt)) => {
+                    self.receipt = Some(receipt);
+                    self.state = State::Acquiring;
+                }
+                Ok(None) => {}
                 Err(error) => self.fail(error, now),
             },
             State::Reserved(reservation) => {
@@ -394,8 +504,21 @@ impl Attempt {
                         return;
                     }
                 }
-                let ready = match ready_generation(upstream, reservation) {
-                    Ok(Some(ready)) => ready,
+                let ready = match ready_generation(upstream, reservation, &mut self.receipt) {
+                    Ok(Some(ReadyGeneration::Connection(ready))) => ready,
+                    Ok(Some(ReadyGeneration::Probe(kind))) => {
+                        let State::Reserved(reservation) =
+                            std::mem::replace(&mut self.state, State::Unstarted)
+                        else {
+                            return;
+                        };
+                        self.state = State::ProbePending {
+                            reservation,
+                            kind,
+                            deadline: kind.deadline(),
+                        };
+                        return;
+                    }
                     Ok(None) => return,
                     Err(error) => {
                         self.fail(error, now);
@@ -444,7 +567,7 @@ impl Attempt {
                     write_pressure: ready.write_pressure,
                     read_pressure: ready.read_pressure,
                     startup_auth_attempts: ready.auth_attempts,
-                    replacement_installed: false,
+                    replacement_installed: ready.replacement_installed,
                 });
                 drop(preparation);
             }
@@ -505,7 +628,7 @@ impl Attempt {
                     }
                 }
             }
-            State::Maintenance(_) | State::Retiring(_) => {}
+            State::Retiring(_) => {}
             State::Transferred(_) | State::Settled(_) => {}
         }
     }
@@ -522,7 +645,7 @@ impl Attempt {
         }
         let state = std::mem::replace(&mut self.state, State::Retiring(Custody::empty()));
         match state {
-            State::Reserved(r) => {
+            State::Reserved(r) | State::ProbePending { reservation: r, .. } => {
                 self.state = State::Retiring(Custody {
                     lease: Some(r.lease),
                     ..Custody::empty()
@@ -547,13 +670,18 @@ impl Attempt {
                 drop(stream.writer);
                 drop(stream.recv);
             }
-            State::Maintenance(replacement) => drop(replacement),
+            State::Maintenance { replacement, .. } => drop(replacement),
             State::Transferred(c) | State::Retiring(c) => self.state = State::Retiring(c),
             State::Settled(receipt) => self.state = State::Settled(receipt),
-            State::Unstarted | State::Acquiring | State::Recovering(_) => {}
+            State::Unstarted
+            | State::Acquiring
+            | State::Recovering(_)
+            | State::HealthyRecovering { .. }
+            | State::Probing(_) => {}
         }
         // Typed custody is installed first. Holding DATA here would keep the
         // closed connection's physical storage alive while its witness waits.
+        self.receipt = None;
         self.upstream = None;
     }
 
@@ -656,6 +784,158 @@ impl Attempt {
                 progress: send.inner.progress_handle(),
             });
         }
+        let native_mode = upstream.relay_policy.tuic_native_override();
+        if native_mode != TuicNativeOverride::None {
+            let reader_lease = match stream.selection.lease.try_clone_retained() {
+                Ok(lease) => lease,
+                Err(error) => {
+                    self.quarantine(
+                        io::ErrorKind::Other,
+                        format!("Native staged reader lease split: {error:?}"),
+                    );
+                    return None;
+                }
+            };
+            let writer_lease = match stream.selection.lease.try_clone_retained() {
+                Ok(lease) => lease,
+                Err(error) => {
+                    self.quarantine(
+                        io::ErrorKind::Other,
+                        format!("Native staged writer lease split: {error:?}"),
+                    );
+                    return None;
+                }
+            };
+            let expected_meter = upstream.endpoint.receive_backing_meter();
+            let direct_meter = if matches!(native_mode, TuicNativeOverride::NativeChunkPump | TuicNativeOverride::D16DirectOrdered) {
+                match crate::tuic::tcp_readers::preflight_native_direct_source(
+                    &stream.recv,
+                    expected_meter.as_ref(),
+                ) {
+                    Ok(meter) => Some(meter),
+                    Err(error) => {
+                        self.quarantine(error.kind(), error.to_string());
+                        return None;
+                    }
+                }
+            } else {
+                None
+            };
+            let preflight = if native_mode == TuicNativeOverride::NativeOrderedPump {
+                match crate::tuic::tcp_readers::preflight_native_ordered_source(
+                    &stream.recv,
+                    expected_meter.as_ref(),
+                ) {
+                    Ok(preflight) => Some(preflight),
+                    Err(error) => {
+                        if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::OutOfMemory) {
+                            self.fail(ClientError::Io(error), now);
+                        } else {
+                            self.quarantine(error.kind(), error.to_string());
+                        }
+                        return None;
+                    }
+                }
+            } else {
+                None
+            };
+            let State::Stream(stream) = std::mem::replace(&mut self.state, State::Unstarted) else {
+                return None;
+            };
+            let StreamWriter::Ready(send) = stream.writer else {
+                return None;
+            };
+            let Some(metadata) = stream.metadata else {
+                return None;
+            };
+            let stream_id = stream.recv.id().index();
+            let conn = stream.selection.conn.clone();
+            let (reader, prepared): (NativeTcpReadHalf, _) =
+                if native_mode == TuicNativeOverride::D16DirectOrdered {
+                    // The direct reader retains the original Quinn receive half;
+                    // the preflight above already bound its backing authority.
+                    drop(preflight);
+                    let pressure = tcp_diag_enabled().then(|| {
+                        stream
+                            .selection
+                            .read_pressure
+                            .reader(stream_id, stream.recv.progress_handle())
+                    });
+                    (
+                        Box::new(TuicNativeOrderedReader::new(
+                            stream.recv,
+                            reader_lease,
+                            metadata.stream_diag,
+                            conn,
+                            pressure,
+                        )),
+                        None,
+                    )
+                } else if native_mode == TuicNativeOverride::NativeChunkPump {
+                    // The direct reader retains RecvStream; the checked source
+                    // authority must be bound before the transfer/ACK point.
+                    let Some(meter) = direct_meter else {
+                        self.quarantine(
+                            io::ErrorKind::Other,
+                            "Native direct preflight missing".into(),
+                        );
+                        return None;
+                    };
+                    (
+                        Box::new(TuicNativeTcpReader::new_preflighted(
+                            stream.recv,
+                            reader_lease,
+                            metadata.stream_diag,
+                            conn,
+                            meter,
+                        )),
+                        None,
+                    )
+                } else if let Some(preflight) = preflight {
+                    let (reader, pump) = TuicNativeOrderedPumpReader::prepare_preflighted(
+                        stream.recv,
+                        reader_lease,
+                        metadata.stream_diag,
+                        conn,
+                        preflight,
+                    );
+                    (Box::new(reader), Some(pump))
+                } else {
+                    (
+                        Box::new(TuicNativeTcpReader::new(
+                            stream.recv,
+                            reader_lease,
+                            metadata.stream_diag,
+                            conn,
+                        )),
+                        None,
+                    )
+                };
+            let writer = Box::new(TuicNativeTcpWriter::new(
+                send,
+                writer_lease,
+                stream.selection.write_pressure.writer(stream_id),
+                metadata.progress,
+            ));
+            self.state = State::Transferred(Custody {
+                lease: Some(stream.selection.lease),
+                witness: Some(stream.witness),
+                pressure: None,
+                written: self.header_len,
+                close: stream.close,
+            });
+            let relay = NativeTcpRelayStream::new(reader, writer);
+            self.upstream = None;
+            let relay = match prepared {
+                Some(pump) => relay.with_prepared_pump(pump),
+                None => relay,
+            };
+            return Some(if native_mode == TuicNativeOverride::D16DirectOrdered {
+                OpenedTcpRelay::NativeByteOwned(relay)
+            } else {
+                OpenedTcpRelay::Native(relay)
+            });
+        }
         // Registration is the last potentially contended operation. Halves remain borrowed.
         let pressure = match stream
             .selection
@@ -715,9 +995,13 @@ impl TcpOpenAttempt<OpenedTcpRelay> for Attempt {
     fn view(&self) -> TcpOpenView {
         let (phase, lease, witness, written) = match &self.state {
             State::Unstarted => (TcpOpenPhase::Unstarted, false, false, 0),
-            State::Acquiring | State::Recovering(_) => (TcpOpenPhase::Acquiring, false, false, 0),
+            State::Acquiring
+            | State::Recovering(_)
+            | State::HealthyRecovering { .. }
+            | State::Maintenance { .. }
+            | State::Probing(_) => (TcpOpenPhase::Acquiring, false, false, 0),
+            State::ProbePending { .. } => (TcpOpenPhase::Acquiring, true, false, 0),
             State::Reserved(_) => (TcpOpenPhase::Reserved, true, false, 0),
-            State::Maintenance(_) => (TcpOpenPhase::Retiring, false, false, 0),
             State::Opening(_) => (TcpOpenPhase::Opening, true, false, 0),
             State::Stream(s) => (
                 if matches!(s.writer, StreamWriter::Ready(_)) {
@@ -797,4 +1081,4 @@ impl TcpOpenAttempt<OpenedTcpRelay> for Attempt {
 
 #[cfg(test)]
 #[path = "tests/retirement.rs"]
-mod tests;
+pub(super) mod tests;

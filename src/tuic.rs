@@ -19,7 +19,7 @@ use crate::upstream::{
     NativeTcpChunk, NativeTcpReader, parse_tuic_tcp_relay_mode, select_tuic_native_relay_mode,
 };
 use quinn::{Connection, Endpoint, VarInt};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
@@ -100,6 +100,7 @@ pub struct TuicClientConfig {
     /// 重连是否尝试 QUIC 0-RTT（**默认 false**：quinn 0.10 在 0-RTT 阶段不支持 `export_keying_material`，
     /// TUIC auth 必失败、自愈回落 1-RTT；显式开仅供实验/未来 quinn 升级。失败时总能回落，不致命）。
     pub zero_rtt: bool,
+    transport_shape: Option<crate::quic::honest_bound::TransportShape>, // see transport_shape.rs
 }
 
 impl std::fmt::Debug for TuicClientConfig {
@@ -178,6 +179,7 @@ impl TuicClientConfig {
             // 默认关：quinn 0.10 在 0-RTT 阶段不支持 export_keying_material（TUIC auth 必失败回落）。
             // 显式 `MINI_VPN_TUIC_ZERO_RTT=true` 可启用（实验/未来 quinn 升级）。
             zero_rtt: false,
+            transport_shape: None,
         })
     }
 
@@ -334,31 +336,33 @@ fn should_probe_tcp_pool_generation(
             == TcpPoolIdleAction::Probe
 }
 
-async fn probe_tcp_pool_connection(conn: &Connection, timeout: Duration) -> TcpPoolProbeOutcome {
+async fn probe_tcp_pool_connection(conn: &Connection, timeout: Duration) -> Result<TcpPoolProbeOutcome, bytes::MeteredCopyError> {
     if conn.close_reason().is_some() {
-        return TcpPoolProbeOutcome::Closed;
+        return Ok(TcpPoolProbeOutcome::Closed);
     }
     let rx_before = conn.stats().udp_rx.datagrams;
-    if conn.send_datagram(encode_heartbeat().into()).is_err() {
-        return TcpPoolProbeOutcome::SendFailed;
+    match udp_send::send_heartbeat(conn) {
+        Ok(()) => {},
+        Err(quinn::SendDatagramError::Admission { error, .. }) => return Err(error),
+        Err(_) => return Ok(TcpPoolProbeOutcome::SendFailed),
     }
 
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if conn.close_reason().is_some() {
-            return TcpPoolProbeOutcome::Closed;
+            return Ok(TcpPoolProbeOutcome::Closed);
         }
         let rx_after = conn.stats().udp_rx.datagrams;
         if rx_after > rx_before {
-            return TcpPoolProbeOutcome::Alive {
+            return Ok(TcpPoolProbeOutcome::Alive {
                 rx_before,
                 rx_after,
-            };
+            });
         }
         if tokio::time::Instant::now() >= deadline {
-            return TcpPoolProbeOutcome::TimedOut {
+            return Ok(TcpPoolProbeOutcome::TimedOut {
                 rx_datagrams: rx_after,
-            };
+            });
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -1456,269 +1460,6 @@ impl<R: Unpin, S: AsyncWrite + Unpin> AsyncWrite for TuicOrderedRelayStream<R, S
     }
 }
 
-#[derive(Debug, Default)]
-struct OrderedQuicChunkAssembler {
-    next_offset: u64,
-    chunks: BTreeMap<u64, bytes::Bytes>,
-    buffered_bytes: usize,
-    max_buffered_bytes: usize,
-}
-
-impl OrderedQuicChunkAssembler {
-    fn next_offset(&self) -> u64 {
-        self.next_offset
-    }
-
-    fn buffered_bytes(&self) -> usize {
-        self.buffered_bytes
-    }
-
-    fn buffered_chunks(&self) -> usize {
-        self.chunks.len()
-    }
-
-    fn max_buffered_bytes(&self) -> usize {
-        self.max_buffered_bytes
-    }
-
-    fn push_chunk(&mut self, mut offset: u64, mut bytes: bytes::Bytes) {
-        if bytes.is_empty() {
-            return;
-        }
-        let end = offset.saturating_add(bytes.len() as u64);
-        if end <= self.next_offset {
-            return;
-        }
-        if offset < self.next_offset {
-            let trim = (self.next_offset - offset) as usize;
-            bytes = bytes.slice(trim..);
-            offset = self.next_offset;
-        }
-        if let Some(old) = self.chunks.get(&offset)
-            && old.len() >= bytes.len()
-        {
-            return;
-        }
-        if let Some(old) = self.chunks.insert(offset, bytes.clone()) {
-            self.buffered_bytes = self.buffered_bytes.saturating_sub(old.len());
-        }
-        self.buffered_bytes = self.buffered_bytes.saturating_add(bytes.len());
-        self.max_buffered_bytes = self.max_buffered_bytes.max(self.buffered_bytes);
-    }
-
-    fn drain_into(&mut self, buf: &mut ReadBuf<'_>) -> usize {
-        let before = buf.filled().len();
-        while buf.remaining() > 0 {
-            let Some((&offset, _)) = self.chunks.first_key_value() else {
-                break;
-            };
-            if offset > self.next_offset {
-                break;
-            }
-            let Some((_, mut bytes)) = self.chunks.remove_entry(&offset) else {
-                break;
-            };
-            self.buffered_bytes = self.buffered_bytes.saturating_sub(bytes.len());
-            if offset < self.next_offset {
-                let trim = (self.next_offset - offset) as usize;
-                if trim >= bytes.len() {
-                    continue;
-                }
-                bytes = bytes.slice(trim..);
-            }
-            let n = bytes.len().min(buf.remaining());
-            buf.put_slice(&bytes[..n]);
-            self.next_offset = self.next_offset.saturating_add(n as u64);
-            if n < bytes.len() {
-                let rest = bytes.slice(n..);
-                self.buffered_bytes = self.buffered_bytes.saturating_add(rest.len());
-                self.chunks.insert(self.next_offset, rest);
-            }
-        }
-        buf.filled().len().saturating_sub(before)
-    }
-}
-
-struct TuicChunkRelayStream {
-    recv: quinn::RecvStream,
-    send: TuicTcpStartupWriter<quinn::SendStream>,
-    rx: OrderedQuicChunkAssembler,
-    recv_eof: bool,
-    diag_meta: Option<TuicTcpStreamDiagMeta>,
-    last_staging_log_at: Option<Instant>,
-    unordered_chunks: u64,
-    unordered_bytes: u64,
-    out_of_order_chunks: u64,
-    max_gap_bytes: u64,
-    staging_cap_hits: u64,
-}
-
-impl TuicChunkRelayStream {
-    fn new(
-        recv: quinn::RecvStream,
-        send: TuicTcpStartupWriter<quinn::SendStream>,
-        diag_meta: Option<TuicTcpStreamDiagMeta>,
-    ) -> Self {
-        Self {
-            recv,
-            send,
-            rx: OrderedQuicChunkAssembler::default(),
-            recv_eof: false,
-            diag_meta,
-            last_staging_log_at: None,
-            unordered_chunks: 0,
-            unordered_bytes: 0,
-            out_of_order_chunks: 0,
-            max_gap_bytes: 0,
-            staging_cap_hits: 0,
-        }
-    }
-
-    fn read_error(err: quinn::ReadError) -> io::Error {
-        io::Error::other(format!("tuic unordered read: {err}"))
-    }
-
-    fn note_staging_cap_hit(&mut self, now: Instant) {
-        self.staging_cap_hits = self.staging_cap_hits.saturating_add(1);
-        self.maybe_log_staging("cap", now, self.rx.next_offset(), 0, 0);
-    }
-
-    fn note_chunk_staged(&mut self, now: Instant, offset: u64, chunk_len: usize) {
-        let expected = self.rx.next_offset();
-        let gap = offset.saturating_sub(expected);
-        self.unordered_chunks = self.unordered_chunks.saturating_add(1);
-        self.unordered_bytes = self.unordered_bytes.saturating_add(chunk_len as u64);
-        if gap > 0 {
-            self.out_of_order_chunks = self.out_of_order_chunks.saturating_add(1);
-            self.max_gap_bytes = self.max_gap_bytes.max(gap);
-        }
-        self.maybe_log_staging("chunk", now, offset, chunk_len, gap);
-    }
-
-    fn maybe_log_staging(
-        &mut self,
-        reason: &'static str,
-        now: Instant,
-        chunk_offset: u64,
-        chunk_len: usize,
-        gap_bytes: u64,
-    ) {
-        let should_log = reason == "cap" || gap_bytes > 0;
-        if !should_log {
-            return;
-        }
-        let Some(meta) = self.diag_meta.as_ref() else {
-            return;
-        };
-        let rate_limited = self
-            .last_staging_log_at
-            .map(|last| {
-                now.saturating_duration_since(last).as_millis() < TUIC_TCP_UNORDERED_STAGING_LOG_MS
-            })
-            .unwrap_or(false);
-        if rate_limited {
-            return;
-        }
-        self.last_staging_log_at = Some(now);
-        println!(
-            "{}",
-            format_tuic_tcp_unordered_staging_line(
-                meta,
-                reason,
-                self.rx.next_offset(),
-                chunk_offset,
-                chunk_len,
-                self.rx.buffered_bytes(),
-                self.rx.buffered_chunks(),
-                self.rx.max_buffered_bytes(),
-                self.unordered_chunks,
-                self.unordered_bytes,
-                self.out_of_order_chunks,
-                self.max_gap_bytes,
-                gap_bytes,
-                self.staging_cap_hits,
-                TUIC_TCP_UNORDERED_REASSEMBLY_MAX_BYTES,
-            )
-        );
-    }
-}
-
-impl AsyncRead for TuicChunkRelayStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        if buf.remaining() == 0 {
-            return Poll::Ready(Ok(()));
-        }
-        if self.rx.drain_into(buf) > 0 {
-            return Poll::Ready(Ok(()));
-        }
-        if self.recv_eof {
-            return Poll::Ready(Ok(()));
-        }
-
-        let mut polls = 0usize;
-        loop {
-            if self.rx.buffered_bytes() >= TUIC_TCP_UNORDERED_REASSEMBLY_MAX_BYTES {
-                self.note_staging_cap_hit(Instant::now());
-                return Poll::Pending;
-            }
-            let read_len = TUIC_TCP_UNORDERED_CHUNK_READ_MAX_BYTES
-                .min(TUIC_TCP_UNORDERED_REASSEMBLY_MAX_BYTES - self.rx.buffered_bytes());
-            let chunk = {
-                let fut = self.recv.read_chunk(read_len, false);
-                tokio::pin!(fut);
-                match fut.poll(cx) {
-                    Poll::Ready(Ok(chunk)) => chunk,
-                    Poll::Ready(Err(err)) => return Poll::Ready(Err(Self::read_error(err))),
-                    Poll::Pending => return Poll::Pending,
-                }
-            };
-            match chunk {
-                Some(chunk) => {
-                    let now = Instant::now();
-                    let offset = chunk.offset;
-                    let chunk_len = chunk.bytes.len();
-                    self.rx.push_chunk(offset, chunk.bytes);
-                    self.note_chunk_staged(now, offset, chunk_len);
-                    if self.rx.drain_into(buf) > 0 {
-                        return Poll::Ready(Ok(()));
-                    }
-                }
-                None => {
-                    self.recv_eof = true;
-                    return Poll::Ready(Ok(()));
-                }
-            }
-            polls += 1;
-            if polls >= 32 {
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-        }
-    }
-}
-
-impl AsyncWrite for TuicChunkRelayStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.send).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.send).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.send).poll_shutdown(cx)
-    }
-}
-
 #[cfg(test)]
 pub(crate) fn d16_native_ordered_reader_for_test(
     recv: quinn::RecvStream,
@@ -1813,33 +1554,6 @@ const ATYP_DOMAIN: u8 = 0x00;
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_IPV6: u8 = 0x02;
 
-/// 编码 TUIC 地址：`[ATYP][ADDR][PORT:u16 BE]`。
-/// 中文要点：域名 `[len:u8][bytes]`，IPv4 4B，IPv6 16B；域名超 255 字节按 255 截断(不 panic)。
-pub fn encode_address(target: &TargetAddr) -> Vec<u8> {
-    let mut v = Vec::new();
-    match target {
-        TargetAddr::IpPort(SocketAddr::V4(a)) => {
-            v.push(ATYP_IPV4);
-            v.extend_from_slice(&a.ip().octets());
-            v.extend_from_slice(&a.port().to_be_bytes());
-        }
-        TargetAddr::IpPort(SocketAddr::V6(a)) => {
-            v.push(ATYP_IPV6);
-            v.extend_from_slice(&a.ip().octets());
-            v.extend_from_slice(&a.port().to_be_bytes());
-        }
-        TargetAddr::DomainPort { host, port } => {
-            let bytes = host.as_bytes();
-            let len = bytes.len().min(u8::MAX as usize);
-            v.push(ATYP_DOMAIN);
-            v.push(len as u8);
-            v.extend_from_slice(&bytes[..len]);
-            v.extend_from_slice(&port.to_be_bytes());
-        }
-    }
-    v
-}
-
 /// 编码 Authenticate 命令(走单向流)：`[0x05][0x00][UUID:16][TOKEN:32]`。
 pub fn encode_authenticate(uuid: &[u8; 16], token: &[u8; 32]) -> Vec<u8> {
     let mut v = Vec::with_capacity(2 + 16 + 32);
@@ -1859,22 +1573,7 @@ pub fn encode_connect(target: &TargetAddr) -> Vec<u8> {
     v
 }
 
-/// 编码 TUIC `Packet`(native datagram)：
-/// `[0x05][0x02][ASSOC:u16][PKT_ID:u16=0][FRAG_TOTAL=1][FRAG_ID=0][SIZE:u16][ADDR][data]`。
-pub fn encode_packet(assoc_id: u16, target: &TargetAddr, data: &[u8]) -> Vec<u8> {
-    let addr = encode_address(target);
-    let mut v = Vec::with_capacity(10 + addr.len() + data.len());
-    v.push(TUIC_VER);
-    v.push(CMD_PACKET);
-    v.extend_from_slice(&assoc_id.to_be_bytes());
-    v.extend_from_slice(&0u16.to_be_bytes()); // PKT_ID(native 不重组,固定 0)
-    v.push(1); // FRAG_TOTAL
-    v.push(0); // FRAG_ID
-    v.extend_from_slice(&(data.len() as u16).to_be_bytes()); // SIZE
-    v.extend_from_slice(&addr);
-    v.extend_from_slice(data);
-    v
-}
+pub use udp_send::encoding::{encode_address, encode_packet};
 
 /// 下行 Packet 的 frag 感知元信息（native 分片重组用）。
 /// 中文要点：`data` 是**本（分片）chunk**（SIZE 字节）；整包由同 `(assoc_id,pkt_id)` 的
@@ -1958,155 +1657,8 @@ fn address_len(buf: &[u8], pos: usize) -> Option<usize> {
     }
 }
 
-/// TUIC UDP 关联表:每条 UDP flow(4 元组)分配一个 **u16 assoc-id**(≈ Stage 12 flow-id),
-/// 双向 demux 用。主循环独占、无锁;`now` 注入便于单测。结构同 udp_relay::FlowTable,只是 id 宽 16 位。
-/// 中文要点:复用 FourTuple/FlowEntry,不动 Stage 12 的 FlowTable(系统稳定优先,接受少量重复)。
-#[derive(Debug)]
-pub struct AssocTable {
-    tuple_to_id: HashMap<FourTuple, u16>,
-    id_to_entry: HashMap<u16, FlowEntry>,
-    /// 刀2：assoc-id → 本 UDP flow 占用的 fake-IP（若 target 经 fake-IP 改写）。
-    /// 中文要点：用于回收（evict/sweep）该 assoc 时知道要 `release` 哪个 fake-IP（引用计数）。
-    id_to_fake_ip: HashMap<u16, Ipv4Addr>,
-    /// 刀2：本轮被回收（evict/sweep）且有 fake-IP 的 assoc 的 fake-IP，待主循环 drain 后 `release`。
-    reclaimed_fake_ips: Vec<Ipv4Addr>,
-    next_id: u16,
-    cap: usize,
-}
-
-impl Default for AssocTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl AssocTable {
-    pub fn new() -> Self {
-        Self::with_cap(MAX_UDP_FLOWS)
-    }
-
-    pub fn with_cap(cap: usize) -> Self {
-        Self {
-            tuple_to_id: HashMap::new(),
-            id_to_entry: HashMap::new(),
-            id_to_fake_ip: HashMap::new(),
-            reclaimed_fake_ips: Vec::new(),
-            next_id: 1,
-            cap: cap.max(1).min(u16::MAX as usize),
-        }
-    }
-
-    /// 刀2：登记该 assoc 占用的 fake-IP（UDP 新 flow 时调，调用方随后 `fake_pool.acquire`）。
-    pub fn set_fake_ip(&mut self, assoc_id: u16, ip: Ipv4Addr) {
-        self.id_to_fake_ip.insert(assoc_id, ip);
-    }
-
-    /// 刀2：取走本轮被回收（evict/sweep）的 fake-IP 列表，主循环对每个 `fake_pool.release`。
-    /// 中文要点：assoc 回收与 fake-IP release 解耦——AssocTable 不持有 FakeIpPool，
-    /// 只累积「该 release 谁」，由独占两者的主循环执行，避免交叉借用/循环依赖。
-    pub fn take_reclaimed_fake_ips(&mut self) -> Vec<Ipv4Addr> {
-        std::mem::take(&mut self.reclaimed_fake_ips)
-    }
-
-    /// assoc 被回收时，若它占用了 fake-IP，移出映射并记入待 release 队列。
-    fn note_reclaimed(&mut self, assoc_id: u16) {
-        if let Some(ip) = self.id_to_fake_ip.remove(&assoc_id) {
-            self.reclaimed_fake_ips.push(ip);
-        }
-    }
-
-    /// 查/铸 assoc-id（已在册稳定返回;否则铸新,到顶 LRU 驱逐）。
-    pub fn intern(&mut self, tuple: FourTuple) -> u16 {
-        if let Some(&id) = self.tuple_to_id.get(&tuple) {
-            return id;
-        }
-        if self.id_to_entry.len() >= self.cap {
-            self.evict_lru();
-        }
-        let id = self.alloc_id();
-        self.id_to_entry.insert(
-            id,
-            FlowEntry {
-                tuple,
-                last_activity: 0,
-            },
-        );
-        self.tuple_to_id.insert(tuple, id);
-        id
-    }
-
-    /// 分配一个**空闲且非 0** 的 assoc-id（单调推进，跳过 0 与仍在册的 id）。
-    /// 中文要点：u16 空间仅 65535,回绕后 `next_id` 可能落到仍在册的 flow 上——不跳过就会
-    /// `insert` 覆盖活跃 flow(回程串到错误端点)并泄漏其 tuple_to_id 映射。活跃集(≤cap≤1024)
-    /// 远小于 id 空间,故必有空闲 id,扫描代价极小。调用前已 evict 保证 len<cap,循环必然终止。
-    fn alloc_id(&mut self) -> u16 {
-        loop {
-            let id = self.next_id;
-            self.next_id = self.next_id.wrapping_add(1);
-            if self.next_id == 0 {
-                self.next_id = 1; // 跳过 0,保持非零、单调
-            }
-            if !self.id_to_entry.contains_key(&id) {
-                return id;
-            }
-        }
-    }
-
-    pub fn resolve(&self, assoc_id: u16) -> Option<&FlowEntry> {
-        self.id_to_entry.get(&assoc_id)
-    }
-
-    /// 该 4 元组是否已在册（用于"每流一次"日志，避免热路径刷屏）。
-    pub fn contains(&self, tuple: &FourTuple) -> bool {
-        self.tuple_to_id.contains_key(tuple)
-    }
-
-    pub fn touch(&mut self, assoc_id: u16, now: u64) {
-        if let Some(e) = self.id_to_entry.get_mut(&assoc_id) {
-            e.last_activity = now;
-        }
-    }
-
-    /// 回收 idle 超 `idle_secs` 的 assoc，**直接返回**这些 assoc 占用的 fake-IP（供调用方 release）。
-    /// 中文要点：review #8——sweep 自包含返回，不再依赖 stash-and-drain（调用方无需记得随后 take）；
-    /// `take_reclaimed_fake_ips` 仅服务 intern 内部的 LRU 驱逐（那里无法返回值）。
-    pub fn sweep(&mut self, now: u64, idle_secs: u64) -> Vec<Ipv4Addr> {
-        let expired: Vec<(u16, FourTuple)> = self
-            .id_to_entry
-            .iter()
-            .filter(|(_, e)| now.saturating_sub(e.last_activity) > idle_secs)
-            .map(|(id, e)| (*id, e.tuple))
-            .collect();
-        let mut reclaimed = Vec::new();
-        for (id, tuple) in expired {
-            self.id_to_entry.remove(&id);
-            self.tuple_to_id.remove(&tuple);
-            if let Some(ip) = self.id_to_fake_ip.remove(&id) {
-                reclaimed.push(ip); // 刀2：该 assoc 占用的 fake-IP → 调用方 release
-            }
-        }
-        reclaimed
-    }
-
-    fn evict_lru(&mut self) {
-        let victim = self
-            .id_to_entry
-            .iter()
-            .min_by_key(|(id, e)| (e.last_activity, **id))
-            .map(|(id, _)| *id);
-        if let Some(id) = victim
-            && let Some(e) = self.id_to_entry.remove(&id)
-        {
-            self.tuple_to_id.remove(&e.tuple);
-            self.note_reclaimed(id); // 刀2：LRU 驱逐时同样回收 fake-IP
-        }
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.id_to_entry.len()
-    }
-}
+mod assoc;
+pub use assoc::AssocTable;
 
 /// 上行 UDP 的传输选择：datagram 快路径 vs uni-stream 兜底。
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -4313,212 +3865,6 @@ impl Drop for TcpPoolDrainingPermit {
     }
 }
 
-impl<T: TcpPoolTransport> TcpPoolGenerationSlot<T> {
-    fn new(
-        index: usize,
-        transport: T,
-        generation: u64,
-        auth_attempts: u64,
-        clock: Instant,
-    ) -> Self {
-        Self {
-            index,
-            state: Mutex::new(TcpPoolGenerationSlotState {
-                current: TcpPoolGeneration::new(transport, generation, auth_attempts, clock),
-                draining: None,
-            }),
-        }
-    }
-
-    fn replacement_available(&self) -> bool {
-        if self.index == 0 {
-            return false;
-        }
-        self.state
-            .try_lock()
-            .map(|state| state.draining.is_none())
-            .unwrap_or(false)
-    }
-
-    async fn current_activity(&self) -> Arc<TcpPoolGenerationActivity> {
-        self.state.lock().await.current.activity.clone()
-    }
-
-    #[cfg(test)]
-    async fn replacement_forward_service_floor(
-        &self,
-        expected_identity: TcpPoolTransportIdentity,
-    ) -> Result<Option<u64>, TcpPoolGenerationInstallError> {
-        let state = self.state.lock().await;
-        if state.current.identity() != expected_identity {
-            return Err(TcpPoolGenerationInstallError::StalePredecessor);
-        }
-        Ok(state.current.replacement_forward_service_floor)
-    }
-
-    #[cfg(test)]
-    async fn current_transport(&self) -> T {
-        self.state.lock().await.current.transport.clone()
-    }
-
-    #[cfg(test)]
-    async fn draining_transport(&self) -> Option<T> {
-        self.state
-            .lock()
-            .await
-            .draining
-            .as_ref()
-            .map(|draining| draining.generation.transport.clone())
-    }
-
-    #[cfg(test)]
-    async fn install_successor(
-        &self,
-        expected_identity: TcpPoolTransportIdentity,
-        expected_activity: &Arc<TcpPoolGenerationActivity>,
-        successor: TcpPoolGeneration<T>,
-        started_at: Instant,
-    ) -> Result<TcpPoolGenerationInstall, TcpPoolGenerationInstallError> {
-        let proved_forward_service = TcpPoolSuccessorInstallServiceProof::for_successor(
-            &successor,
-            successor.replacement_forward_service_floor.unwrap_or(0),
-        )
-        .ok_or(TcpPoolGenerationInstallError::InvalidSuccessor)?;
-        self.install_successor_with(
-            expected_identity,
-            expected_activity,
-            successor,
-            proved_forward_service,
-            started_at,
-            |_, _| true,
-        )
-        .await
-    }
-
-    #[cfg(test)]
-    async fn install_successor_with_proved_service(
-        &self,
-        expected_identity: TcpPoolTransportIdentity,
-        expected_activity: &Arc<TcpPoolGenerationActivity>,
-        successor: TcpPoolGeneration<T>,
-        final_cwnd: u64,
-        started_at: Instant,
-    ) -> Result<TcpPoolGenerationInstall, TcpPoolGenerationInstallError> {
-        let proved_forward_service =
-            TcpPoolSuccessorInstallServiceProof::for_successor(&successor, final_cwnd)
-                .ok_or(TcpPoolGenerationInstallError::InvalidSuccessor)?;
-        self.install_successor_with(
-            expected_identity,
-            expected_activity,
-            successor,
-            proved_forward_service,
-            started_at,
-            |_, _| true,
-        )
-        .await
-    }
-
-    async fn install_successor_with(
-        &self,
-        expected_identity: TcpPoolTransportIdentity,
-        expected_activity: &Arc<TcpPoolGenerationActivity>,
-        successor: TcpPoolGeneration<T>,
-        proved_forward_service: TcpPoolSuccessorInstallServiceProof,
-        started_at: Instant,
-        install_activity: impl FnOnce(
-            &Arc<TcpPoolGenerationActivity>,
-            &Arc<TcpPoolGenerationActivity>,
-        ) -> bool,
-    ) -> Result<TcpPoolGenerationInstall, TcpPoolGenerationInstallError> {
-        if self.index == 0 {
-            return Err(TcpPoolGenerationInstallError::Primary);
-        }
-        let mut state = self.state.lock().await;
-        if state.draining.is_some() {
-            return Err(TcpPoolGenerationInstallError::PredecessorDraining);
-        }
-        if state.current.identity() != expected_identity
-            || !Arc::ptr_eq(&state.current.activity, expected_activity)
-        {
-            return Err(TcpPoolGenerationInstallError::StalePredecessor);
-        }
-        let successor_identity = successor.identity();
-        let successor_current_service = successor.transport.tcp_pool_install_service_state();
-        if successor_identity.stable_id == expected_identity.stable_id
-            || expected_identity.generation.checked_add(1) != Some(successor_identity.generation)
-            || !proved_forward_service.matches_successor(&successor)
-            || successor_current_service.is_some_and(|current| {
-                current.closed || current.path_generation != proved_forward_service.path_generation
-            })
-        {
-            return Err(TcpPoolGenerationInstallError::InvalidSuccessor);
-        }
-        if successor_current_service
-            .is_some_and(|current| current.cwnd < proved_forward_service.final_cwnd)
-        {
-            return Err(TcpPoolGenerationInstallError::InsufficientForwardService);
-        }
-        if state
-            .current
-            .replacement_forward_service_floor
-            .is_some_and(|required| proved_forward_service.final_cwnd < required)
-        {
-            return Err(TcpPoolGenerationInstallError::InsufficientForwardService);
-        }
-        if !install_activity(&state.current.activity, &successor.activity) {
-            return Err(TcpPoolGenerationInstallError::StalePredecessor);
-        }
-        let predecessor = std::mem::replace(&mut state.current, successor);
-        let predecessor_identity = predecessor.identity();
-        let predecessor_activity = predecessor.activity.clone();
-        state.draining = Some(TcpPoolDrainingGeneration {
-            generation: predecessor,
-            started_at,
-        });
-        Ok(TcpPoolGenerationInstall {
-            predecessor_identity,
-            successor_identity,
-            predecessor_activity,
-        })
-    }
-
-    async fn take_drained(
-        &self,
-        expected_identity: TcpPoolTransportIdentity,
-    ) -> Option<TcpPoolDrainingGeneration<T>> {
-        let mut state = self.state.lock().await;
-        let draining = state.draining.as_ref()?;
-        if draining.generation.identity() != expected_identity
-            || draining.generation.activity.active() != 0
-        {
-            return None;
-        }
-        state.draining.take()
-    }
-}
-
-impl TcpPoolGenerationSlot<Connection> {
-    async fn prepare_replacement_current_service_handoff(
-        &self,
-        expected_identity: TcpPoolTransportIdentity,
-    ) -> Result<TcpPoolReplacementCurrentServiceHandoff, TcpPoolReplacementCurrentServiceHandoffError>
-    {
-        let mut state = self.state.lock().await;
-        if state.current.identity() != expected_identity {
-            return Err(TcpPoolReplacementCurrentServiceHandoffError::StalePredecessor);
-        }
-        let observed_cwnd = state.current.transport.stats().path.cwnd;
-        let required_cwnd_floor = state
-            .current
-            .record_forward_service_floor(observed_cwnd)
-            .ok_or(TcpPoolReplacementCurrentServiceHandoffError::ZeroWindow)?;
-        Ok(TcpPoolReplacementCurrentServiceHandoff {
-            observed_cwnd,
-            required_cwnd_floor,
-        })
-    }
-}
-
 struct TcpPoolConnectionSelection {
     conn_index: usize,
     conn: Connection,
@@ -4609,6 +3955,10 @@ impl DatagramUpstream for TuicUpstream {
         TuicUpstream::send_udp(self, datagram).await
     }
 
+    async fn send_udp_packet(&self, association: u16, target: &TargetAddr, payload: &[u8]) {
+        self.send_packet(association, target, payload);
+    }
+
     // 刀11：上行计数仍住 TuicUpstream（零回归）→ 经既有 inherent 访问器暴露给 snapshot。
     fn udp_drops_up(&self) -> u64 {
         self.udp_drop_count()
@@ -4618,49 +3968,12 @@ impl DatagramUpstream for TuicUpstream {
     }
 }
 
-/// 刀9 F1：failover 健康探测面。`probe` 主动探活（live_conn=QUIC 握手+TUIC 认证，非浅探）；
-/// `is_dead` 区分 down 快路（黑洞，连接被 idle/keepalive 打死）/慢路（流失败）。
-#[async_trait::async_trait]
-impl crate::failover::HealthProbe for TuicUpstream {
-    async fn probe(&self) -> bool {
-        self.live_conn().await.is_ok()
-    }
-    async fn is_dead(&self) -> bool {
-        self.tcp_pool_slots
-            .first()
-            .expect("TuicUpstream always has a primary connection")
-            .state
-            .lock()
-            .await
-            .current
-            .transport
-            .close_reason()
-            .is_some()
-    }
-    /// 累计收到的 UDP datagram 数（quinn `stats().udp_rx.datagrams`）——黑洞存活信标：健康连接每 ~5s
-    /// 有 keepalive ACK 进来→单调增；黑洞连 ACK 都收不到→停滞。down 探测据此判黑洞（不被乐观开流/keepalive 架空）。
-    /// **非阻塞**（try_lock，同 current_conn）：锁被占（后台 start_udp 正在重连，持锁≤5s）→ `None`，**绝不 await
-    /// 锁**——否则健康探针任务被卡 5s、把锁等待当成网络停滞、检测计时偏斜（review finding）。调用方对 None
-    /// 跳过本次观察：连接正在重连本就不健康，停滞计时靠 `now` 累积、不重置，下次能读到（仍停滞）即判黑洞。
-    async fn rx_datagrams(&self) -> Option<u64> {
-        Some(
-            self.tcp_pool_slots
-                .first()?
-                .state
-                .try_lock()
-                .ok()?
-                .current
-                .transport
-                .stats()
-                .udp_rx
-                .datagrams,
-        )
-    }
-}
-
 #[cfg(test)]
 #[path = "tuic_direct_probe.rs"]
 mod direct_probe;
+mod failover_health;
+mod generation_slot;
+pub mod probe;
 #[cfg(test)]
 #[path = "tuic/tests/tcp_fixture.rs"]
 pub(crate) mod tcp_fixture;
@@ -4679,12 +3992,12 @@ use tcp_readers::{
 mod node;
 pub use node::{NodeHost, NodeShutdown, NodeStartup};
 mod node_runtime;
-use node_runtime::{
-    spawn_endpoint_pacing_stats_logger, spawn_quic_stats_logger,
-    spawn_udp_send_service_stats_logger,
-};
+use node_runtime::{spawn_endpoint_pacing_stats_logger, spawn_quic_stats_logger, spawn_udp_send_service_stats_logger};
+mod transport_shape;
 mod udp_reassembly;
 mod udp_send;
-
+mod unordered;
+use unordered::TuicChunkRelayStream;
+#[cfg(test)] pub(crate) use node::NativeNodeWeakObserver;
 #[cfg(test)]
 mod tests;

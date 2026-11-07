@@ -1,10 +1,11 @@
-use crate::Duration;
 use crate::connection::spaces::PendingAcks;
 use crate::frame::AckFrequency;
 use crate::transport_parameters::TransportParameters;
-use crate::{AckFrequencyConfig, TIMER_GRANULARITY, TransportError, VarInt};
+use crate::Duration;
+use crate::{AckFrequencyConfig, TransportError, VarInt, TIMER_GRANULARITY};
 
 /// State associated to ACK frequency
+#[derive(Clone)]
 pub(super) struct AckFrequencyState {
     //
     // Sending ACK_FREQUENCY frames
@@ -119,6 +120,16 @@ impl AckFrequencyState {
         frame: &AckFrequency,
         pending_acks: &mut PendingAcks,
     ) -> Result<bool, TransportError> {
+        if !self.apply_received_value(frame)? { return Ok(false); }
+
+        // Update the rest of the params
+        pending_acks.set_ack_frequency_params(frame);
+
+        Ok(true)
+    }
+    /// Value-only validation/update shared by the original commit and packet
+    /// preflight; no ACK range, timer or event inventory is copied.
+    pub(super) fn apply_received_value(&mut self, frame: &AckFrequency) -> Result<bool, TransportError> {
         if self
             .last_ack_frequency_frame
             .is_some_and(|highest_sequence_nr| frame.sequence.into_inner() <= highest_sequence_nr)
@@ -137,11 +148,9 @@ impl AckFrequencyState {
         }
         self.max_ack_delay = max_ack_delay;
 
-        // Update the rest of the params
-        pending_acks.set_ack_frequency_params(frame);
-
         Ok(true)
     }
+
 }
 
 /// Maximum proportion difference between the most recently requested max ACK delay and the

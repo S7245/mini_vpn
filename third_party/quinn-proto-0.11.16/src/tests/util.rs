@@ -218,7 +218,11 @@ impl Pair {
         client_ch
     }
 
-    fn finish_connect(&mut self, client_ch: ConnectionHandle, server_ch: ConnectionHandle) {
+    pub(super) fn finish_connect(
+        &mut self,
+        client_ch: ConnectionHandle,
+        server_ch: ConnectionHandle,
+    ) {
         assert_matches!(
             self.client_conn_mut(client_ch).poll(),
             Some(Event::HandshakeDataReady)
@@ -246,11 +250,13 @@ impl Pair {
     }
 
     pub(super) fn client_send(&mut self, ch: ConnectionHandle, s: StreamId) -> SendStream<'_> {
-        self.client_conn_mut(ch).send_stream(s)
+        let now = self.time;
+        self.client_conn_mut(ch).send_stream(s, now)
     }
 
     pub(super) fn client_recv(&mut self, ch: ConnectionHandle, s: StreamId) -> RecvStream<'_> {
-        self.client_conn_mut(ch).recv_stream(s)
+        let now = self.time;
+        self.client_conn_mut(ch).recv_stream(s, now)
     }
 
     pub(super) fn client_datagrams(&mut self, ch: ConnectionHandle) -> Datagrams<'_> {
@@ -266,11 +272,13 @@ impl Pair {
     }
 
     pub(super) fn server_send(&mut self, ch: ConnectionHandle, s: StreamId) -> SendStream<'_> {
-        self.server_conn_mut(ch).send_stream(s)
+        let now = self.time;
+        self.server_conn_mut(ch).send_stream(s, now)
     }
 
     pub(super) fn server_recv(&mut self, ch: ConnectionHandle, s: StreamId) -> RecvStream<'_> {
-        self.server_conn_mut(ch).recv_stream(s)
+        let now = self.time;
+        self.server_conn_mut(ch).recv_stream(s, now)
     }
 
     pub(super) fn server_datagrams(&mut self, ch: ConnectionHandle) -> Datagrams<'_> {
@@ -365,6 +373,15 @@ impl TestEndpoint {
 
         while self.inbound.front().is_some_and(|x| x.0 <= now) {
             let (recv_time, ecn, packet) = self.inbound.pop_front().unwrap();
+            // Match the production Quinn receive owner: a configured authority
+            // obtains backing credit before copying encrypted socket input.
+            let packet = if let Some(meter) = self.endpoint.config().receive_backing_meter.as_ref()
+            {
+                BytesMut::try_copy_from_slice_metered(&packet, meter)
+                    .expect("test receive backing admission")
+            } else {
+                packet
+            };
             if let Some(event) = self
                 .endpoint
                 .handle(recv_time, remote, None, ecn, packet, &mut buf)
@@ -409,13 +426,22 @@ impl TestEndpoint {
     /// This exposes the production receive/transmit boundary for tests that must inspect or
     /// inject frame semantics after packet processing but before the resulting ACK is emitted.
     pub(super) fn process_connection_events(&mut self, ch: ConnectionHandle) {
-        let Some(mut events) = self.conn_events.remove(&ch) else {
-            return;
+        while self.process_one_connection_event(ch) {}
+    }
+
+    /// Apply exactly one already-routed original event, retaining FIFO order.
+    pub(super) fn process_one_connection_event(&mut self, ch: ConnectionHandle) -> bool {
+        let Some(events) = self.conn_events.get_mut(&ch) else {
+            return false;
         };
-        let conn = self.connections.get_mut(&ch).unwrap();
-        for event in events.drain(..) {
-            conn.handle_event(event);
+        let Some(event) = events.pop_front() else {
+            return false;
+        };
+        if events.is_empty() {
+            self.conn_events.remove(&ch);
         }
+        self.connections.get_mut(&ch).unwrap().handle_event(event);
+        true
     }
 
     pub(super) fn drive_outgoing(&mut self, now: Instant) {
@@ -424,14 +450,14 @@ impl TestEndpoint {
 
         loop {
             let mut endpoint_events: Vec<(ConnectionHandle, EndpointEvent)> = vec![];
+            self.timeout = None;
             for (ch, conn) in self.connections.iter_mut() {
-                if self.timeout.is_some_and(|x| x <= now) {
-                    self.timeout = None;
+                if conn.poll_timeout().is_some_and(|x| x <= now) {
                     conn.handle_timeout(now);
                 }
 
-                for (_, mut events) in self.conn_events.drain() {
-                    for event in events.drain(..) {
+                if let Some(events) = self.conn_events.remove(ch) {
+                    for event in events {
                         conn.handle_event(event);
                     }
                 }
@@ -457,7 +483,7 @@ impl TestEndpoint {
                         "socket success must clear the configured pending batch"
                     );
                 }
-                self.timeout = conn.poll_timeout();
+                self.timeout = min_opt(self.timeout, conn.poll_timeout());
             }
 
             if endpoint_events.is_empty() {
@@ -465,10 +491,12 @@ impl TestEndpoint {
             }
 
             for (ch, event) in endpoint_events {
-                if let Some(event) = self.handle_event(ch, event) {
+                if self.endpoint.native_registration() && !event.is_drained() {
                     if let Some(conn) = self.connections.get_mut(&ch) {
-                        conn.handle_event(event);
+                        self.endpoint.handle_connection_event(ch, event, conn);
                     }
+                } else if let Some(event) = self.handle_event(ch, event) {
+                    if let Some(conn) = self.connections.get_mut(&ch) { conn.handle_event(event); }
                 }
             }
         }

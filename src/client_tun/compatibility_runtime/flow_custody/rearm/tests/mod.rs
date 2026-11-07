@@ -16,6 +16,26 @@ fn close_wait() -> SocketCloseSnapshot {
 }
 
 #[test]
+fn d16_preclear_requires_observed_dead_socket_even_for_reasoned_close() {
+    let active = close_wait();
+    assert!(!d16_dead_socket_preclear_witness(active));
+    let closed_but_active = SocketCloseSnapshot {
+        tcp_state: TcpState::Closed,
+        ..active
+    };
+    assert!(!d16_dead_socket_preclear_witness(closed_but_active));
+    let closed_but_can_send = SocketCloseSnapshot {
+        active: false,
+        ..closed_but_active
+    };
+    assert!(!d16_dead_socket_preclear_witness(closed_but_can_send));
+    assert!(d16_dead_socket_preclear_witness(SocketCloseSnapshot {
+        can_send: false,
+        ..closed_but_can_send
+    }));
+}
+
+#[test]
 fn resumable_pending_fin_survives_sweep_until_open_completion() {
     let mut ctx = SocketCtx::new(443);
     ctx.state = SocketState::HandshakePending;

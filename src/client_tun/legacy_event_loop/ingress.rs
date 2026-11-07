@@ -28,13 +28,13 @@ where
     // 非 UDP → 既有 smoltcp 路径。前两类 take 走、不进 iface.poll。
     let class = device.rx_peek().map(classify_inbound);
     if class == Some(Inbound::UdpRelay) {
-        if let Some(pkt) = device.rx_take() {
+        if let Some(pkt) = device.rx_take_packet() {
             handle_tuic_udp_uplink(&pkt, assoc_table, fake_pool, upstream.as_ref(), now_secs).await;
         }
         return (TunRxPacketKind::Udp, InboundTcpCoverage::FullFallback);
     }
     if class == Some(Inbound::Dns) {
-        if let Some(pkt) = device.rx_take() {
+        if let Some(pkt) = device.rx_take_packet() {
             handle_dns_hijack(&pkt, fake_pool, device, now_secs, metrics_handle).await;
         }
         return (TunRxPacketKind::Dns, InboundTcpCoverage::FullFallback);
@@ -68,20 +68,26 @@ async fn poll_staged_tun_rx<D, M>(
     tcp_loop_flush_tx_failures: &mut u64,
     poll_stage: &str,
     targets: Option<&HashSet<SocketHandle>>,
+    #[cfg(all(test, feature = "harness"))] test_bridge: Option<
+        &Arc<super::relay_events::RelayEventTestBridge>,
+    >,
 ) where
     D: TunIo,
     M: MetricsSink,
 {
     metrics.enter_poll();
-    iface.poll_with_egress_targets(
-        smoltcp::time::Instant::now(),
-        device,
-        sockets,
-        targets.map(|set| set.iter().copied()),
-    );
     *tcp_loop_flush_tx_calls = tcp_loop_flush_tx_calls.saturating_add(1);
-    let (flush_result, _) =
-        flush_tx_and_release_downlink_permits(device, sockets, socket_ctxs, poll_stage).await;
+    let (flush_result, _) = poll_egress_cycle(
+        device,
+        iface,
+        sockets,
+        socket_ctxs,
+        targets,
+        poll_stage,
+        #[cfg(all(test, feature = "harness"))]
+        test_bridge,
+    )
+    .await;
     if let Err(e) = flush_result {
         *tcp_loop_flush_tx_failures = tcp_loop_flush_tx_failures.saturating_add(1);
         tcp_diag_log!(
@@ -107,7 +113,7 @@ pub(in crate::client_tun) async fn process_ready_tun_rx_packet<D, U, M>(
     iface: &mut Interface,
     dirty: &mut HashSet<SocketHandle>,
     handshake_done_tx: &OpenDispatch,
-    global_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
+    global_tx: &crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
     owned_action_tx: &mpsc::Sender<OwnedActionEvent>,
     metrics: &mut M,
     downlink_flush_max_bytes: usize,
@@ -154,6 +160,8 @@ where
         poll_stage,
         (handshake_done_tx.flow_mode() && coverage == InboundTcpCoverage::CompleteTcp)
             .then_some(&*dirty),
+        #[cfg(all(test, feature = "harness"))]
+        handshake_done_tx.test_egress_bridge(),
     )
     .await;
 
@@ -200,7 +208,7 @@ pub(in crate::client_tun) async fn drain_ready_tun_rx<D, U, M>(
     iface: &mut Interface,
     dirty: &mut HashSet<SocketHandle>,
     handshake_done_tx: &OpenDispatch,
-    global_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
+    global_tx: &crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
     owned_action_tx: &mpsc::Sender<OwnedActionEvent>,
     metrics: &mut M,
     downlink_flush_max_bytes: usize,
@@ -356,6 +364,8 @@ where
             tcp_loop_flush_tx_failures,
             "tun_rx_drain",
             None,
+            #[cfg(all(test, feature = "harness"))]
+            handshake_done_tx.test_egress_bridge(),
         )
         .await;
         super::ingress_effects::collect(iface, sockets, dirty, handshake_done_tx.flow_mode());

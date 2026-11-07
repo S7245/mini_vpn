@@ -189,7 +189,7 @@ async fn open_settlement_retains_join_wakes_across_chunks_and_observer_reentry()
             SocketBuffer::new(vec![0; 1]),
         ));
         let probe = Arc::clone(&probe);
-        control.opens().slots[index] = Some(OpenSlot {
+        assert!(matches!(control.opens().slots.put(index, OpenSlot {
             handle,
             epoch: 1,
             deadline: Instant::now() + Duration::from_secs(20),
@@ -199,7 +199,7 @@ async fn open_settlement_retains_join_wakes_across_chunks_and_observer_reentry()
                 probe.gates[index].notified().await;
                 OpenOutcome::default()
             })),
-        });
+        }), Ok(None)));
     }
     control.opens().live = 2;
     control.request_stop();
@@ -368,10 +368,7 @@ async fn open_illegal_orphan_announcement_stays_quarantined_across_shutdown_reen
 
 #[tokio::test(flavor = "current_thread")]
 async fn open_notice_before_task_return_keeps_custody_until_join_and_disposition() {
-    let control = Arc::new(SessionControl {
-        control_remaining: AtomicUsize::new(32),
-        ..SessionControl::default()
-    });
+    let control = Arc::new({ let mut control = SessionControl::default(); control.control_remaining = AtomicUsize::new(32); control });
     let probe = Arc::new(PendingOpens::new());
     let (dispatch, mut receiver) = OpenDispatch::channel(128, Some(Arc::clone(&control)));
     let mut sockets = SocketSet::new(vec![]);
@@ -381,7 +378,7 @@ async fn open_notice_before_task_return_keeps_custody_until_join_and_disposition
     ));
     let worker_probe = Arc::clone(&probe);
     let sender = dispatch.sender.clone();
-    control.opens().slots[0] = Some(OpenSlot {
+    assert!(matches!(control.opens().slots.put(0, OpenSlot {
         handle,
         epoch: 7,
         deadline: Instant::now() + Duration::from_secs(20),
@@ -398,7 +395,7 @@ async fn open_notice_before_task_return_keeps_custody_until_join_and_disposition
                 ..OpenOutcome::default()
             }
         })),
-    });
+    }), Ok(None)));
     control.opens().live = 1;
     let captured = capture(async {
         for _ in 0..256 {
@@ -742,21 +739,21 @@ async fn open_illegal_inventory_directions_keep_quarantine_and_nonworker_bits() 
                 } else {
                     OpenPhase::AwaitingDisposition(OpenOutcome::default())
                 };
-                session.control.opens().slots[0] = Some(OpenSlot {
+                assert!(matches!(session.control.opens().slots.put(0, OpenSlot {
                     handle: apps.handles[0],
                     epoch: 1,
                     deadline: Instant::now() + Duration::from_secs(20),
                     phase,
-                });
+                }), Ok(None)));
                 if case >= 2 {
                     let phase = illegal_fixture_worker(&session.control, &upstream);
                     let mut opens = session.control.opens();
-                    opens.slots[1] = Some(OpenSlot {
+                    assert!(matches!(opens.slots.put(1, OpenSlot {
                         handle: apps.handles[1],
                         epoch: 1,
                         deadline: Instant::now() + Duration::from_secs(20),
                         phase,
-                    });
+                    }), Ok(None)));
                     opens.live = 2;
                     session.control.announced[0].store(1, Ordering::Release);
                 }

@@ -18,3 +18,16 @@ mod retirement;
 
 #[cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
 mod bi_retirement;
+
+#[cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
+mod stream_control;
+
+#[cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
+mod cid_retirement;
+mod endpoint_source;
+
+#[cfg(feature = "rustls-ring")]
+mod reply_poison;
+
+#[cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
+mod native_closed;

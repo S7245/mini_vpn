@@ -148,7 +148,7 @@ async fn real_tcp_and_stream_packet_tails_settle_at_published_root() {
                 .unwrap(),
             NodeShutdown::RunningResourcesSettled
         );
-        assert!(host.resources.state().uplink.is_none());
+        assert!(host.resources.state().uplink.is_empty());
         assert!(host.resources.state().endpoint_drained);
     })
     .await;
@@ -582,7 +582,7 @@ async fn publication_missing_original_witness_stays_quarantined_after_return() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn unsupported_native_profiles_reject_before_data_publication_and_settle_original_node() {
+async fn native_profiles_publish_one_node_data_authority_and_settle_original_node() {
     for mode in 0..3 {
         let server = server(8);
         let mut cfg = config(server.local_addr().unwrap());
@@ -604,33 +604,47 @@ async fn unsupported_native_profiles_reject_before_data_publication_and_settle_o
             boot(&mut host, &server, &cfg, &mut peers).await;
             let runtime = Arc::clone(&host.ready.as_ref().unwrap().udp_runtime);
             let task_count = host.resources.state().tasks_started;
-            assert!(host.data().is_err(), "unowned Native DATA must not escape");
-            let deadline = host.deadline.unwrap();
-            assert!(host.data().is_err());
-            assert_eq!(host.deadline, Some(deadline));
-            assert!(runtime.owner.get().is_none());
+            let data = host
+                .data()
+                .expect("Native DATA uses the original Node owner");
+            let same = host
+                .data()
+                .expect("repeat DATA borrows the same publication");
+            assert!(Arc::ptr_eq(&data, &same));
+            assert!(
+                data.endpoint
+                    .receive_backing_meter()
+                    .as_ref()
+                    .is_some_and(|meter| {
+                        meter.same_authority(&host.resources.state().backing_meter)
+                    })
+            );
+            assert!(runtime.owner.get().is_some());
             assert_eq!(runtime.child_count.load(Ordering::Acquire), 0);
             {
                 let state = host.resources.state();
-                assert!(!state.published && !state.monitor_started);
-                assert!(state.udp.is_none());
+                assert!(state.published && !state.monitor_started);
+                assert!(state.udp.is_some());
                 assert!(
                     state
                         .connections
                         .iter()
                         .flatten()
-                        .all(|entry| !entry.published)
+                        .all(|entry| entry.published)
                 );
                 assert_eq!(state.attempts_started, 1);
                 assert_eq!(state.tasks_started, task_count);
-                assert!(state.first.is_some());
+                assert!(state.first.is_none());
                 assert_eq!(state.additional, 0);
             }
+            drop(same);
+            drop(data);
+            host.request_stop();
             assert_eq!(
                 tokio::time::timeout(Duration::from_secs(3), host.drive_shutdown())
                     .await
                     .unwrap(),
-                NodeShutdown::FailedSettled
+                NodeShutdown::RunningResourcesSettled
             );
             assert!(
                 tokio::time::timeout(Duration::from_secs(2), peers[0].accept_bi())

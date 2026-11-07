@@ -1,10 +1,10 @@
 //! Legacy Native PermitPump outer task supervision.
 //!
-//! Owns only the existing reader/writer/dispatcher stop and join mechanics.
+//! Owns the existing reader/writer/dispatcher and optional original Native pump.
 //! Owns no SocketCtx, FakeIpPool, listener, SessionControl, F ledger, policy,
 //! ChunkPump, or D16; this extraction preserves all task, queue and timer behavior.
 //! Entry: run_relay_native_permit. Tests remain in client_tun::tests at
-//! src/client_tun/tests/mod.rs (paused credit, read floor and egress permit release).
+//! src/client_tun/tests/native_permit_owner.rs (credit, read floor, permit release).
 
 use super::{
     AsyncLeasedByteFlowQueue, DownstreamPermitReleaseMode, NATIVE_TCP_REASSEMBLY_MAX_BYTES,
@@ -12,20 +12,19 @@ use super::{
     RELAY_WRITER_STOP_TIMEOUT, RelayClose, RelayCloseTimer, RelayCommand, RelayEvent,
     RelayReadCredit, RelayReaderSignal, RelayTaskDiag, RelayWriterSignal, SocketHandle,
     format_relay_close_diag, format_relay_live_diag, relay_ack_drain_hint_due,
-    run_permit_relay_dispatcher, run_relay_native_permit_reader, run_relay_writer,
-    should_poll_relay_ack_drain_hint, should_poll_relay_remote_read_probe, tcp_diag_enabled,
+    run_permit_relay_dispatcher, run_relay_writer, should_poll_relay_ack_drain_hint,
+    should_poll_relay_remote_read_probe, tcp_diag_enabled,
 };
-use crate::upstream::{NativeTcpReadHalf, NativeTcpWriteHalf};
+use crate::upstream::NativeTcpRelayStream;
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 
 pub(in crate::client_tun) async fn run_relay_native_permit(
     handle: SocketHandle,
     epoch: u64,
-    remote_reader: NativeTcpReadHalf,
-    remote_writer: NativeTcpWriteHalf,
-    rx: mpsc::Receiver<RelayCommand>,
-    back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
+    native: NativeTcpRelayStream,
+    rx: crate::client_tun::uplink::Receiver,
+    back_tx: crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
     read_credit_rx: watch::Receiver<RelayReadCredit>,
     queue_capacity_bytes: usize,
     native_read_service_floor: bool,
@@ -62,22 +61,29 @@ pub(in crate::client_tun) async fn run_relay_native_permit(
             .await;
         return;
     };
+    let Some((remote_reader, remote_writer, mut pump)) =
+        crate::client_tun::legacy_native_readers::start(native, handle, epoch, &back_tx).await
+    else {
+        return;
+    };
     let mut dispatcher_task = tokio::spawn(run_permit_relay_dispatcher(
         handle,
         epoch,
         queue.clone(),
         back_tx.clone(),
     ));
-    let mut reader_task = tokio::spawn(run_relay_native_permit_reader(
-        handle,
-        epoch,
-        remote_reader,
+    let mut reader_task = tokio::spawn(super::legacy_native_readers::run_permit(
+        super::legacy_native_readers::Request {
+            handle,
+            epoch,
+            remote_reader,
+            read_credit_rx,
+            signal_tx: reader_signal_tx,
+            local_finish_seen: local_finish_seen.clone(),
+            stop_rx: reader_stop_rx,
+            native_read_service_floor,
+        },
         queue,
-        read_credit_rx,
-        reader_signal_tx,
-        local_finish_seen.clone(),
-        reader_stop_rx,
-        native_read_service_floor,
     ));
     let mut writer_task = tokio::spawn(run_relay_writer(
         handle,
@@ -221,6 +227,7 @@ pub(in crate::client_tun) async fn run_relay_native_permit(
             }
         }
     };
+    pump.stop(RELAY_WRITER_STOP_TIMEOUT);
     let _ = reader_stop_tx.send(());
     let _ = writer_stop_tx.send(());
     if reader_task.is_finished() {
@@ -250,6 +257,7 @@ pub(in crate::client_tun) async fn run_relay_native_permit(
         dispatcher_task.abort();
         let _ = dispatcher_task.await;
     }
+    pump.finish().await;
     tcp_diag_log!(
         "{}",
         format_relay_close_diag(handle, close_direction, close_reason, &diag)

@@ -17,7 +17,7 @@ use std::task::Poll;
 pub(in crate::client_tun) async fn run_borrowed_event_loop<D, U, M>(
     device: &mut D,
     upstream: Arc<U>,
-    mut udp_downlink: UdpDownlinkSource,
+    udp_downlink: &mut UdpDownlinkSource,
     runtime_config: TunRuntimeConfig,
     metrics_handle: Arc<Metrics>,
     mut metrics: M,
@@ -28,6 +28,40 @@ where
     U: OwnedUpstream + 'static,
     M: MetricsSink,
 {
+    let mut namespace = super::namespace::Namespace::new();
+    run_with_namespace(
+        device,
+        upstream,
+        udp_downlink,
+        runtime_config,
+        metrics_handle,
+        &mut metrics,
+        super::namespace::LoopContext {
+            namespace: &mut namespace,
+            control: open_owner,
+        },
+    )
+    .await
+}
+
+/// Original DATA engine; its persistent caller retains the borrowed device on unwind.
+pub(in crate::client_tun) async fn run_with_namespace<D, U, M>(
+    device: &mut D,
+    upstream: Arc<U>,
+    udp_downlink: &mut UdpDownlinkSource,
+    runtime_config: TunRuntimeConfig,
+    metrics_handle: Arc<Metrics>,
+    metrics: &mut M,
+    context: super::namespace::LoopContext<'_>,
+) -> std::io::Result<()>
+where
+    D: TunIo,
+    U: OwnedUpstream + 'static,
+    M: MetricsSink,
+{
+    let open_owner = context.control;
+    let mut fake_pool = &mut context.namespace.fake_pool;
+    let udp_clock = context.namespace.clock;
     let panic_owner = open_owner.clone();
     let pool_size = runtime_config.listener.pool_size;
     let listener_capacity_profile = runtime_config.listener_capacity_profile;
@@ -58,14 +92,23 @@ where
     };
 
     // 全局回信通道（TCP relay 通用回程）：发送端 global_tx 克隆给每个后台车厢。
-    let (global_tx, global_rx) =
-        tokio::sync::mpsc::channel::<(SocketHandle, RelayEvent)>(RELAY_CHANNEL_CAPACITY);
+    let (global_tx, global_rx) = if let Some(owner) = open_owner.as_ref() {
+        owner.prepare_relay_lane(RELAY_CHANNEL_CAPACITY, runtime_config.native_limits.is_some())?
+    } else if runtime_config.native_limits.is_some() {
+        return Err(std::io::ErrorKind::Unsupported.into());
+    } else {
+        crate::client_tun::relay_channel::channel::<(SocketHandle, RelayEvent)>(RELAY_CHANNEL_CAPACITY)
+    };
     let mut relay_event_lane = RelayEventLane::new(global_rx);
     let (owned_action_tx, mut owned_action_rx) =
         tokio::sync::mpsc::channel::<OwnedActionEvent>(OWNED_ACTION_CHANNEL_CAPACITY);
 
     // 刀9 M3 / 刀14d：spawn 出主循环的 remote-open 完成后经此回灌主循环安装 relay。
     // 明确 cheap 的测试/mock 路径仍可 inline，不走此通道。
+    #[cfg(test)]
+    let shutdown_session_id = open_owner
+        .as_ref()
+        .map_or(0, |owner| Arc::as_ptr(owner) as usize);
     let (handshake_done_tx, mut handshake_done_rx) =
         OpenDispatch::channel(HANDSHAKE_DONE_CAPACITY, open_owner);
     let handshake_done_tx =
@@ -90,7 +133,6 @@ where
     // 刀5: fake-IP DNS 不再用 smoltcp socket。任意 resolver 的明文 :53 在 rx 热路径被
     // classify_inbound 判 Dns → handle_dns_hijack 裸包伪造 fake-IP 回包（绕过 smoltcp，
     // 源 = 被查询的 resolver，故不依赖系统 DNS 指向 198.18.0.1，见 ADR-0007）。
-    let mut fake_pool = FakeIpPool::new();
 
     // 3. 初始化 smoltcp 的“虚拟路由器”
     let config = SmolConfig::new(smoltcp::wire::HardwareAddress::Ip);
@@ -117,12 +159,16 @@ where
 
     // 初始化定时器 (每 5 毫秒触发一次)
     let mut timer = tokio::time::interval(std::time::Duration::from_millis(5));
+    if runtime_config.native_limits.is_some() {
+        // Poll and maintenance read actual now; the pacer resets a fixed
+        // allowance. Replaying missed ticks cannot settle additional time.
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    }
 
     // UDP flow ownership remains in the event loop. Wire decoding/reassembly
     // belongs to the selected downlink source, so this layer never interprets
     // TUIC records or a future resumable UDP envelope.
     let mut assoc_table = AssocTable::new();
-    let udp_clock = std::time::Instant::now();
     let mut udp_sweep = tokio::time::interval(std::time::Duration::from_secs(1));
     // review #7：fake-IP 池回收单独走低频 tick（TTL=300s，无需每秒全表扫）。
     let mut fake_ip_sweep = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -169,9 +215,28 @@ where
     let mut selected_action = None;
     let flow_mode = handshake_done_tx.flow_mode();
     let mut shutdown_physical_cursor = 0;
+    let mut last_shutdown_census = None;
+    #[cfg(test)]
+    let mut shutdown_scan_calls = 0u64;
+    #[cfg(test)]
+    let mut shutdown_scan_rounds = 0u64;
+    #[cfg(test)]
+    let mut shutdown_scan_max_cursor = 0usize;
+    #[cfg(test)]
+    let mut shutdown_scan_elapsed = std::time::Duration::ZERO;
+    #[cfg(test)]
+    let mut shutdown_census_calls = 0u64;
+    #[cfg(test)]
+    let mut shutdown_census_elapsed = std::time::Duration::ZERO;
     let mut execution = Box::pin(async {
         loop {
             handshake_done_tx.begin_turn().await;
+            #[cfg(test)]
+            let scan_started = handshake_done_tx
+                .flow_draining()
+                .then(std::time::Instant::now);
+            #[cfg(test)]
+            let previous_cursor = shutdown_physical_cursor;
             handshake_done_tx.drain_shutdown_physical(
                 &mut sockets,
                 &mut socket_ctxs,
@@ -179,7 +244,46 @@ where
                 &mut shutdown_physical_cursor,
                 udp_clock.elapsed().as_secs(),
             );
-            if handshake_done_tx.flow_shutdown_complete(&sockets, &mut socket_ctxs, &fake_pool) {
+            #[cfg(test)]
+            if let Some(started) = scan_started {
+                shutdown_scan_calls = shutdown_scan_calls.saturating_add(1);
+                shutdown_scan_elapsed = shutdown_scan_elapsed.saturating_add(started.elapsed());
+                shutdown_scan_max_cursor = shutdown_scan_max_cursor.max(shutdown_physical_cursor);
+                if previous_cursor > 0 && shutdown_physical_cursor == 0 {
+                    shutdown_scan_rounds = shutdown_scan_rounds.saturating_add(1);
+                }
+            }
+            let census_now = tokio::time::Instant::now();
+            let census_candidate =
+                handshake_done_tx.flow_shutdown_census_candidate(last_shutdown_census, census_now);
+            if census_candidate {
+                last_shutdown_census = Some(census_now);
+            }
+            #[cfg(test)]
+            let census_started = census_candidate.then(std::time::Instant::now);
+            let shutdown_complete = census_candidate
+                && handshake_done_tx.flow_shutdown_complete(&sockets, &mut socket_ctxs, &fake_pool);
+            #[cfg(test)]
+            if let Some(started) = census_started {
+                shutdown_census_calls = shutdown_census_calls.saturating_add(1);
+                shutdown_census_elapsed = shutdown_census_elapsed.saturating_add(started.elapsed());
+            }
+            if shutdown_complete {
+                #[cfg(test)]
+                println!(
+                    "B818 RootComplete session={} now={:?} scan_calls={} scan_rounds={} scan_max_cursor={} scan_elapsed={:?} census_calls={} census_elapsed={:?}",
+                    shutdown_session_id,
+                    tokio::time::Instant::now(),
+                    shutdown_scan_calls,
+                    shutdown_scan_rounds,
+                    shutdown_scan_max_cursor,
+                    shutdown_scan_elapsed,
+                    shutdown_census_calls,
+                    shutdown_census_elapsed,
+                );
+                for ip in assoc_table.retire_all() {
+                    fake_pool.release(ip, udp_clock.elapsed().as_secs());
+                }
                 return Ok(());
             }
             let downlink_stats_raw = downlink_pressure_stats(&dirty, &socket_ctxs, &sockets);
@@ -297,8 +401,6 @@ where
                 downlink_rx_paused || tun_egress_feedback.is_paused()
             };
             let allow_relay_receive = !global_rx_paused || handshake_done_tx.flow_draining();
-            #[cfg(test)]
-            let allow_relay_receive = allow_relay_receive && !handshake_done_tx.test_lane_held();
             publish_relay_read_credit_for_dirty_handles(
                 &dirty,
                 &sockets,
@@ -315,6 +417,15 @@ where
                     },
                 buffered_downlink,
                 downlink_stats_raw.total_pending,
+            );
+            #[cfg(test)]
+            handshake_done_tx.observe_ordered_physical(&socket_ctxs, &sockets);
+            #[cfg(test)]
+            handshake_done_tx.run_active_reasoned_close_probe(
+                &mut sockets,
+                &mut socket_ctxs,
+                &mut fake_pool,
+                0,
             );
             macro_rules! relay_event_turn {
                 () => {
@@ -336,7 +447,7 @@ where
                             handshake_done_tx: &handshake_done_tx,
                             global_tx: &global_tx,
                             owned_action_tx: &owned_action_tx,
-                            metrics: &mut metrics,
+                            metrics: metrics,
                             runtime_config: &runtime_config,
                             downlink_backpressure,
                             downlink_flush_max_bytes,
@@ -417,9 +528,23 @@ where
                 // TCP relay 回程：后台车厢把远端回传字节送回主循环 → 注入对应 smoltcp socket。
                 // TUIC 自重连（live_conn），不需要 legacy 的 disconnect/复位分支。
                 Some(()) = async {
-                    selected_relay = relay_event_lane.recv().await;
+                    #[cfg(not(test))]
+                    { selected_relay = relay_event_lane.recv().await; }
+                    #[cfg(test)]
+                    {
+                        let receive = relay_event_lane.recv();
+                        tokio::pin!(receive);
+                        selected_relay = std::future::poll_fn(|cx| {
+                            if handshake_done_tx.test_lane_held() || handshake_done_tx.test_receive_held() {
+                                return Poll::Pending;
+                            }
+                            receive.as_mut().poll(cx)
+                        }).await;
+                    }
                     selected_relay.as_ref().map(|_| ())
                 }, if allow_relay_receive => {
+                    #[cfg(all(test, feature = "harness"))]
+                    handshake_done_tx.fault_selected_relay(&mut selected_relay);
                     #[cfg(all(test, feature = "harness"))]
                     handshake_done_tx.observe_selected_relay(&selected_relay);
                     metrics.loop_park_end();
@@ -468,7 +593,7 @@ where
                                 &handshake_done_tx,
                                 &global_tx,
                                 &owned_action_tx,
-                                &mut metrics,
+                                metrics,
                                 downlink_flush_max_bytes,
                                 downlink_backpressure,
                                 runtime_config.tun_mtu,
@@ -535,7 +660,7 @@ where
                             &handshake_done_tx,
                             &global_tx,
                             &owned_action_tx,
-                            &mut metrics,
+                            metrics,
                             downlink_flush_max_bytes,
                             downlink_backpressure,
                             runtime_config.tun_mtu,
@@ -595,7 +720,7 @@ where
                                 &handshake_done_tx,
                                 &global_tx,
                                 &owned_action_tx,
-                                &mut metrics,
+                                metrics,
                                 downlink_flush_max_bytes,
                                 downlink_backpressure,
                                 runtime_config.tun_mtu,
@@ -626,7 +751,7 @@ where
                                 &handshake_done_tx,
                                 &global_tx,
                                 &owned_action_tx,
-                                &mut metrics,
+                                metrics,
                                 downlink_flush_max_bytes,
                                 downlink_backpressure,
                                 runtime_config.tun_mtu,
@@ -673,7 +798,7 @@ where
                                 &handshake_done_tx,
                                 &global_tx,
                                 &owned_action_tx,
-                                &mut metrics,
+                                metrics,
                                 downlink_flush_max_bytes,
                                 downlink_backpressure,
                                 runtime_config.tun_mtu,
@@ -729,16 +854,18 @@ where
                         let routed = assoc_table
                             .resolve(assoc_id)
                             .map(|e| (e.target_src(), e.app_endpoint()));
-                        let packet = routed.and_then(|(src, dst)| {
-                            let packet = build_udp_ip_packet(src, dst, &payload);
-                            if packet.is_none() {
-                                metrics_handle.inc_udp_drops_down();
-                            }
-                            packet
+                        let injected = routed.map(|(src, dst)| {
+                            crate::udp_relay::inject_udp_ip_packet(device, src, dst, &payload)
                         });
-                        if let Some(pkt) = packet {
-                            device.inject_ip_packet(&pkt);
+                        if matches!(injected, Some(Ok(()))) {
                             assoc_table.touch(assoc_id, udp_clock.elapsed().as_secs());
+                            #[cfg(all(test, feature = "harness"))]
+                            if let Some(bridge) = handshake_done_tx.test_egress_bridge() {
+                                bridge.observe_egress_probe(
+                                    crate::client_tun::legacy_event_loop::relay_events::EgressProbePhase::BeforeUdpFlush,
+                                    &socket_ctxs,
+                                );
+                            }
                             let (flush_result, _) = flush_tx_and_release_downlink_permits(
                                 device,
                                 &sockets,
@@ -746,10 +873,18 @@ where
                                 "udp_downlink",
                             )
                             .await;
+                            #[cfg(all(test, feature = "harness"))]
+                            if let Some(bridge) = handshake_done_tx.test_egress_bridge() {
+                                bridge.observe_egress_probe(
+                                    crate::client_tun::legacy_event_loop::relay_events::EgressProbePhase::AfterUdpFlush,
+                                    &socket_ctxs,
+                                );
+                            }
                             if let Err(e) = flush_result {
                                 trace_log!("UDP 下行 flush 失败: {e}");
                             }
                         } else {
+                            if injected.is_some() { metrics_handle.inc_udp_drops_down(); }
                             // 未知 association 或无法编码的 payload 不进入 TUN。
                             trace_log!("🗑️ UDP↓ assoc={assoc_id} 无映射或报文无效，丢弃 {}B", payload.len());
                         }
@@ -876,21 +1011,28 @@ where
                     }
                 }
                 // 分支 2: 时钟滴答，处理超时重传等后台任务
-                _ = timer.tick() =>{
+                _scheduled_tick = timer.tick() =>{
+                    #[cfg(all(test, feature = "harness"))]
+                    if let Some(bridge) = handshake_done_tx.test_egress_bridge() {
+                        bridge.observe_timer_tick(_scheduled_tick);
+                        bridge.observe_capacity(&sockets, &socket_ctxs, &registry);
+                    }
                     metrics.loop_park_end();
                     downlink_egress_pacer.on_timer_tick();
                     metrics.enter_poll();
-                    let timestamp = smoltcp::time::Instant::now();
-                    iface.poll(timestamp, device, &mut sockets);
-                    super::ingress_effects::collect(&mut iface, &sockets, &mut dirty, handshake_done_tx.flow_mode());
                     tcp_loop_flush_tx_calls += 1;
-                    let (flush_result, _) = flush_tx_and_release_downlink_permits(
+                    let (flush_result, _) = poll_egress_cycle(
                         device,
-                        &sockets,
+                        &mut iface,
+                        &mut sockets,
                         &mut socket_ctxs,
+                        None,
                         "timer_poll",
+                        #[cfg(all(test, feature = "harness"))]
+                        handshake_done_tx.test_egress_bridge(),
                     )
                     .await;
+                    super::ingress_effects::collect(&mut iface, &sockets, &mut dirty, handshake_done_tx.flow_mode());
                     if let Err(e) = flush_result {
                         tcp_loop_flush_tx_failures += 1;
                         tcp_diag_log!(
@@ -973,7 +1115,7 @@ where
                             &handshake_done_tx,
                             &global_tx,
                             &owned_action_tx,
-                            &mut metrics,
+                            metrics,
                             downlink_flush_max_bytes,
                             downlink_backpressure,
                             runtime_config.tun_mtu,
@@ -1017,7 +1159,7 @@ where
                         &mut fake_pool,
                         udp_clock.elapsed().as_secs(),
                         &metrics_handle,
-                        &mut metrics,
+                        metrics,
                         downlink_flush_max_bytes,
                         downlink_backpressure,
                         runtime_config.tun_mtu,
@@ -1047,7 +1189,7 @@ where
                             &handshake_done_tx,
                             &global_tx,
                             &owned_action_tx,
-                            &mut metrics,
+                            metrics,
                             downlink_flush_max_bytes,
                             downlink_backpressure,
                             runtime_config.tun_mtu,
@@ -1123,6 +1265,11 @@ where
         payloads[0] = Some(payload);
         fatal = true;
     }
+    #[cfg(test)]
+    println!(
+        "B31 original shutdown census session={} calls={shutdown_census_calls} elapsed={shutdown_census_elapsed:?}",
+        &*owner as *const _ as usize
+    );
     match outcome {
         Err(payload) => {
             if let Err(secondary) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {

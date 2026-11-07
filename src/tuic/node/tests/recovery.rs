@@ -511,8 +511,17 @@ async fn actual_tls_configuration_rejection_stops_same_config_without_retry() {
     cfg.tcp_pool = 2;
     let mut host = NodeHost::prepare(cfg.clone(), Arc::new(Metrics::default()));
     let mut peers = Vec::new();
+    struct ReleaseWitness(Arc<Notify>);
+    impl Drop for ReleaseWitness {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+    let witness_gate = Arc::new(Notify::new());
+    let owner = host.resources.clone();
     let result =
         guarded(async {
+            let _release_on_drop = ReleaseWitness(witness_gate.clone());
             boot(&mut host, &server, &cfg, &mut peers).await;
             let data = host.data().unwrap();
             let target = TargetAddr::IpPort("192.0.2.1:443".parse().unwrap());
@@ -535,10 +544,38 @@ async fn actual_tls_configuration_rejection_stops_same_config_without_retry() {
                     tokio::join!(async { assert!(data.open_tcp(&target).await.is_err()); }, async {
                         for _ in 0..1 {
                             let incoming = server.accept().await.unwrap();
+                            {
+                                let mut state = owner.state();
+                                let entry = state.connections.iter_mut().flatten().find(|e| !e.published).unwrap();
+                                assert!(entry.connection.is_none());
+                                let Retirement::Ready(drain) = std::mem::replace(&mut entry.retirement, Retirement::Failed) else { panic!("original witness"); };
+                                let gate = witness_gate.clone();
+                                entry.retirement = Retirement::Waiting(Box::pin(async move {
+                                    drain.abandon(); // same original physical operation, only observation is held
+                                    gate.notified().await;
+                                    drain.drained().await
+                                }));
+                            }
                             starts.push(tokio::time::Instant::now());
                             assert!(incoming.await.is_err());
                         }
                     });
+                    {
+                        let state = owner.state();
+                        assert!(state.config_rejected && state.attempts_drained == 0);
+                    }
+                    witness_gate.notify_one();
+                    loop {
+                        let settled = {
+                            let state = owner.state();
+                            state.attempts_drained == 1
+                                && state.connections.iter().flatten().all(|e| e.published)
+                                && state.recovery.preparation.is_none()
+                                && state.recovery.permit.is_none()
+                        };
+                        if settled { break; }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
                 } => {},
                 result = host.run() => panic!("local exhaustion ended unrelated node: {result:?}"),
             }

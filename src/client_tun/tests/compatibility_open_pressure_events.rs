@@ -38,7 +38,7 @@ impl RejectedRelayEvent {
         match self {
             Self::Data => RelayEvent::Data {
                 epoch,
-                bytes: vec![0x5a],
+                bytes: vec![0x5a].into(),
                 stream_service_window: Default::default(),
                 downstream_permit: None,
             },

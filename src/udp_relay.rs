@@ -88,5 +88,54 @@ pub fn build_udp_ip_packet(
     Some(buf)
 }
 
+/// Encode directly into a preadmitted Device packet. The payload encoder runs
+/// only after the caller acquired its slot and complete maximum backing.
+pub(crate) fn write_udp_ip_packet(
+    output: &mut [u8],
+    src: (Ipv4Addr, u16),
+    dst: (Ipv4Addr, u16),
+    encode: impl FnOnce(&mut [u8]) -> std::io::Result<usize>,
+) -> std::io::Result<usize> {
+    use std::io::{Error, ErrorKind};
+    if output.len() < 28 || output.len() > u16::MAX as usize {
+        return Err(ErrorKind::InvalidInput.into());
+    }
+    let (header, payload) = output.split_at_mut(28);
+    let len = encode(payload)?;
+    if len > payload.len() {
+        return Err(ErrorKind::InvalidData.into());
+    }
+    let ip = etherparse::Ipv4Header::new(
+        (8 + len) as u16,
+        64,
+        etherparse::ip_number::UDP,
+        src.0.octets(),
+        dst.0.octets(),
+    );
+    let udp = etherparse::UdpHeader::with_ipv4_checksum(src.1, dst.1, &ip, &payload[..len])
+        .map_err(Error::other)?;
+    let mut target = &mut header[..];
+    ip.write(&mut target).map_err(Error::other)?;
+    udp.write(&mut target).map_err(Error::other)?;
+    Ok(28 + len)
+}
+
+pub(crate) fn inject_udp_ip_packet<D: crate::device::TunIo>(
+    device: &mut D,
+    src: (Ipv4Addr, u16),
+    dst: (Ipv4Addr, u16),
+    payload: &[u8],
+) -> std::io::Result<()> {
+    if payload.len() > MAX_IPV4_UDP_PAYLOAD_BYTES {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    device.inject_ip_packet_with(28 + payload.len(), |out| {
+        write_udp_ip_packet(out, src, dst, |body| {
+            body.copy_from_slice(payload);
+            Ok(payload.len())
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests;

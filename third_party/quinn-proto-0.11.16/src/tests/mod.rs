@@ -35,6 +35,8 @@ use crate::{
 mod util;
 use util::*;
 
+mod admission;
+pub(crate) use admission::{allocations_in, allocator_failure_in, freed_bytes_in};
 mod token;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -444,7 +446,9 @@ fn successor_service_turn_cannot_succeed_past_preexisting_stream_loss() {
     pair.client_send(client_ch, authentication)
         .write(b"authenticate")
         .unwrap();
-    pair.client_send(client_ch, authentication).finish().unwrap();
+    pair.client_send(client_ch, authentication)
+        .finish()
+        .unwrap();
     pair.client.drive(pair.time, pair.server.addr);
     assert!(
         !pair.client.outbound.is_empty(),
@@ -485,7 +489,9 @@ fn successor_service_turn_completes_after_preexisting_stream_is_acked() {
     pair.client_send(client_ch, authentication)
         .write(b"authenticate")
         .unwrap();
-    pair.client_send(client_ch, authentication).finish().unwrap();
+    pair.client_send(client_ch, authentication)
+        .finish()
+        .unwrap();
     pair.client.drive(pair.time, pair.server.addr);
 
     let started = pair
@@ -525,9 +531,7 @@ fn successor_service_turn_ignores_preexisting_mtu_probe_loss() {
     let mut pair = Pair::default_with_deterministic_pns();
     let mut config = client_config_with_deterministic_pns();
     let mut mtud = MtuDiscoveryConfig::default();
-    mtud
-        .interval(Duration::from_millis(1))
-        .upper_bound(2_000);
+    mtud.interval(Duration::from_millis(1)).upper_bound(2_000);
     Arc::get_mut(&mut config.transport)
         .unwrap()
         .mtu_discovery_config(Some(mtud));
@@ -1796,7 +1800,7 @@ fn stop_opens_bidi() {
         .connections
         .get_mut(&server_ch)
         .unwrap()
-        .recv_stream(s)
+        .recv_stream(s, pair.time)
         .stop(ERROR)
         .unwrap();
     pair.drive();
@@ -3958,10 +3962,7 @@ fn write_blocked_business_demand_survives_worker_turn_before_retry() {
 
     let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
     let payload = vec![0x5a; TOTAL_BYTES];
-    let mut written = pair
-        .client_send(client_ch, stream)
-        .write(&payload)
-        .unwrap();
+    let mut written = pair.client_send(client_ch, stream).write(&payload).unwrap();
     assert_eq!(written, SEND_WINDOW as usize);
     assert_eq!(
         pair.client_send(client_ch, stream)
@@ -4112,7 +4113,8 @@ fn cancelled_blocked_writer_does_not_own_another_streams_packets() {
 
     let before_independent = pair.client_conn_mut(client_ch).stats().path.cwnd;
     assert_eq!(
-        pair.client_send(client_ch, independent).write(&full_window[..64 * 1024]),
+        pair.client_send(client_ch, independent)
+            .write(&full_window[..64 * 1024]),
         Ok(64 * 1024)
     );
     pair.client_send(client_ch, independent).finish().unwrap();
@@ -4123,7 +4125,9 @@ fn cancelled_blocked_writer_does_not_own_another_streams_packets() {
         after_independent, before_independent,
         "a cancelled or deferred blocked writer cannot lend non-application-limited ownership to an independent stream"
     );
-    pair.client_send(client_ch, blocked).reset(VarInt(0)).unwrap();
+    pair.client_send(client_ch, blocked)
+        .reset(VarInt(0))
+        .unwrap();
 }
 
 #[test]

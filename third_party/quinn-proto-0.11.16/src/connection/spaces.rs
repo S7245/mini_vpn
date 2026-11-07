@@ -1,18 +1,20 @@
 use std::{
-    cmp,
-    collections::{BTreeMap, VecDeque},
-    mem,
-    ops::{Bound, Index, IndexMut},
+    cmp, mem,
+    ops::{Index, IndexMut},
 };
 
 use rand::{Rng, RngExt};
-use rustc_hash::FxHashSet;
 use tracing::trace;
 
-use super::assembler::Assembler;
+use super::{
+    assembler::Assembler,
+    cid_frames::Frames,
+    control_inventory::{Retransmits, ThinRetransmits},
+    sent_history::{History, SentPacket},
+};
 use crate::{
-    Dir, Duration, Instant, SocketAddr, StreamId, TransportError, VarInt, connection::StreamsState,
-    crypto::Keys, frame, packet::SpaceId, range_set::ArrayRangeSet, shared::IssuedCid,
+    connection::StreamsState, crypto::Keys, frame, packet::SpaceId, range_set::ArrayRangeSet,
+    Duration, Instant, TransportError,
 };
 
 pub(super) struct PacketSpace {
@@ -23,6 +25,8 @@ pub(super) struct PacketSpace {
 
     /// Data to send
     pub(super) pending: Retransmits,
+    /// CID frames move independently of the optional general control box.
+    pub(super) pending_cids: Frames,
     /// Packet numbers to acknowledge
     pub(super) pending_acks: PendingAcks,
 
@@ -38,7 +42,7 @@ pub(super) struct PacketSpace {
     pub(super) unacked_non_ack_eliciting_tail: u64,
     /// Transmitted but not acked
     // We use a BTreeMap here so we can efficiently query by range on ACK and for loss detection
-    pub(super) sent_packets: BTreeMap<u64, SentPacket>,
+    pub(super) sent_packets: History,
     /// Number of explicit congestion notification codepoints seen on incoming packets
     pub(super) ecn_counters: frame::EcnCounts,
     /// Recent ECN counters sent by the peer in ACK frames
@@ -76,6 +80,7 @@ impl PacketSpace {
             rx_packet: 0,
 
             pending: Retransmits::default(),
+            pending_cids: Frames::default(),
             pending_acks: PendingAcks::new(),
 
             next_packet_number: 0,
@@ -83,7 +88,7 @@ impl PacketSpace {
             largest_acked_packet_sent: now,
             largest_ack_eliciting_sent: 0,
             unacked_non_ack_eliciting_tail: 0,
-            sent_packets: BTreeMap::new(),
+            sent_packets: History::default(),
             ecn_counters: frame::EcnCounts::ZERO,
             ecn_feedback: frame::EcnCounts::ZERO,
 
@@ -115,9 +120,9 @@ impl PacketSpace {
         &mut self,
         request_immediate_ack: bool,
         streams: &StreamsState,
-    ) {
+    ) -> Result<(), (crate::TransportError, ThinRetransmits)> {
         if self.loss_probes == 0 {
-            return;
+            return Ok(());
         }
 
         if request_immediate_ack {
@@ -126,19 +131,19 @@ impl PacketSpace {
             self.immediate_ack_pending = true;
         }
 
-        if !self.pending.is_empty(streams) {
+        if self.pending_is_sendable(streams) {
             // There's real data to send here, no need to make something up
-            return;
+            return Ok(());
         }
 
         // Retransmit the data of the oldest in-flight packet
-        for packet in self.sent_packets.values_mut() {
-            if !packet.retransmits.is_empty(streams) {
-                // Remove retransmitted data from the old packet so we don't end up retransmitting
-                // it *again* even if the copy we're sending now gets acknowledged.
-                self.pending |= mem::take(&mut packet.retransmits);
-                return;
-            }
+        let retransmits = self.sent_packets.values_mut().find_map(|packet| {
+            (!packet.retransmits.is_empty(streams)).then(|| mem::take(&mut packet.retransmits))
+        });
+        if let Some(retransmits) = retransmits {
+            // Move all frame obligations out of the old packet together.
+            self.requeue(retransmits)?;
+            return Ok(());
         }
 
         // Nothing new to send and nothing to retransmit, so fall back on a ping. This should only
@@ -147,6 +152,7 @@ impl PacketSpace {
         if !self.immediate_ack_pending {
             self.ping_pending = true;
         }
+        Ok(())
     }
 
     /// Get the next outgoing packet number in this space
@@ -165,9 +171,17 @@ impl PacketSpace {
     pub(super) fn can_send(&self, streams: &StreamsState) -> SendableFrames {
         let acks = self.pending_acks.can_send();
         let other =
-            !self.pending.is_empty(streams) || self.ping_pending || self.immediate_ack_pending;
+            self.pending_is_sendable(streams) || self.ping_pending || self.immediate_ack_pending;
 
         SendableFrames { acks, other }
+    }
+
+    pub(super) fn pending_is_sendable(&self, streams: &StreamsState) -> bool {
+        self.pending_cids.ready() || !self.pending.is_empty(streams)
+    }
+
+    pub(super) fn pending_is_empty(&self, streams: &StreamsState) -> bool {
+        self.pending_cids.is_empty() && self.pending.is_empty(streams)
     }
 
     /// Verifies sanity of an ECN block and returns whether congestion was encountered.
@@ -203,58 +217,6 @@ impl PacketSpace {
         Ok(ce_increase != 0)
     }
 
-    /// Stop tracking sent packet `number`, and return what we knew about it
-    pub(super) fn take(&mut self, number: u64) -> Option<SentPacket> {
-        let packet = self.sent_packets.remove(&number)?;
-        if !packet.ack_eliciting && number > self.largest_ack_eliciting_sent {
-            self.unacked_non_ack_eliciting_tail =
-                self.unacked_non_ack_eliciting_tail.checked_sub(1).unwrap();
-        }
-        Some(packet)
-    }
-
-    /// May return a packet that should be forgotten
-    pub(super) fn sent(&mut self, number: u64, packet: SentPacket) -> Option<SentPacket> {
-        // Retain state for at most this many non-ACK-eliciting packets sent after the most recently
-        // sent ACK-eliciting packet. We're never guaranteed to receive an ACK for those, and we
-        // can't judge them as lost without an ACK, so to limit memory in applications which receive
-        // packets but don't send ACK-eliciting data for long periods use we must eventually start
-        // forgetting about them, although it might also be reasonable to just kill the connection
-        // due to weird peer behavior.
-        const MAX_UNACKED_NON_ACK_ELICTING_TAIL: u64 = 1_000;
-
-        let mut forgotten = None;
-        if packet.ack_eliciting {
-            self.unacked_non_ack_eliciting_tail = 0;
-            self.largest_ack_eliciting_sent = number;
-        } else if self.unacked_non_ack_eliciting_tail > MAX_UNACKED_NON_ACK_ELICTING_TAIL {
-            let oldest_after_ack_eliciting = *self
-                .sent_packets
-                .range((
-                    Bound::Excluded(self.largest_ack_eliciting_sent),
-                    Bound::Unbounded,
-                ))
-                .next()
-                .unwrap()
-                .0;
-            // Per https://www.rfc-editor.org/rfc/rfc9000.html#name-frames-and-frame-types,
-            // non-ACK-eliciting packets must only contain PADDING, ACK, and CONNECTION_CLOSE
-            // frames, which require no special handling on ACK or loss beyond removal from
-            // in-flight counters if padded.
-            let packet = self
-                .sent_packets
-                .remove(&oldest_after_ack_eliciting)
-                .unwrap();
-            debug_assert!(!packet.ack_eliciting);
-            forgotten = Some(packet);
-        } else {
-            self.unacked_non_ack_eliciting_tail += 1;
-        }
-
-        self.sent_packets.insert(number, packet);
-        forgotten
-    }
-
     /// Whether any congestion-controlled packets in this space are not yet acknowledged or lost
     pub(super) fn has_in_flight(&self) -> bool {
         // The number of non-congestion-controlled (i.e. size == 0) packets in flight at a time
@@ -274,161 +236,6 @@ impl Index<SpaceId> for [PacketSpace; 3] {
 impl IndexMut<SpaceId> for [PacketSpace; 3] {
     fn index_mut(&mut self, space: SpaceId) -> &mut PacketSpace {
         &mut self.as_mut()[space as usize]
-    }
-}
-
-/// Represents one or more packets subject to retransmission
-#[derive(Debug, Clone)]
-pub(super) struct SentPacket {
-    /// [`PathData::generation`](super::PathData::generation) of the path on which this packet was sent
-    pub(super) path_generation: u64,
-    /// The time the packet was sent.
-    pub(super) time_sent: Instant,
-    /// The number of bytes sent in the packet, not including UDP or IP overhead, but including QUIC
-    /// framing overhead. Zero if this packet is not counted towards congestion control, i.e. not an
-    /// "in flight" packet.
-    pub(super) size: u16,
-    /// Whether an acknowledgement is expected directly in response to this packet.
-    pub(super) ack_eliciting: bool,
-    /// Whether this packet carries bytes owned by the bounded successor service turn.
-    pub(super) successor_service_turn: bool,
-    /// Whether this packet carries STREAM bytes for a transport-blocked application writer.
-    pub(super) transport_write_demand: bool,
-    /// The largest packet number acknowledged by this packet
-    pub(super) largest_acked: Option<u64>,
-    /// Data which needs to be retransmitted in case the packet is lost.
-    /// The data is boxed to minimize `SentPacket` size for the typical case of
-    /// packets only containing ACKs and STREAM frames.
-    pub(super) retransmits: ThinRetransmits,
-    /// Metadata for stream frames in a packet
-    ///
-    /// The actual application data is stored with the stream state.
-    pub(super) stream_frames: frame::StreamMetaVec,
-}
-
-/// Retransmittable data queue
-#[allow(unreachable_pub)] // fuzzing only
-#[derive(Debug, Default, Clone)]
-pub struct Retransmits {
-    pub(super) max_data: bool,
-    pub(super) max_stream_id: [bool; 2],
-    pub(super) reset_stream: Vec<(StreamId, VarInt)>,
-    pub(super) stop_sending: Vec<frame::StopSending>,
-    pub(super) max_stream_data: FxHashSet<StreamId>,
-    pub(super) crypto: VecDeque<frame::Crypto>,
-    pub(super) new_cids: Vec<IssuedCid>,
-    pub(super) retire_cids: Vec<u64>,
-    pub(super) ack_frequency: bool,
-    pub(super) handshake_done: bool,
-    /// For each enqueued NEW_TOKEN frame, a copy of the path's remote address
-    ///
-    /// There are 2 reasons this is unusual:
-    ///
-    /// - If the path changes, NEW_TOKEN frames bound for the old path are not retransmitted on the
-    ///   new path. That is why this field stores the remote address: so that ones for old paths
-    ///   can be filtered out.
-    /// - If a token is lost, a new randomly generated token is re-transmitted, rather than the
-    ///   original. This is so that if both transmissions are received, the client won't risk
-    ///   sending the same token twice. That is why this field does _not_ store any actual token.
-    ///
-    /// It is true that a QUIC endpoint will only want to effectively have NEW_TOKEN frames
-    /// enqueued for its current path at a given point in time. Based on that, we could conceivably
-    /// change this from a vector to an `Option<(SocketAddr, usize)>` or just a `usize` or
-    /// something. However, due to the architecture of Quinn, it is considerably simpler to not do
-    /// that; consider what such a change would mean for implementing `BitOrAssign` on Self.
-    pub(super) new_tokens: Vec<SocketAddr>,
-}
-
-impl Retransmits {
-    pub(super) fn is_empty(&self, streams: &StreamsState) -> bool {
-        !self.max_data
-            && !self.max_stream_id.into_iter().any(|x| x)
-            && self.reset_stream.is_empty()
-            && self.stop_sending.is_empty()
-            && self
-                .max_stream_data
-                .iter()
-                .all(|&id| !streams.can_send_flow_control(id))
-            && self.crypto.is_empty()
-            && self.new_cids.is_empty()
-            && self.retire_cids.is_empty()
-            && !self.ack_frequency
-            && !self.handshake_done
-            && self.new_tokens.is_empty()
-    }
-}
-
-impl ::std::ops::BitOrAssign for Retransmits {
-    fn bitor_assign(&mut self, rhs: Self) {
-        // We reduce in-stream head-of-line blocking by queueing retransmits before other data for
-        // STREAM and CRYPTO frames.
-        self.max_data |= rhs.max_data;
-        for dir in Dir::iter() {
-            self.max_stream_id[dir as usize] |= rhs.max_stream_id[dir as usize];
-        }
-        self.reset_stream.extend_from_slice(&rhs.reset_stream);
-        self.stop_sending.extend_from_slice(&rhs.stop_sending);
-        self.max_stream_data.extend(&rhs.max_stream_data);
-        for crypto in rhs.crypto.into_iter().rev() {
-            self.crypto.push_front(crypto);
-        }
-        self.new_cids.extend(&rhs.new_cids);
-        self.retire_cids.extend(rhs.retire_cids);
-        self.ack_frequency |= rhs.ack_frequency;
-        self.handshake_done |= rhs.handshake_done;
-        self.new_tokens.extend_from_slice(&rhs.new_tokens);
-    }
-}
-
-impl ::std::ops::BitOrAssign<ThinRetransmits> for Retransmits {
-    fn bitor_assign(&mut self, rhs: ThinRetransmits) {
-        if let Some(retransmits) = rhs.retransmits {
-            self.bitor_assign(*retransmits)
-        }
-    }
-}
-
-impl ::std::iter::FromIterator<Self> for Retransmits {
-    fn from_iter<T>(iter: T) -> Self
-    where
-        T: IntoIterator<Item = Self>,
-    {
-        let mut result = Self::default();
-        for packet in iter {
-            result |= packet;
-        }
-        result
-    }
-}
-
-/// A variant of `Retransmits` which only allocates storage when required
-#[derive(Debug, Default, Clone)]
-pub(super) struct ThinRetransmits {
-    retransmits: Option<Box<Retransmits>>,
-}
-
-impl ThinRetransmits {
-    /// Returns `true` if no retransmits are necessary
-    pub(super) fn is_empty(&self, streams: &StreamsState) -> bool {
-        match &self.retransmits {
-            Some(retransmits) => retransmits.is_empty(streams),
-            None => true,
-        }
-    }
-
-    /// Returns a reference to the retransmits stored in this box
-    pub(super) fn get(&self) -> Option<&Retransmits> {
-        self.retransmits.as_deref()
-    }
-
-    /// Returns a mutable reference to the stored retransmits
-    ///
-    /// This function will allocate a backing storage if required.
-    pub(super) fn get_or_create(&mut self) -> &mut Retransmits {
-        if self.retransmits.is_none() {
-            self.retransmits = Some(Box::default());
-        }
-        self.retransmits.as_deref_mut().unwrap()
     }
 }
 
@@ -467,6 +274,11 @@ impl Dedup {
     /// Highest packet number authenticated.
     fn highest(&self) -> u64 {
         self.next - 1
+    }
+
+    pub(super) fn contains(&self, packet: u64) -> bool {
+        let mut probe = Self { window: self.window, next: self.next };
+        probe.insert(packet)
     }
 
     /// Record a newly authenticated packet number.
@@ -608,7 +420,7 @@ pub(super) struct PendingAcks {
     earliest_ack_eliciting_since_last_ack_sent: Option<Instant>,
     /// The packet number ranges of ack-eliciting packets the peer hasn't confirmed receipt of ACKs
     /// for
-    ranges: ArrayRangeSet,
+    pub(super) ranges: ArrayRangeSet,
     /// The packet with the largest packet number, and the time upon which it was received (used to
     /// calculate ACK delay in [`PendingAcks::ack_delay`])
     largest_packet: Option<(u64, Instant)>,
@@ -628,6 +440,9 @@ pub(super) struct PendingAcks {
 
 impl PendingAcks {
     fn new() -> Self {
+        Self::with_ranges(ArrayRangeSet::default())
+    }
+    pub(super) fn with_ranges(ranges: ArrayRangeSet) -> Self {
         Self {
             immediate_ack_required: false,
             ack_eliciting_since_last_ack_sent: 0,
@@ -635,7 +450,7 @@ impl PendingAcks {
             ack_eliciting_threshold: 1,
             reordering_threshold: 1,
             earliest_ack_eliciting_since_last_ack_sent: None,
-            ranges: ArrayRangeSet::default(),
+            ranges,
             largest_packet: None,
             largest_ack_eliciting_packet: None,
             largest_acked: None,
@@ -815,8 +630,10 @@ impl PendingAcks {
     }
 
     /// Insert one packet that needs to be acknowledged
-    pub(super) fn insert_one(&mut self, packet: u64, now: Instant) {
-        self.ranges.insert_one(packet);
+    pub(super) fn insert_one(&mut self, packet: u64, now: Instant) -> Result<(), TransportError> {
+        self.ranges
+            .try_insert_one(packet)
+            .map_err(|_| TransportError::INTERNAL_ERROR("ACK range custody invariant failed"))?;
 
         if self.largest_packet.is_none_or(|(pn, _)| packet > pn) {
             self.largest_packet = Some((packet, now));
@@ -825,6 +642,7 @@ impl PendingAcks {
         if self.ranges.len() > MAX_ACK_BLOCKS {
             self.ranges.pop_min();
         }
+        Ok(())
     }
 
     /// Remove ACKs of packets numbered at or below `max` from the set of pending ACKs
@@ -956,6 +774,7 @@ impl PacketNumberFilter {
 
 /// Ensures we can always fit all our ACKs in a single minimum-MTU packet with room to spare
 const MAX_ACK_BLOCKS: usize = 64;
+pub(super) const ACK_RANGE_CAPACITY: usize = MAX_ACK_BLOCKS + 1;
 
 #[cfg(test)]
 mod test {
@@ -1100,7 +919,7 @@ mod test {
         // Receive ack-eliciting packet
         dedup.insert(0);
         let now = Instant::now();
-        acks.insert_one(0, now);
+        acks.insert_one(0, now).unwrap();
         acks.packet_received(now, 0, true, &dedup);
 
         // Sanity check
@@ -1126,7 +945,7 @@ mod test {
 
         // In-order packet
         dedup.insert(0);
-        acks.insert_one(0, t1);
+        acks.insert_one(0, t1).unwrap();
         acks.packet_received(t1, 0, true, &dedup);
         assert_eq!(acks.ack_delay(t1), Duration::from_millis(0));
         assert_eq!(acks.ack_delay(t2), Duration::from_millis(2));
@@ -1134,14 +953,14 @@ mod test {
 
         // Out of order (higher than expected)
         dedup.insert(3);
-        acks.insert_one(3, t2);
+        acks.insert_one(3, t2).unwrap();
         acks.packet_received(t2, 3, true, &dedup);
         assert_eq!(acks.ack_delay(t2), Duration::from_millis(0));
         assert_eq!(acks.ack_delay(t3), Duration::from_millis(5));
 
         // Out of order (lower than expected, so previous instant is kept)
         dedup.insert(2);
-        acks.insert_one(2, t3);
+        acks.insert_one(2, t3).unwrap();
         acks.packet_received(t3, 2, true, &dedup);
         assert_eq!(acks.ack_delay(t3), Duration::from_millis(5));
     }
@@ -1155,7 +974,7 @@ mod test {
 
         for packet_number in [0, 2] {
             dedup.insert(packet_number);
-            acks.insert_one(packet_number, sent_at);
+            acks.insert_one(packet_number, sent_at).unwrap();
             acks.packet_received(sent_at, packet_number, true, &dedup);
         }
         acks.request_gap_ack_reinforcement();
@@ -1165,7 +984,7 @@ mod test {
 
         let newer_packet_at = sent_at + delay - Duration::from_millis(1);
         dedup.insert(3);
-        acks.insert_one(3, newer_packet_at);
+        acks.insert_one(3, newer_packet_at).unwrap();
         assert!(acks.packet_received(newer_packet_at, 3, true, &dedup));
         assert_eq!(
             acks.max_ack_delay_timeout(delay),
@@ -1198,7 +1017,7 @@ mod test {
 
         for packet_number in [0, 2] {
             dedup.insert(packet_number);
-            acks.insert_one(packet_number, now);
+            acks.insert_one(packet_number, now).unwrap();
             acks.packet_received(now, packet_number, true, &dedup);
         }
         acks.request_gap_ack_reinforcement();
@@ -1217,3 +1036,7 @@ mod test {
         assert!(std::mem::size_of::<SentPacket>() <= 128);
     }
 }
+
+#[cfg(test)]
+#[path = "spaces/tests/packet_snapshot.rs"]
+mod packet_snapshot_tests;

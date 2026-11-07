@@ -66,6 +66,9 @@ impl TunIo for DnsInjectRecorder {
     fn rx_take(&mut self) -> Option<bytes::BytesMut> {
         None
     }
+    fn rx_take_packet(&mut self) -> Option<crate::device::RxPacket> {
+        self.rx_take().map(Into::into)
+    }
     fn stage_rx_for_iface(&mut self) -> bool {
         false
     }
@@ -153,6 +156,9 @@ impl TunIo for BrokenTunDevice {
 
     fn rx_take(&mut self) -> Option<bytes::BytesMut> {
         None
+    }
+    fn rx_take_packet(&mut self) -> Option<crate::device::RxPacket> {
+        self.rx_take().map(Into::into)
     }
 
     fn stage_rx_for_iface(&mut self) -> bool {
@@ -316,6 +322,9 @@ impl TunIo for BatchTestTunDevice {
         }
         self.current.take()
     }
+    fn rx_take_packet(&mut self) -> Option<crate::device::RxPacket> {
+        self.rx_take().map(Into::into)
+    }
 
     fn stage_rx_for_iface(&mut self) -> bool {
         if self.stopping {
@@ -375,7 +384,7 @@ async fn run_batch_drain_test(packets: Vec<Vec<u8>>) -> BatchDrainTestReport {
         .unwrap();
     let mut dirty = HashSet::new();
     let (handshake_done_tx, _handshake_done_rx) = OpenDispatch::channel(1, None);
-    let (global_tx, _global_rx) = mpsc::channel(1);
+    let (global_tx, _global_rx) = crate::client_tun::relay_channel::channel(1);
     let (owned_action_tx, _owned_action_rx) = mpsc::channel(1);
     let mut sink = CountingSink::default();
     let cfg = default_downlink_backpressure_for_tun_egress(1200, 500);

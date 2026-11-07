@@ -56,6 +56,9 @@ impl TunIo for Staging {
     fn rx_take(&mut self) -> Option<bytes::BytesMut> {
         self.0.rx_take()
     }
+    fn rx_take_packet(&mut self) -> Option<crate::device::RxPacket> {
+        self.0.rx_take_packet()
+    }
     fn stage_rx_for_iface(&mut self) -> bool {
         !self.1 && self.0.stage_rx_for_iface()
     }

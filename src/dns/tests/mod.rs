@@ -86,3 +86,44 @@ fn build_nodata_response_fields() {
     assert_eq!(r[3] & 0x0F, 0); // RCODE=0 (success)
     assert_eq!(u16::from_be_bytes([r[6], r[7]]), 0); // ANCOUNT=0
 }
+
+#[test]
+fn borrowed_query_and_fixed_reply_match_owned_wire_without_question_copy() {
+    let wire = build_query(0x4312, "one.two.example", QTYPE_A);
+    let owned = parse_query(&wire).unwrap();
+    let mut name = [0; 253];
+    let view = parse_query_into(&wire, &mut name).unwrap();
+    assert_eq!(view.question.as_ptr(), wire[12..].as_ptr());
+    assert_eq!(view.qname, owned.qname);
+    for answer in [
+        Answer::A(Ipv4Addr::new(198, 18, 0, 2), 5),
+        Answer::NoData,
+        Answer::ServFail,
+    ] {
+        let mut response = [0; 300];
+        let expected = match answer {
+            Answer::A(ip, ttl) => build_response(&owned, Answer::A(ip, ttl)),
+            Answer::NoData => build_response(&owned, Answer::NoData),
+            Answer::ServFail => build_response(&owned, Answer::ServFail),
+        };
+        let written = write_response_into(&view, answer, &mut response).unwrap();
+        assert_eq!(expected, response[..written]);
+    }
+}
+#[test]
+fn borrowed_parser_bounds_qname_before_reply_admission() {
+    let longest = format!(
+        "{}.{}.{}.{}",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(61)
+    );
+    assert_eq!(longest.len(), 253);
+    let mut name = [0; 253];
+    let wire = build_query(1, &longest, QTYPE_A);
+    assert_eq!(parse_query_into(&wire, &mut name).unwrap().qname, longest);
+    let oversized = build_query(1, &(longest + "x"), QTYPE_A);
+    assert!(parse_query_into(&oversized, &mut name).is_none());
+    assert!(parse_query(&oversized).is_none());
+}

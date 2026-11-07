@@ -1,7 +1,7 @@
 //! Storing tokens sent from servers in NEW_TOKEN frames and using them in subsequent connections
 
 use std::{
-    collections::{HashMap, VecDeque, hash_map},
+    collections::{hash_map, HashMap, VecDeque},
     sync::{Arc, Mutex},
 };
 
@@ -9,7 +9,11 @@ use bytes::Bytes;
 use lru_slab::LruSlab;
 use tracing::trace;
 
-use crate::token::TokenStore;
+use crate::token::{TokenStore, TokenStoreError};
+
+mod cold;
+mod prepared;
+use cold::Cold;
 
 /// `TokenStore` implementation that stores up to `N` tokens per server name for up to a
 /// limited number of server names, in-memory
@@ -26,16 +30,136 @@ impl TokenMemoryCache {
     }
 }
 
+impl TokenMemoryCache {
+    /// Exact fixed hard-cache slab layouts at these configured limits.
+    /// Excludes dynamic name/token backings and bounded instance/platform heads.
+    /// Planning does not bind an authority or change the cache representation.
+    #[doc(hidden)]
+    pub fn fixed_layout_bytes(&self) -> Result<usize, TokenStoreError> {
+        match &*self.lock()? {
+            State::Empty {
+                max_server_names,
+                max_tokens_per_server,
+            } => Cold::layout_bytes(*max_server_names as usize, *max_tokens_per_server),
+            State::Legacy(legacy) => Cold::layout_bytes(
+                legacy.max_server_names as usize,
+                legacy.max_tokens_per_server,
+            ),
+            State::Cold(cold) => cold.fixed_layout_bytes(),
+        }
+    }
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, State>, TokenStoreError> {
+        self.0.lock().map_err(|poison| {
+            if let State::Cold(cold) = &**poison.get_ref() {
+                cold.quarantine();
+            }
+            TokenStoreError::Capacity(bytes::MeteredCopyError::Quarantined)
+        })
+    }
+}
+
 impl TokenStore for TokenMemoryCache {
+    fn prepare_insert_metered(
+        self: Arc<Self>, name: &str, meter: &bytes::BackingMeter,
+    ) -> Result<crate::token::PreparedTokenInsert, TokenStoreError> {
+        prepared::prepare(self, name, meter)
+    }
+
     fn insert(&self, server_name: &str, token: Bytes) {
-        trace!(%server_name, "storing token");
-        self.0.lock().unwrap().store(server_name, token)
+        // Legacy public callers may carry a charged token too. Never send it
+        // through uncharged legacy containers. Connection uses the typed path.
+        if let Some(meter) = token.backing_meter().filter(|m| m.budget_limit().is_some()) {
+            if self.insert_metered(server_name, token, &meter).is_err() {
+                meter.quarantine();
+            }
+            return;
+        }
+        if let Ok(mut state) = self.lock() {
+            if let State::Empty {
+                max_server_names,
+                max_tokens_per_server,
+            } = *state
+            {
+                *state = State::Legacy(Legacy::new(max_server_names, max_tokens_per_server));
+            }
+            match &mut *state {
+                State::Cold(cold) => cold.quarantine(),
+                State::Legacy(legacy) => {
+                    trace!(%server_name, "storing token");
+                    legacy.store(server_name, token);
+                }
+                State::Empty { .. } => {}
+            }
+        }
     }
 
     fn take(&self, server_name: &str) -> Option<Bytes> {
-        let token = self.0.lock().unwrap().take(server_name);
+        let mut state = self.lock().ok()?;
+        let token = match &mut *state {
+            State::Cold(cold) => cold.take(server_name).ok().flatten(),
+            State::Legacy(legacy) => legacy.take(server_name),
+            State::Empty { .. } => None,
+        };
         trace!(%server_name, found=%token.is_some(), "taking token");
         token
+    }
+
+    fn insert_metered(
+        &self,
+        name: &str,
+        token: Bytes,
+        meter: &bytes::BackingMeter,
+    ) -> Result<(), TokenStoreError> {
+        let mut state = self.lock()?;
+        Cold::check_token(&token, meter)?;
+        state.release_empty_legacy()?;
+        match &mut *state {
+            State::Cold(cold) => {
+                cold.check_authority(meter)?;
+                cold.insert(name, token)
+            }
+            State::Empty {
+                max_server_names,
+                max_tokens_per_server,
+            } => {
+                // The entire candidate stays private through slab/name admission.
+                // An error drops its exact layouts; publication is infallible.
+                let mut cold =
+                    Cold::prepare(*max_server_names as usize, *max_tokens_per_server, meter)?;
+                cold.insert(name, token)?;
+                *state = State::Cold(cold);
+                Ok(())
+            }
+            State::Legacy(_) => Err(TokenStoreError::OccupiedLegacy),
+        }
+    }
+
+    fn take_metered(
+        &self,
+        name: &str,
+        meter: &bytes::BackingMeter,
+    ) -> Result<Option<Bytes>, TokenStoreError> {
+        let mut state = self.lock()?;
+        meter
+            .admit_precharged()
+            .map_err(TokenStoreError::Capacity)?;
+        state.release_empty_legacy()?;
+        match &mut *state {
+            State::Cold(cold) => {
+                cold.check_authority(meter)?;
+                cold.take(name)
+            }
+            State::Empty {
+                max_server_names,
+                max_tokens_per_server,
+            } if *max_server_names != 0
+                && *max_tokens_per_server != 0
+                && meter.budget_limit().is_some() =>
+            {
+                Ok(None)
+            }
+            _ => Err(TokenStoreError::Unsupported),
+        }
     }
 }
 
@@ -46,17 +170,44 @@ impl Default for TokenMemoryCache {
     }
 }
 
-/// Lockable inner state of `TokenMemoryCache`
+/// Exclusive representations: a hard cache can never retain legacy backing.
 #[derive(Debug)]
-struct State {
+enum State {
+    Empty {
+        max_server_names: u32,
+        max_tokens_per_server: usize,
+    },
+    Legacy(Legacy),
+    Cold(Cold),
+}
+impl State {
+    fn new(max_server_names: u32, max_tokens_per_server: usize) -> Self {
+        Self::Empty {
+            max_server_names,
+            max_tokens_per_server,
+        }
+    }
+    fn release_empty_legacy(&mut self) -> Result<(), TokenStoreError> {
+        if let Self::Legacy(legacy) = self {
+            if !legacy.lookup.is_empty() || legacy.lru.len() != 0 {
+                return Err(TokenStoreError::OccupiedLegacy);
+            }
+            // Assigning destroys both real retained allocations, not just len.
+            // No token is consumed and the replacement has no allocation.
+            *self = Self::new(legacy.max_server_names, legacy.max_tokens_per_server);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct Legacy {
     max_server_names: u32,
     max_tokens_per_server: usize,
-    // map from server name to index in lru
     lookup: HashMap<Arc<str>, u32>,
     lru: LruSlab<CacheEntry>,
 }
-
-impl State {
+impl Legacy {
     fn new(max_server_names: u32, max_tokens_per_server: usize) -> Self {
         Self {
             max_server_names,
@@ -151,96 +302,4 @@ impl CacheEntry {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::VecDeque;
-
-    use super::*;
-    use rand::prelude::*;
-    use rand_pcg::Pcg32;
-
-    fn new_rng() -> impl Rng {
-        Pcg32::new(0xdeadbeefdeadbeef, 0xdeadbeefdeadbeef)
-    }
-
-    #[test]
-    fn cache_test() {
-        let mut rng = new_rng();
-        const N: usize = 2;
-
-        for _ in 0..10 {
-            let mut cache_1: Vec<(u32, VecDeque<Bytes>)> = Vec::new(); // keep it sorted oldest to newest
-            let cache_2 = TokenMemoryCache::new(20, 2);
-
-            for i in 0..200 {
-                let server_name = rng.random::<u32>() % 10;
-                if rng.random_bool(0.666) {
-                    // store
-                    let token = Bytes::from(vec![i]);
-                    println!("STORE {server_name} {token:?}");
-                    if let Some((j, _)) = cache_1
-                        .iter()
-                        .enumerate()
-                        .find(|&(_, &(server_name_2, _))| server_name_2 == server_name)
-                    {
-                        let (_, mut queue) = cache_1.remove(j);
-                        queue.push_back(token.clone());
-                        if queue.len() > N {
-                            queue.pop_front();
-                        }
-                        cache_1.push((server_name, queue));
-                    } else {
-                        let mut queue = VecDeque::new();
-                        queue.push_back(token.clone());
-                        cache_1.push((server_name, queue));
-                        if cache_1.len() > 20 {
-                            cache_1.remove(0);
-                        }
-                    }
-                    cache_2.insert(&server_name.to_string(), token);
-                } else {
-                    // take
-                    println!("TAKE {server_name}");
-                    let expecting = cache_1
-                        .iter()
-                        .enumerate()
-                        .find(|&(_, &(server_name_2, _))| server_name_2 == server_name)
-                        .map(|(j, _)| j)
-                        .map(|j| {
-                            let (_, mut queue) = cache_1.remove(j);
-                            let token = queue.pop_front().unwrap();
-                            if !queue.is_empty() {
-                                cache_1.push((server_name, queue));
-                            }
-                            token
-                        });
-                    println!("EXPECTING {expecting:?}");
-                    assert_eq!(cache_2.take(&server_name.to_string()), expecting);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn zero_max_server_names() {
-        // test that this edge case doesn't panic
-        let cache = TokenMemoryCache::new(0, 2);
-        for i in 0..10 {
-            cache.insert(&i.to_string(), Bytes::from(vec![i]));
-            for j in 0..10 {
-                assert!(cache.take(&j.to_string()).is_none());
-            }
-        }
-    }
-
-    #[test]
-    fn zero_queue_length() {
-        // test that this edge case doesn't panic
-        let cache = TokenMemoryCache::new(256, 0);
-        for i in 0..10 {
-            cache.insert(&i.to_string(), Bytes::from(vec![i]));
-            for j in 0..10 {
-                assert!(cache.take(&j.to_string()).is_none());
-            }
-        }
-    }
-}
+mod tests;

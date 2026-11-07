@@ -33,12 +33,44 @@ const HEALTH_TICK_SECS: u64 = 3;
 /// 这么久 = 真黑洞（误判也只是优雅切 REALITY + 冷却切回，自愈）。
 const BLACKHOLE_RX_STALE_SECS: u64 = 10;
 
+mod health;
+pub(crate) use health::HealthJoinObservation;
+#[cfg(test)]
+pub(crate) use health::HealthObservation;
+pub use health::{HealthExit, HealthTask};
+mod staged;
+
+/// Node authority admission, separate from the physical primary's health facts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FallbackAdmission {
+    Allowed,
+    Pending,
+    Unowned,
+    OwnerLost,
+    Unpublished,
+    Stopping,
+    ConfigurationRejected,
+    Quarantined,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HealthSnapshot {
+    pub dead: bool,
+    pub rx_datagrams: u64,
+    pub fallback: FallbackAdmission,
+}
+
 /// 上游腿的健康探测面（failover 用）。TUIC 实现它；REALITY 腿无需。
 ///
 /// 中文要点：与 `ProxyUpstream`/`DatagramUpstream` 并列，专供 failover 判健康——
 /// `probe` 主动探活（QUIC 连接可建立），`is_dead` 区分 down 快路（黑洞，连接死）/慢路（流失败）。
 #[async_trait::async_trait]
 pub trait HealthProbe: Send + Sync {
+    /// Nonblocking same-primary facts; None means busy/unavailable, never zero RX.
+    fn snapshot(&self) -> Option<HealthSnapshot> {
+        None
+    }
+
     /// 主动探活：QUIC 连接可建立（live_conn 成功，含 QUIC 握手 + TUIC 认证，非浅探）→ true。
     async fn probe(&self) -> bool;
     /// 当前连接是否已死（`close_reason` 有值 = 黑洞/超时打死，重建才知能不能回来）。
@@ -268,10 +300,15 @@ pub struct FailoverUpstream<T, R> {
 
 impl<T, R> FailoverUpstream<T, R> {
     pub fn new(tuic: Arc<T>, reality: Arc<R>) -> Self {
+        Self::with_state(tuic, reality, Arc::new(FailoverState::new()))
+    }
+
+    /// Cold session composition preserves the original policy and its clock.
+    pub(crate) fn with_state(tuic: Arc<T>, reality: Arc<R>, state: Arc<FailoverState>) -> Self {
         Self {
             tuic,
             reality,
-            state: Arc::new(FailoverState::new()),
+            state,
         }
     }
 
@@ -290,55 +327,24 @@ where
     /// - **TUIC 当班**：观察 `udp_rx.datagrams`，停滞 ~10s（连 keepalive ACK 都没有）→ 判黑洞 → 切 REALITY。
     ///   这是**主**检测（可靠、不被 keepalive/乐观开流架空，见 ADR-0011 §3b）。
     /// - **REALITY 当班**：每 PROBE_INTERVAL_SECS 探一次 TUIC（live_conn 非浅探），不对称迟滞切回（spec §2.4）。
-    pub fn spawn_health_probe(self: &Arc<Self>) {
-        let state = self.state.clone();
-        let tuic = self.tuic.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(HEALTH_TICK_SECS));
-            let mut detector = BlackholeDetector::new();
-            let mut secs_since_up_probe = 0u64;
-            loop {
-                tick.tick().await;
-                match state.active_leg() {
-                    TcpLeg::Tuic => {
-                        secs_since_up_probe = 0;
-                        // rx_datagrams 非阻塞：None=锁被占（重连中）→ 跳过本次观察（停滞计时靠 now 累积、不重置）。
-                        if let Some(rx) = tuic.rx_datagrams().await
-                            && detector.observe(rx, state.now_secs())
-                            && state.record_blackhole(state.now_secs())
-                        {
-                            println!(
-                                "🔀 failover：TUIC 黑洞（{BLACKHOLE_RX_STALE_SECS}s 无收包，连 keepalive ACK 都没有）→ 切到 REALITY 备路",
-                            );
-                            detector.reset();
-                        }
-                    }
-                    TcpLeg::Reality => {
-                        // 每 REALITY tick 复位（幂等）：保证切回 TUIC 时 detector 从干净状态开始计（非仅切换瞬间）。
-                        detector.reset();
-                        secs_since_up_probe += HEALTH_TICK_SECS;
-                        if secs_since_up_probe >= PROBE_INTERVAL_SECS {
-                            secs_since_up_probe = 0;
-                            let ok = tuic.probe().await;
-                            if state.record_probe(ok, state.now_secs()) {
-                                println!(
-                                    "🔀 failover：TUIC 探针连续成功 + 冷却已过 → 切回 TUIC 主腿"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        });
+    pub fn spawn_health_probe(self: &Arc<Self>) -> HealthTask {
+        health::spawn(self)
     }
 }
 
 #[async_trait::async_trait]
 impl<T, R> ProxyUpstream for FailoverUpstream<T, R>
 where
-    T: ProxyUpstream + HealthProbe,
-    R: ProxyUpstream,
+    T: ProxyUpstream + HealthProbe + 'static,
+    R: ProxyUpstream + 'static,
 {
+    fn staged_tcp_open(
+        self: Arc<Self>,
+        request: crate::upstream::TcpOpenRequest,
+    ) -> crate::upstream::StagedTcpOpen<crate::upstream::OpenedTcpRelay> {
+        staged::create(self, request).map(|open| Box::new(open) as _)
+    }
+
     async fn open_tcp(&self, target: &TargetAddr) -> Result<RelayStream, ClientError> {
         match self.state.active_leg() {
             TcpLeg::Tuic => match self.tuic.open_tcp(target).await {
@@ -396,6 +402,10 @@ where
         // F2 硬约束（铁律）：UDP datagram 永久绑 TUIC，绝不读 active_leg、绝不看冷却、绝不降级 REALITY。
         // TUIC 不可用时由 TuicUpstream::send_udp 内部优雅丢弃（udp_drops++）+ live_conn 自愈，failover 不干预。
         self.tuic.send_udp(datagram).await;
+    }
+
+    async fn send_udp_packet(&self, association: u16, target: &TargetAddr, payload: &[u8]) {
+        self.tuic.send_udp_packet(association, target, payload).await;
     }
 
     // 刀11：上行计数转发 tuic 腿（UDP 恒 TUIC，REALITY 腿无 datagram）。

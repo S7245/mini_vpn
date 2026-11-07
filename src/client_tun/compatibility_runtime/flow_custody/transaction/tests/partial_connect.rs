@@ -39,16 +39,16 @@ fn target() -> TargetAddr {
     TargetAddr::IpPort("10.0.0.2:10000".parse().unwrap())
 }
 
-struct ReadyPeer {
+pub(super) struct ReadyPeer {
     pair: UdpPair,
-    upstream: Arc<TuicUpstream>,
+    pub(super) upstream: Arc<TuicUpstream>,
     peer: quinn::Connection,
     auth: quinn::RecvStream,
     id: usize,
 }
 
 impl ReadyPeer {
-    async fn new() -> Self {
+    pub(super) async fn new() -> Self {
         Self::with_window(4).await
     }
 
@@ -115,7 +115,7 @@ impl ReadyPeer {
         }
     }
 
-    fn assert_current(&self, next: u64) {
+    pub(super) fn assert_current(&self, next: u64) {
         let current = upstream_ready_connection(&self.upstream).unwrap();
         assert_eq!(current.stable_id(), self.id);
         let (opened, credit, handshaking, closed, failed) = current.bi_stream_open_snapshot();
@@ -127,7 +127,7 @@ impl ReadyPeer {
         assert!(self.peer.close_reason().is_none());
     }
 
-    async fn prefix(&self) -> (quinn::SendStream, quinn::RecvStream) {
+    pub(super) async fn prefix(&self) -> (quinn::SendStream, quinn::RecvStream) {
         tokio::time::timeout(Duration::from_secs(2), async {
             let (send, mut recv) = self.peer.accept_bi().await.unwrap();
             assert_eq!(recv.id().index(), 0);
@@ -140,7 +140,7 @@ impl ReadyPeer {
         .unwrap()
     }
 
-    async fn close(self) {
+    pub(super) async fn close(self) {
         let endpoint = upstream_endpoint(&self.upstream);
         endpoint.close(0u32.into(), b"partial CONNECT cleanup");
         self.peer.close(0u32.into(), b"partial CONNECT cleanup");
@@ -316,7 +316,7 @@ impl Physical {
         })
         .await;
         if let Poll::Ready(Some(event)) = event {
-            let (global_tx, _global_rx) = mpsc::channel(4);
+            let (global_tx, _global_rx) = crate::client_tun::relay_channel::channel(4);
             let (owned_action_tx, _owned_rx) = mpsc::channel(4);
             HandshakeCompletion::from_loop(
                 &self.dispatch,

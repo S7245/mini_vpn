@@ -5,7 +5,8 @@ use tracing::trace;
 use super::{
     mtud::MtuDiscovery,
     pacing::Pacer,
-    spaces::{PacketSpace, SentPacket},
+    sent_history::{PacketPermit, SentPacket},
+    spaces::PacketSpace,
 };
 use crate::{congestion, packet::SpaceId, Duration, Instant, TransportConfig, TIMER_GRANULARITY};
 
@@ -167,14 +168,29 @@ impl PathData {
     }
 
     /// Account for transmission of `packet` with number `pn` in `space`
-    pub(super) fn sent(&mut self, pn: u64, packet: SentPacket, space: &mut PacketSpace) {
+    pub(super) fn sent(
+        &mut self,
+        pn: u64,
+        packet: SentPacket,
+        space: &mut PacketSpace,
+        permit: PacketPermit,
+    ) -> bool {
         self.in_flight.insert(&packet);
         if self.first_packet.is_none() {
             self.first_packet = Some(pn);
         }
-        if let Some(forgotten) = space.sent(pn, packet) {
-            self.remove_in_flight(&forgotten);
+        match space.sent(pn, packet, permit) {
+            Ok(Some(forgotten)) => {
+                self.remove_in_flight(&forgotten);
+            }
+            Ok(None) => {}
+            Err((packet, permit)) => {
+                self.remove_in_flight(&packet);
+                drop(permit);
+                return false;
+            }
         }
+        true
     }
 
     /// Remove `packet` with number `pn` from this path's congestion control counters, or return
@@ -415,10 +431,39 @@ impl RttEstimator {
 
 #[derive(Default)]
 pub(crate) struct PathResponses {
-    pending: Vec<PathResponse>,
+    pending: super::storage::Slab<PathResponse>,
+    meter: Option<bytes::BackingMeter>,
 }
 
 impl PathResponses {
+    pub(super) fn prepare_push(&self, remote: SocketAddr, meter: Option<&bytes::BackingMeter>)
+        -> Result<ResponseCapacity, bytes::MeteredCopyError> {
+        if let Some(owner) = &self.meter {
+            if !meter.is_some_and(|m| m.same_authority(owner)) {
+                owner.quarantine();
+                if let Some(meter) = meter { meter.quarantine(); }
+                return Err(bytes::MeteredCopyError::Quarantined);
+            }
+        }
+        if let Some(meter) = meter {
+            meter.admit_precharged()?;
+            if !self.pending.layout_matches(meter) { meter.quarantine(); return Err(bytes::MeteredCopyError::Quarantined); }
+        }
+        let extra = usize::from(self.pending.values.len() < 16 && !self.pending.values.iter().any(|r| r.remote == remote));
+        Ok(ResponseCapacity { owner: self as *const Self as usize,
+            len: self.pending.values.len(), capacity: self.pending.values.capacity(),
+            growth: self.pending.growth(extra, meter)?, meter: meter.cloned() })
+    }
+    pub(super) fn install(&mut self, prepared: ResponseCapacity) -> Result<(), bytes::MeteredCopyError> {
+        if prepared.owner != self as *const Self as usize || prepared.len != self.pending.values.len()
+            || prepared.capacity != self.pending.values.capacity() {
+            if let Some(meter) = &prepared.meter { meter.quarantine(); }
+            return Err(bytes::MeteredCopyError::Quarantined);
+        }
+        self.pending.install(prepared.growth);
+        self.meter = prepared.meter;
+        Ok(())
+    }
     pub(crate) fn push(&mut self, packet: u64, token: u64, remote: SocketAddr) {
         /// Arbitrary permissive limit to prevent abuse
         const MAX_PATH_RESPONSES: usize = 16;
@@ -427,7 +472,7 @@ impl PathResponses {
             token,
             remote,
         };
-        let existing = self.pending.iter_mut().find(|x| x.remote == remote);
+        let existing = self.pending.values.iter_mut().find(|x| x.remote == remote);
         if let Some(existing) = existing {
             // Update a queued response
             if existing.packet <= packet {
@@ -435,8 +480,9 @@ impl PathResponses {
             }
             return;
         }
-        if self.pending.len() < MAX_PATH_RESPONSES {
-            self.pending.push(response);
+        if self.pending.values.len() < MAX_PATH_RESPONSES {
+            debug_assert!(self.pending.values.len() < self.pending.values.capacity());
+            self.pending.values.push(response);
         } else {
             // We don't expect to ever hit this with well-behaved peers, so we don't bother dropping
             // older challenges.
@@ -445,29 +491,29 @@ impl PathResponses {
     }
 
     pub(crate) fn pop_off_path(&mut self, remote: SocketAddr) -> Option<(u64, SocketAddr)> {
-        let response = *self.pending.last()?;
+        let response = *self.pending.values.last()?;
         if response.remote == remote {
             // We don't bother searching further because we expect that the on-path response will
             // get drained in the immediate future by a call to `pop_on_path`
             return None;
         }
-        self.pending.pop();
+        self.pending.values.pop();
         Some((response.token, response.remote))
     }
 
     pub(crate) fn pop_on_path(&mut self, remote: SocketAddr) -> Option<u64> {
-        let response = *self.pending.last()?;
+        let response = *self.pending.values.last()?;
         if response.remote != remote {
             // We don't bother searching further because we expect that the off-path response will
             // get drained in the immediate future by a call to `pop_off_path`
             return None;
         }
-        self.pending.pop();
+        self.pending.values.pop();
         Some(response.token)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.pending.is_empty()
+        self.pending.values.is_empty()
     }
 }
 
@@ -479,6 +525,16 @@ struct PathResponse {
     /// The address the corresponding PATH_CHALLENGE was received from
     remote: SocketAddr,
 }
+
+pub(super) struct ResponseCapacity {
+    owner: usize, len: usize, capacity: usize,
+    growth: Option<super::storage::Slab<PathResponse>>,
+    meter: Option<bytes::BackingMeter>,
+}
+
+#[cfg(test)]
+#[path = "paths/response_tests.rs"]
+mod response_tests;
 
 /// Summary statistics of packets that have been sent on a particular path, but which have not yet
 /// been acked or deemed lost

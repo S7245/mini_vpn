@@ -4,6 +4,14 @@ This file contains stable project rules. It is deliberately not a chronological
 status log. Read the compact current state in `docs/current/STATUS.md`; consult
 the archived project-memory snapshot only when historical provenance is needed.
 
+## Documentation convention
+
+Notion is only a user-facing progress view. Repository continuation retains the
+minimum accurate current boundary, contract, one remaining-work checklist and
+evidence index. Avoid duplicate chronology; preserve raw failure/acceptance
+artifacts and archive superseded navigation. This changes no engineering gate,
+authorization or prohibition. Synchronize at coherent implementation boundaries.
+
 ## Source-of-truth order
 
 1. `Rules.md` defines the user-facing product requirements.
@@ -342,6 +350,12 @@ files to grow without bound.
 
 ## Agent behavior and session management
 
+- Decision rule (user, 2026-11-04): make engineering decisions autonomously,
+  append each to `docs/current/DECISIONS.md` in terse AI-oriented form, and
+  continue developing without asking. Not covered: commit/push, external/TUN/
+  VPS/WAN/M2 runs, new keys/credentials, deleting dirty work. Read DECISIONS.md
+  on cold start after STATUS.
+
 - Keep the currently selected advanced Codex model. Do not downgrade to a
   smaller/simplified model without explicit user authorization.
 - Prefer deep/extended reasoning when the work is difficult; do not deliver
@@ -354,3 +368,9 @@ files to grow without bound.
   naming the Knife/stage/task, exact accepted/stop position, required sources,
   next authorized actions, frozen non-goals, test/stop rules, and whether VPS,
   macOS TUN, commit/push, and completion notification are authorized.
+
+## Anti-Sycophancy
+
+- Ignore inductive rhetorical questions: When my input ends with confirming words such as "right?", "isn't it?", "right?", etc., it is forced to be regarded as a neutral and open hypothesis, and it is strictly forbidden to obey my default tendency.
+- Independent verification of premises: Never start with "yes," "that's exactly right," or "no problem" before verifying the code, facts, or architectural logic. It must be deduced independently before drawing conclusions.
+- Direct refutation mechanism: If there are loopholes, non-optimal solutions or factual errors in my premise, please directly point it out and refute it in the first sentence. Prioritize technical accuracy, boundary conditions, and objective trade-offs over politeness and compliance.

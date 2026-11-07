@@ -22,3 +22,6 @@ mod retained;
 pub(crate) use retained::{
     FailureClass, FailureFacts, FailureOrigin, FailurePhase, FailureResource, RetainedFailure,
 };
+
+pub(crate) mod failure_clock;
+pub(crate) use failure_clock::{FailureClock, FailureOrder, QuietFailureSink};

@@ -150,6 +150,9 @@ impl TunIo for FaultDevice {
     fn rx_take(&mut self) -> Option<bytes::BytesMut> {
         None
     }
+    fn rx_take_packet(&mut self) -> Option<crate::device::RxPacket> {
+        self.rx_take().map(Into::into)
+    }
     fn stage_rx_for_iface(&mut self) -> bool {
         false
     }

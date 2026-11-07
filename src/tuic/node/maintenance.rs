@@ -107,18 +107,50 @@ impl TuicUpstream {
                 let Ok(state) = slot.state.try_lock() else {
                     return TcpPoolPathObservation::Unknown;
                 };
-                let current = &state.current;
-                let conn = &current.transport;
-                if conn.close_reason().is_some() {
-                    return TcpPoolPathObservation::Unknown;
-                }
-                let path = conn.stats().path;
-                TcpPoolPathObservation::Known {
-                    identity: current.identity(),
-                    path_service: TcpPoolPathService::known(path.cwnd, path.rtt),
-                    black_holes_detected: path.black_holes_detected,
-                    path_generation: Some(conn.current_path_generation()),
-                    successor_service_certificate: current.successor_service_certificate,
+                Self::tcp_pool_observation(&state.current)
+            })
+            .collect()
+    }
+
+    fn tcp_pool_observation(current: &TcpPoolGeneration<Connection>) -> TcpPoolPathObservation {
+        let conn = &current.transport;
+        if conn.close_reason().is_some() {
+            return TcpPoolPathObservation::Unknown;
+        }
+        let path = conn.stats().path;
+        TcpPoolPathObservation::Known {
+            identity: current.identity(),
+            path_service: TcpPoolPathService::known(path.cwnd, path.rtt),
+            black_holes_detected: path.black_holes_detected,
+            path_generation: Some(conn.current_path_generation()),
+            successor_service_certificate: current.successor_service_certificate,
+        }
+    }
+
+    /// One actual slot borrow supplies identity AND its generation activity.
+    /// Busy is distinct from Closed; snapshots never own a physical generation.
+    pub(in crate::tuic) fn sample_staged_tcp_pool(
+        &self,
+    ) -> Vec<tcp_pool_admission::StagedSlotSnapshot> {
+        use tcp_pool_admission::StagedSlotSnapshot;
+        let draining = self.tcp_pool_draining_predecessor.load(Ordering::Acquire);
+        self.tcp_pool_slots
+            .iter()
+            .map(|slot| {
+                let Ok(state) = slot.state.try_lock() else {
+                    return StagedSlotSnapshot::Contended;
+                };
+                let activity = state.current.activity.clone();
+                match Self::tcp_pool_observation(&state.current) {
+                    TcpPoolPathObservation::Unknown => StagedSlotSnapshot::Closed {
+                        identity: state.current.identity(),
+                        activity,
+                    },
+                    observation => StagedSlotSnapshot::Current {
+                        observation,
+                        activity,
+                        replacement_allowed: !draining && state.replacement_available(slot.index),
+                    },
                 }
             })
             .collect()
@@ -142,6 +174,7 @@ impl TuicUpstream {
         // later independent open retains fresh replacement authority.
         let mut failed_replacement_slots = vec![false; self.tcp_pool_slots.len()];
         let mut failed_replacement: Option<(usize, String)> = None;
+        let mut receipt = None;
         loop {
             let available = self.tcp_pool_admission.available.notified();
             self.check_node_admission()?;
@@ -174,9 +207,39 @@ impl TuicUpstream {
                             reservation.index
                         );
                     }
-                    return Ok((reservation, false));
+                    let proved = receipt
+                        .take()
+                        .is_some_and(|receipt: super::recovery::Receipt| {
+                            receipt.consume(&reservation)
+                        });
+                    return Ok((reservation, proved));
                 }
                 Ok(TcpPoolAdmissionDecision::ReplaceAuxiliary(replacement)) => {
+                    if self.udp_runtime.node_owned() {
+                        let index = replacement.index;
+                        let ticket = match self.request_healthy_replacement(replacement).await {
+                            Ok(ticket) => ticket,
+                            Err(super::recovery::SubmissionFailure { error, settled }) => {
+                                if !settled {
+                                    return Err(error);
+                                }
+                                failed_replacement_slots[index] = true;
+                                failed_replacement = Some((index, format!("{error:?}")));
+                                continue;
+                            }
+                        };
+                        match self.await_healthy_replacement(ticket).await {
+                            Ok(proof) => receipt = Some(proof),
+                            Err(error) => {
+                                if !self.healthy_fallback_allowed(ticket) {
+                                    return Err(error);
+                                }
+                                failed_replacement_slots[index] = true;
+                                failed_replacement = Some((index, format!("{error:?}")));
+                            }
+                        }
+                        continue;
+                    }
                     self.reject_unowned_maintenance()?;
                     let replacement_index = replacement.index;
                     let Some(permit) = TcpPoolDrainingPermit::try_acquire(
@@ -491,11 +554,72 @@ impl TuicUpstream {
     pub(in crate::tuic) async fn live_tcp_conn(
         &self,
     ) -> Result<TcpPoolConnectionSelection, ClientError> {
+        let mut probe_receipt: Option<super::recovery::Receipt> = None;
         loop {
-            let (reservation, replacement_installed) = self.acquire_tcp_pool_reservation().await?;
+            let (mut reservation, replacement_installed) =
+                self.acquire_tcp_pool_reservation().await?;
+            let index = reservation.index;
+            let slot = self
+                .tcp_pool_slots
+                .get(index)
+                .ok_or_else(|| io_err("tuic pool", "slot missing"))?;
+            let mut state = slot.state.lock().await;
+            let mut maintenance_proved = replacement_installed;
+            if self.udp_runtime.node_owned() {
+                if state.current.transport.close_reason().is_some() {
+                    let identity = state.current.identity();
+                    let activity = state.current.activity.clone();
+                    let ticket = self.request_aux_recovery(index, state)?;
+                    self.release_recovery_lease(
+                        index,
+                        identity,
+                        &activity,
+                        &mut reservation.lease,
+                    )?;
+                    drop(reservation);
+                    self.await_aux_recovery(ticket).await?;
+                    continue;
+                }
+                if reservation
+                    .candidates
+                    .iter()
+                    .find(|c| c.index == index)
+                    .and_then(|c| c.identity)
+                    != Some(state.current.identity())
+                    || !reservation
+                        .lease
+                        .generation_active
+                        .as_ref()
+                        .is_some_and(|a| Arc::ptr_eq(a, &state.current.activity))
+                {
+                    return Err(io_err("tuic probe", "readmission identity changed"));
+                }
+                maintenance_proved |= probe_receipt
+                    .take()
+                    .and_then(|r| r.consume_proof(&reservation))
+                    .is_some();
+                if let Some(kind) =
+                    self.node_probe_kind(&reservation, &state.current, maintenance_proved)
+                {
+                    let ticket = match self.submit_probe(reservation, state, kind, kind.deadline())
+                    {
+                        Ok(ticket) => ticket,
+                        Err(super::recovery::ProbeSubmissionFailure { error, reservation }) => {
+                            drop(reservation);
+                            return Err(error);
+                        }
+                    };
+                    self.await_aux_recovery(ticket).await?;
+                    probe_receipt = Some(
+                        self.poll_maintenance_receipt(ticket)?
+                            .ok_or_else(|| io_err("tuic probe", "ready receipt missing"))?,
+                    );
+                    continue;
+                }
+            }
             let TcpPoolSlotReservation {
                 index,
-                mut lease,
+                lease,
                 active_before,
                 path_service,
                 path_service_tiebreak,
@@ -510,22 +634,6 @@ impl TuicUpstream {
             } = reservation;
             let idle_exclusive = active_before == 0;
             let now_secs = self.clock.elapsed().as_secs();
-            let slot = self.tcp_pool_slots.get(index).ok_or_else(|| {
-                ClientError::InvalidTarget("tuic tcp pool index out of range".into())
-            })?;
-            let mut state = slot.state.lock().await;
-            if self.udp_runtime.node_owned() && state.current.transport.close_reason().is_some() {
-                let identity = state.current.identity();
-                let activity = state.current.activity.clone();
-                // Register the first deadline while holding the actual slot.
-                // Original preparation prevents root physical work until release.
-                let ticket = self.request_aux_recovery(index, state)?;
-                self.release_recovery_lease(index, identity, &activity, &mut lease)?;
-                drop(lease);
-                drop(preparation);
-                self.await_aux_recovery(ticket).await?;
-                continue;
-            }
             let current = &mut state.current;
             let open_state = current.open_state.clone();
             let last_success_age_secs = open_state.last_success_age_secs(now_secs);
@@ -546,11 +654,11 @@ impl TuicUpstream {
                     now_secs,
                     last_success_secs,
                     idle_exclusive,
-                    replacement_installed,
+                    maintenance_proved,
                 )
             {
                 self.reject_unowned_maintenance()?;
-                let outcome = probe_tcp_pool_connection(
+                let outcome = self.probe_tcp_pool_connection(
                     &current.transport,
                     TUIC_TCP_POOL_LIVENESS_PROBE_TIMEOUT,
                 )
@@ -575,7 +683,7 @@ impl TuicUpstream {
                     .await?;
                 current.note_reconnect_success();
                 if index != 0 {
-                    let ready = probe_tcp_pool_connection(
+                    let ready = self.probe_tcp_pool_connection(
                         &current.transport,
                         TUIC_TCP_POOL_LIVENESS_PROBE_TIMEOUT,
                     )

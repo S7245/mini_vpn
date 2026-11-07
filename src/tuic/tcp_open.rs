@@ -25,7 +25,10 @@ impl TuicTcpStartupPriorityWrite for quinn::SendStream {
 
     fn set_stream_priority(&mut self, priority: i32) -> io::Result<()> {
         self.set_priority(priority)
-            .map_err(|error| io::Error::other(format!("tuic TCP priority set: {error}")))
+            .map_err(|error| match error {
+                quinn::WriteError::Admission(_) => error.into(),
+                error => io::Error::other(format!("tuic TCP priority set: {error}")),
+            })
     }
 
     fn poll_write_then_set_priority(
@@ -413,9 +416,12 @@ impl GenericCarrierParts<'_> {
                 conn.clone(),
             )),
             TuicTcpRelayMode::UnorderedReassembly => {
+                let stream = TuicChunkRelayStream::new(recv, send, diag_meta);
+                #[cfg(test)]
+                let stream = staged::tests::carrier_inventory::observe(stream);
                 Box::new(TrackedRelayStream::new_with_transport(
                     TcpWritePressureAdapter::new_with_progress(
-                        TuicChunkRelayStream::new(recv, send, diag_meta),
+                        stream,
                         pressure_writer,
                         send_progress,
                     ),
@@ -480,7 +486,9 @@ impl ProxyUpstream for TuicUpstream {
             let (mut send, send_progress) =
                 TuicTcpStartupWriter::prepare(send, encode_connect(target))
                     .await
-                    .map_err(|e| io_err("tuic connect write", e))?;
+                    .map_err(|e| if e.get_ref().is_some_and(|source| source.is::<quinn::owned_events::AdmissionError>()) {
+                        ClientError::Io(e)
+                    } else { io_err("tuic connect write", e) })?;
             open_state.note_open_success(self.clock.elapsed().as_secs());
             let relay_mode = self.relay_policy.tuic_generic_mode();
             let diag_meta = if tcp_diag_enabled() {
@@ -592,7 +600,9 @@ impl ProxyUpstream for TuicUpstream {
             let (mut send, send_progress) =
                 TuicTcpStartupWriter::prepare(send, encode_connect(target))
                     .await
-                    .map_err(|e| io_err("tuic connect write", e))?;
+                    .map_err(|e| if e.get_ref().is_some_and(|source| source.is::<quinn::owned_events::AdmissionError>()) {
+                        ClientError::Io(e)
+                    } else { io_err("tuic connect write", e) })?;
             open_state.note_open_success(self.clock.elapsed().as_secs());
             let diag_meta = if tcp_diag_enabled() {
                 println!(
@@ -644,30 +654,39 @@ impl ProxyUpstream for TuicUpstream {
                     format!("failed to reserve reader ownership: {error:?}"),
                 )
             })?;
-            let reader: NativeTcpReadHalf = if d16_byte_owned {
-                let read_pressure = tcp_diag_enabled()
+            let (reader, prepared): (NativeTcpReadHalf, _) = if d16_byte_owned {
+                let pressure = tcp_diag_enabled()
                     .then(|| read_pressure.reader(stream_id, recv.progress_handle()));
-                Box::new(TuicNativeOrderedReader::new(
-                    recv,
-                    reader_lease,
-                    tcp_stream_diag,
-                    conn.clone(),
-                    read_pressure,
-                ))
+                (
+                    Box::new(TuicNativeOrderedReader::new(
+                        recv,
+                        reader_lease,
+                        tcp_stream_diag,
+                        conn.clone(),
+                        pressure,
+                    )),
+                    None,
+                )
             } else if relay_mode == TuicNativeOverride::NativeOrderedPump {
-                Box::new(TuicNativeOrderedPumpReader::spawn(
+                let (reader, pump) = TuicNativeOrderedPumpReader::prepare(
                     recv,
                     reader_lease,
                     tcp_stream_diag,
                     conn.clone(),
-                ))
+                    self.endpoint.receive_backing_meter().as_ref(),
+                )
+                .map_err(|error| io_err("tuic native ordered source", error))?;
+                (Box::new(reader), Some(pump))
             } else {
-                Box::new(TuicNativeTcpReader::new(
-                    recv,
-                    reader_lease,
-                    tcp_stream_diag,
-                    conn.clone(),
-                ))
+                (
+                    Box::new(TuicNativeTcpReader::new(
+                        recv,
+                        reader_lease,
+                        tcp_stream_diag,
+                        conn.clone(),
+                    )),
+                    None,
+                )
             };
             let writer = Box::new(TuicNativeTcpWriter::new(
                 send,
@@ -675,7 +694,11 @@ impl ProxyUpstream for TuicUpstream {
                 write_pressure.writer(stream_id),
                 send_progress,
             ));
-            let relay = NativeTcpRelayStream { reader, writer };
+            let relay = NativeTcpRelayStream::new(reader, writer);
+            let relay = match prepared {
+                Some(pump) => relay.with_prepared_pump(pump),
+                None => relay,
+            };
             Ok::<OpenedTcpRelay, ClientError>(if d16_byte_owned {
                 OpenedTcpRelay::NativeByteOwned(relay)
             } else {

@@ -1,41 +1,37 @@
 use std::{
-    collections::{hash_map::Entry, VecDeque},
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    collections::VecDeque,
+    sync::{Arc, Mutex, MutexGuard},
     task::Waker,
 };
 
 use rustc_hash::FxHashMap;
 
-use crate::{ConnectionHandle, EndpointPacingServiceConfig, Instant};
+use crate::{EndpointPacingServiceConfig, Instant};
 
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
 #[derive(Clone, Debug)]
 pub(crate) struct EndpointPacingService(Arc<EndpointPacingServiceInner>);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct EndpointPacingConnectionKey {
-    connection_handle: ConnectionHandle,
-    path_generation: u64,
-}
-
-impl EndpointPacingConnectionKey {
-    pub(crate) const fn new(connection_handle: ConnectionHandle, path_generation: u64) -> Self {
-        Self {
-            connection_handle,
-            path_generation,
-        }
-    }
-}
+mod authority;
+mod identity;
+mod inventory;
+use inventory::{Records, StateStorage, WaitQueue};
+mod prepared;
+pub(crate) use identity::EndpointPacingConnectionKey;
 
 #[derive(Debug)]
 struct EndpointPacingServiceInner {
     config: EndpointPacingServiceConfig,
-    state: Mutex<EndpointPacingState>,
+    state: Mutex<StateStorage>,
+    meter: Option<bytes::BackingMeter>,
+    failed: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug)]
 struct EndpointPacingState {
+    retired_wakers: [Option<Waker>; 2],
+    callback_overflow: bool,
     available_tokens: u64,
     live_reservation_bytes: u64,
     outstanding_bytes: u64,
@@ -63,12 +59,12 @@ struct EndpointPacingState {
     stale_waker_events: u64,
     refill_remainder: u128,
     last_refill: Option<Instant>,
-    connections: FxHashMap<EndpointPacingConnectionKey, ConnectionAccounting>,
-    control_waiters: VecDeque<EndpointPacingConnectionKey>,
+    connections: Records,
+    control_waiters: WaitQueue,
     control_turn: Option<EndpointPacingConnectionKey>,
     control_yielding_to_bulk: bool,
     bulk_service_before_control_bytes: u64,
-    bulk_waiters: VecDeque<EndpointPacingConnectionKey>,
+    bulk_waiters: WaitQueue,
     bulk_turn: Option<EndpointPacingConnectionKey>,
 }
 
@@ -250,9 +246,12 @@ impl EndpointPacingState {
         let Some(connection) = self.connections.get_mut(&key) else {
             return false;
         };
-        let removed = connection.waiter.take().is_some();
+        let waiter = connection.waiter.take();
+        let removed = waiter.is_some();
+        let retired = waiter.and_then(|waiter| waiter.waker);
         connection.control_deficit_bytes = 0;
         connection.bulk_deficit_bytes = 0;
+        self.retire_waker(retired);
         self.control_waiters.retain(|queued| *queued != key);
         self.bulk_waiters.retain(|queued| *queued != key);
         if self.control_turn == Some(key) {
@@ -273,7 +272,7 @@ impl EndpointPacingState {
         key: EndpointPacingConnectionKey,
         path_ready_at: Instant,
         planned_bytes: u64,
-        waker: Option<&Waker>,
+        waker: Option<Waker>,
     ) {
         if self.connections.get(&key).is_some_and(|connection| {
             connection
@@ -290,7 +289,8 @@ impl EndpointPacingState {
         if let Some(waiter) = connection.waiter.as_mut() {
             waiter.path_ready_at = path_ready_at;
             waiter.planned_bytes = planned_bytes;
-            let replaced = replace_waker(&mut waiter.waker, waker);
+            let (replaced, retired) = replace_waker(&mut waiter.waker, waker);
+            self.retire_waker(retired);
             if replaced {
                 self.stale_waker_events = self.stale_waker_events.saturating_add(1);
             }
@@ -300,11 +300,13 @@ impl EndpointPacingState {
             class: PacingTrafficClass::Bulk,
             path_ready_at,
             planned_bytes,
-            waker: waker.cloned(),
+            waker,
         });
         connection.service_counters.wait_count =
             connection.service_counters.wait_count.saturating_add(1);
-        self.bulk_waiters.push_back(key);
+        if !self.bulk_waiters.push_back(key) {
+            self.callback_overflow = true;
+        }
         self.update_waiter_high_water();
     }
 
@@ -313,7 +315,7 @@ impl EndpointPacingState {
         key: EndpointPacingConnectionKey,
         path_ready_at: Instant,
         planned_bytes: u64,
-        waker: Option<&Waker>,
+        waker: Option<Waker>,
     ) {
         if self.connections.get(&key).is_some_and(|connection| {
             connection
@@ -330,7 +332,8 @@ impl EndpointPacingState {
         if let Some(waiter) = connection.waiter.as_mut() {
             waiter.path_ready_at = path_ready_at;
             waiter.planned_bytes = planned_bytes;
-            let replaced = replace_waker(&mut waiter.waker, waker);
+            let (replaced, retired) = replace_waker(&mut waiter.waker, waker);
+            self.retire_waker(retired);
             if replaced {
                 self.stale_waker_events = self.stale_waker_events.saturating_add(1);
             }
@@ -340,11 +343,13 @@ impl EndpointPacingState {
             class: PacingTrafficClass::Control,
             path_ready_at,
             planned_bytes,
-            waker: waker.cloned(),
+            waker,
         });
         connection.service_counters.wait_count =
             connection.service_counters.wait_count.saturating_add(1);
-        self.control_waiters.push_back(key);
+        if !self.control_waiters.push_back(key) {
+            self.callback_overflow = true;
+        }
         self.update_waiter_high_water();
     }
 
@@ -624,87 +629,123 @@ impl EndpointPacingState {
     }
 }
 
-fn replace_waker(stored: &mut Option<Waker>, current: Option<&Waker>) -> bool {
+fn replace_waker(stored: &mut Option<Waker>, current: Option<Waker>) -> (bool, Option<Waker>) {
     let Some(current) = current else {
-        return false;
+        return (false, None);
     };
-    if stored
-        .as_ref()
-        .is_some_and(|existing| existing.will_wake(current))
-    {
-        return false;
+    if stored.as_ref().is_some_and(|old| old.will_wake(&current)) {
+        return (false, Some(current));
     }
-    let replaced = stored.is_some();
-    *stored = Some(current.clone());
-    replaced
+    let old = stored.replace(current);
+    (old.is_some(), old)
 }
 
 impl EndpointPacingService {
     pub(crate) fn new(config: EndpointPacingServiceConfig) -> Self {
-        Self(Arc::new(EndpointPacingServiceInner {
+        Self::prepare(config, None).expect("unbudgeted pacing state allocation")
+    }
+    pub(crate) const fn native_layout_bytes() -> usize {
+        StateStorage::layout_bytes()
+    }
+    pub(crate) fn prepare(
+        config: EndpointPacingServiceConfig,
+        meter: Option<&bytes::BackingMeter>,
+    ) -> std::io::Result<Self> {
+        let native = meter.is_some();
+        let state = EndpointPacingState {
+            retired_wakers: [None, None],
+            callback_overflow: false,
+            available_tokens: config.burst_bytes,
+            live_reservation_bytes: 0,
+            outstanding_bytes: 0,
+            stateless_outstanding_bytes: 0,
+            stateless_responses_sent: 0,
+            stateless_responses_dropped: 0,
+            granted_bytes: 0,
+            granted_datagrams: 0,
+            refunded_bytes: 0,
+            refund_events: 0,
+            sent_bytes: 0,
+            sent_datagrams: 0,
+            abandoned_bytes: 0,
+            abandoned_datagrams: 0,
+            outstanding_bytes_high_water: 0,
+            socket_would_block_events: 0,
+            socket_would_block_outstanding_high_water: 0,
+            endpoint_delay_events: 0,
+            max_endpoint_delay_nanos: 0,
+            waiter_high_water: 0,
+            cancellations: 0,
+            migrations: 0,
+            detaches: 0,
+            fairness_lead_high_water_bytes: 0,
+            stale_waker_events: 0,
+            refill_remainder: 0,
+            last_refill: None,
+            connections: Records::new(native),
+            control_waiters: WaitQueue::new(native),
+            control_turn: None,
+            control_yielding_to_bulk: false,
+            bulk_service_before_control_bytes: 0,
+            bulk_waiters: WaitQueue::new(native),
+            bulk_turn: None,
+        };
+        let service = Self(Arc::new(EndpointPacingServiceInner {
             config,
-            state: Mutex::new(EndpointPacingState {
-                available_tokens: config.burst_bytes,
-                live_reservation_bytes: 0,
-                outstanding_bytes: 0,
-                stateless_outstanding_bytes: 0,
-                stateless_responses_sent: 0,
-                stateless_responses_dropped: 0,
-                granted_bytes: 0,
-                granted_datagrams: 0,
-                refunded_bytes: 0,
-                refund_events: 0,
-                sent_bytes: 0,
-                sent_datagrams: 0,
-                abandoned_bytes: 0,
-                abandoned_datagrams: 0,
-                outstanding_bytes_high_water: 0,
-                socket_would_block_events: 0,
-                socket_would_block_outstanding_high_water: 0,
-                endpoint_delay_events: 0,
-                max_endpoint_delay_nanos: 0,
-                waiter_high_water: 0,
-                cancellations: 0,
-                migrations: 0,
-                detaches: 0,
-                fairness_lead_high_water_bytes: 0,
-                stale_waker_events: 0,
-                refill_remainder: 0,
-                last_refill: None,
-                connections: FxHashMap::default(),
-                control_waiters: VecDeque::new(),
-                control_turn: None,
-                control_yielding_to_bulk: false,
-                bulk_service_before_control_bytes: 0,
-                bulk_waiters: VecDeque::new(),
-                bulk_turn: None,
-            }),
-        }))
+            state: Mutex::new(StateStorage::new(state, meter)?),
+            meter: meter.cloned(),
+            failed: std::sync::atomic::AtomicBool::new(false),
+        }));
+        // Some platforms initialize the existing mutex's opaque OS storage on
+        // first lock. Do that at cold construction, before publishing the service.
+        drop(service.lock_state());
+        Ok(service)
     }
 
     pub(crate) fn attach_connection(&self, key: EndpointPacingConnectionKey) -> bool {
         let mut state = self.lock_state();
-        match state.connections.entry(key) {
-            Entry::Vacant(entry) => {
-                entry.insert(ConnectionAccounting::attached());
-                true
-            }
-            Entry::Occupied(_) => false,
+        if !state.validate_control() {
+            return false;
         }
+        state
+            .connections
+            .insert(key, ConnectionAccounting::attached())
     }
 
+    #[cfg(test)]
     pub(crate) fn migrate_connection(
         &self,
         old_key: EndpointPacingConnectionKey,
         new_key: EndpointPacingConnectionKey,
     ) -> Result<(), MigrationError> {
+        self.migrate_deferred(old_key, new_key)?.finish();
+        Ok(())
+    }
+
+    fn migrate_deferred(
+        &self,
+        old_key: EndpointPacingConnectionKey,
+        new_key: EndpointPacingConnectionKey,
+    ) -> Result<authority::MigrationEffects, MigrationError> {
         let mut state = self.lock_state();
+        if !state.validate_control() {
+            return Err(MigrationError);
+        }
         if old_key == new_key
             || state.connections.contains_key(&new_key)
             || !state
                 .connections
                 .get(&old_key)
                 .is_some_and(|connection| connection.attached)
+        {
+            return Err(MigrationError);
+        }
+
+        if !state.connections.has_capacity()
+            && state
+                .connections
+                .get(&old_key)
+                .is_some_and(|old| old.live_reservation_bytes != 0 || old.outstanding_bytes != 0)
         {
             return Err(MigrationError);
         }
@@ -740,11 +781,9 @@ impl EndpointPacingService {
         state.migrations = state.migrations.saturating_add(1);
         state.assert_conservation(self.0.config.burst_bytes);
         let wake = state.take_next_waiter_waker(old_key);
+        let effects = authority::MigrationEffects::new(&self.0, &mut state, wake);
         drop(state);
-        if let Some(waker) = wake {
-            waker.wake();
-        }
-        Ok(())
+        Ok(effects)
     }
 
     #[cfg(test)]
@@ -759,6 +798,9 @@ impl EndpointPacingService {
         }
 
         let mut state = self.lock_state();
+        if state.unavailable() {
+            return None;
+        }
         if !state
             .connections
             .get(&key)
@@ -802,7 +844,20 @@ impl EndpointPacingService {
             };
         }
 
+        if self.0.unavailable() {
+            return PollReservation::Blocked {
+                deadline: None,
+                reason: ReservationBlockReason::Detached,
+            };
+        }
+        let mut waker = self.0.prepare_waker(waker);
         let mut state = self.lock_state();
+        if state.unavailable() {
+            return PollReservation::Blocked {
+                deadline: None,
+                reason: ReservationBlockReason::Detached,
+            };
+        }
         if !state
             .connections
             .get(&key)
@@ -816,7 +871,7 @@ impl EndpointPacingService {
         state.refill(self.0.config, now);
 
         if class == PacingTrafficClass::Control {
-            state.register_control_waiter(key, path_ready_at, planned_bytes, waker);
+            state.register_control_waiter(key, path_ready_at, planned_bytes, waker.take());
             if path_ready_at > now {
                 state.ensure_ready_control_turn(now, self.0.config.control_reserve_bytes);
                 let deadline =
@@ -887,10 +942,11 @@ impl EndpointPacingService {
             }
 
             state.control_waiters.retain(|queued| *queued != key);
-            if let Some(connection) = state.connections.get_mut(&key) {
-                connection.waiter = None;
+            let retired = state.connections.get_mut(&key).and_then(|connection| {
                 connection.control_deficit_bytes -= planned_bytes;
-            }
+                connection.waiter.take().and_then(|waiter| waiter.waker)
+            });
+            state.retire_waker(retired);
             return PollReservation::Granted(
                 reserve_locked(
                     &self.0,
@@ -904,7 +960,7 @@ impl EndpointPacingService {
             );
         }
 
-        state.register_bulk_waiter(key, path_ready_at, planned_bytes, waker);
+        state.register_bulk_waiter(key, path_ready_at, planned_bytes, waker.take());
         if path_ready_at > now {
             state.ensure_ready_bulk_turn(now, self.0.config.connection_quantum_bytes);
             let deadline =
@@ -952,11 +1008,11 @@ impl EndpointPacingService {
             .map_or(0, |connection| connection.bulk_deficit_bytes);
         if deficit < planned_bytes {
             if state.rotate_bulk_turn(key, now, self.0.config.connection_quantum_bytes) {
-                let wake = state.take_turn_waker(PacingTrafficClass::Bulk, key, now);
+                let wake =
+                    self.0
+                        .hold_waker(state.take_turn_waker(PacingTrafficClass::Bulk, key, now));
                 drop(state);
-                if let Some(waker) = wake {
-                    waker.wake();
-                }
+                wake.wake();
                 return PollReservation::Blocked {
                     deadline: None,
                     reason: ReservationBlockReason::Turn,
@@ -984,10 +1040,11 @@ impl EndpointPacingService {
         }
 
         state.bulk_waiters.retain(|queued| *queued != key);
-        if let Some(connection) = state.connections.get_mut(&key) {
-            connection.waiter = None;
+        let retired = state.connections.get_mut(&key).and_then(|connection| {
             connection.bulk_deficit_bytes -= planned_bytes;
-        }
+            connection.waiter.take().and_then(|waiter| waiter.waker)
+        });
+        state.retire_waker(retired);
         if serving_control_yield {
             state.bulk_service_before_control_bytes -= planned_bytes;
         }
@@ -1008,15 +1065,18 @@ impl EndpointPacingService {
 
     pub(crate) fn cancel_waiter(&self, key: EndpointPacingConnectionKey) -> bool {
         let mut state = self.lock_state();
+        if !state.validate_control() {
+            return false;
+        }
         let removed = state.remove_waiter(key);
         if removed {
             state.cancellations = state.cancellations.saturating_add(1);
         }
-        let wake = removed.then(|| state.take_next_waiter_waker(key)).flatten();
+        let wake = self
+            .0
+            .hold_waker(removed.then(|| state.take_next_waiter_waker(key)).flatten());
         drop(state);
-        if let Some(waker) = wake {
-            waker.wake();
-        }
+        wake.wake();
         removed
     }
 
@@ -1046,6 +1106,9 @@ impl EndpointPacingService {
         response_bytes: u64,
     ) -> Option<StatelessResponseReservation> {
         let mut state = self.lock_state();
+        if state.unavailable() {
+            return None;
+        }
         state.refill(self.0.config, now);
         if response_bytes == 0 || response_bytes > state.available_tokens {
             state.stateless_responses_dropped = state.stateless_responses_dropped.saturating_add(1);
@@ -1072,7 +1135,10 @@ impl EndpointPacingService {
         now: Instant,
         sent: bool,
     ) -> bool {
-        let mut state = service.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = service.lock();
+        if state.unavailable() {
+            return false;
+        }
         if response_bytes == 0 || response_bytes > state.stateless_outstanding_bytes {
             return false;
         }
@@ -1085,11 +1151,9 @@ impl EndpointPacingService {
             state.stateless_responses_dropped = state.stateless_responses_dropped.saturating_add(1);
         }
         state.assert_conservation(service.config.burst_bytes);
-        let wake = state.take_any_waiter_waker();
+        let wake = service.hold_waker(state.take_any_waiter_waker());
         drop(state);
-        if let Some(waker) = wake {
-            waker.wake();
-        }
+        wake.wake();
         true
     }
 
@@ -1119,6 +1183,9 @@ impl EndpointPacingService {
         batch_bytes: u64,
     ) -> Result<(), SocketOutcomeError> {
         let mut state = self.lock_state();
+        if state.unavailable() {
+            return Err(SocketOutcomeError);
+        }
         let valid = batch_bytes != 0
             && state.connections.get(&key).is_some_and(|connection| {
                 connection.outstanding_bytes >= batch_bytes && connection.outstanding_datagrams != 0
@@ -1142,6 +1209,9 @@ impl EndpointPacingService {
         sent: bool,
     ) -> Result<(), SocketOutcomeError> {
         let mut state = self.lock_state();
+        if state.unavailable() {
+            return Err(SocketOutcomeError);
+        }
         let Some(connection) = state.connections.get(&key) else {
             return Err(SocketOutcomeError);
         };
@@ -1174,11 +1244,9 @@ impl EndpointPacingService {
             state.connections.remove(&key);
         }
         state.assert_conservation(self.0.config.burst_bytes);
-        let wake = state.take_next_waiter_waker(key);
+        let wake = self.0.hold_waker(state.take_next_waiter_waker(key));
         drop(state);
-        if let Some(waker) = wake {
-            waker.wake();
-        }
+        wake.wake();
         Ok(())
     }
 
@@ -1188,6 +1256,9 @@ impl EndpointPacingService {
         now: Instant,
     ) -> Result<DetachedConnectionAccounting, DetachError> {
         let mut state = self.lock_state();
+        if !state.validate_control() {
+            return Err(DetachError);
+        }
         let Some(connection) = state.connections.get(&key) else {
             return Err(DetachError);
         };
@@ -1287,8 +1358,8 @@ impl EndpointPacingService {
         })
     }
 
-    fn lock_state(&self) -> MutexGuard<'_, EndpointPacingState> {
-        self.0.state.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock_state(&self) -> authority::Guard<'_> {
+        self.0.lock()
     }
 
     #[cfg(test)]
@@ -1314,20 +1385,32 @@ struct PendingSocketBatch {
 }
 
 impl ConnectionEndpointPacing {
+    #[cfg(test)]
     pub(crate) fn attach(service: EndpointPacingService, key: EndpointPacingConnectionKey) -> Self {
-        let attached = service.attach_connection(key);
-        debug_assert!(attached, "endpoint pacing connection key must be unique");
-        Self {
+        Self::try_attach(service, key).expect("test pacing attachment")
+    }
+    pub(crate) fn try_attach(
+        service: EndpointPacingService,
+        key: EndpointPacingConnectionKey,
+    ) -> Option<Self> {
+        if !service.attach_connection(key) {
+            return None;
+        }
+        Some(Self {
             service,
             key,
             driver_waker: None,
             pending_socket_batch: None,
             socket_batch_exposed: false,
-        }
+        })
+    }
+
+    pub(crate) fn is_native(&self) -> bool {
+        self.service.0.meter.is_some()
     }
 
     pub(crate) fn begin_transmit_poll(&self) -> bool {
-        !self.socket_batch_exposed
+        !self.socket_batch_exposed && !self.service.0.unavailable()
     }
 
     pub(crate) fn poll_reserve(
@@ -1354,7 +1437,17 @@ impl ConnectionEndpointPacing {
     }
 
     pub(crate) fn set_driver_waker(&mut self, waker: &Waker) {
-        let _ = replace_waker(&mut self.driver_waker, Some(waker));
+        if self.service.0.unavailable()
+            || self
+                .driver_waker
+                .as_ref()
+                .is_some_and(|old| old.will_wake(waker))
+        {
+            return;
+        }
+        let prepared = self.service.0.opaque(|| waker.clone());
+        let old = self.driver_waker.replace(prepared);
+        self.service.0.dispose_wakers([old]);
     }
 
     pub(crate) fn cancel_waiter(&self) -> bool {
@@ -1401,11 +1494,20 @@ impl ConnectionEndpointPacing {
         true
     }
 
+    #[cfg(test)]
     pub(crate) fn migrate(&mut self, path_generation: u64) -> Result<(), MigrationError> {
-        let new_key = EndpointPacingConnectionKey::new(self.key.connection_handle, path_generation);
-        self.service.migrate_connection(self.key, new_key)?;
-        self.key = new_key;
+        self.migrate_deferred(path_generation)?.finish();
         Ok(())
+    }
+
+    pub(crate) fn migrate_deferred(
+        &mut self,
+        path_generation: u64,
+    ) -> Result<authority::MigrationEffects, MigrationError> {
+        let new_key = self.key.with_path(path_generation);
+        let effects = self.service.migrate_deferred(self.key, new_key)?;
+        self.key = new_key;
+        Ok(effects)
     }
 
     pub(crate) fn note_socket_sent(&mut self, now: Instant) -> Result<bool, SocketOutcomeError> {
@@ -1468,8 +1570,8 @@ impl ConnectionEndpointPacing {
             .abandoned_datagrams
             .checked_add(abandoned_batch_datagrams)
             .ok_or(DetachError)?;
-        self.driver_waker = None;
         self.socket_batch_exposed = false;
+        self.service.0.dispose_wakers([self.driver_waker.take()]);
         Ok(detached)
     }
 
@@ -1619,16 +1721,19 @@ impl StatelessResponseReservation {
             now,
             sent,
         );
-        debug_assert!(
-            settled,
-            "stateless response outcome must match its reservation"
-        );
+        if !settled {
+            self.service.quarantine();
+        }
         self.settled = true;
     }
 }
 
 impl Drop for StatelessResponseReservation {
     fn drop(&mut self) {
+        if std::thread::panicking() || self.service.unavailable() {
+            self.service.quarantine();
+            return;
+        }
         if !self.settled {
             self.finish(self.reserved_at, false);
         }
@@ -1667,11 +1772,10 @@ impl DatagramReservation {
             return Err(ReservationError);
         }
 
-        let mut state = self
-            .service
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.service.lock();
+        if state.unavailable() {
+            return Err(ReservationError);
+        }
         let Some(connection) = state.connections.get_mut(&self.key) else {
             return Err(ReservationError);
         };
@@ -1720,11 +1824,14 @@ impl Drop for DatagramReservation {
             return;
         }
 
-        let mut state = self
-            .service
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        if std::thread::panicking() || self.service.unavailable() {
+            self.service.quarantine();
+            return;
+        }
+        let mut state = self.service.lock();
+        if state.unavailable() {
+            return;
+        }
         let remove_connection = match state.connections.get_mut(&self.key) {
             Some(connection) if connection.live_reservation_bytes >= self.planned_bytes => {
                 connection.live_reservation_bytes -= self.planned_bytes;
@@ -1746,7 +1853,7 @@ impl Drop for DatagramReservation {
                     && connection.outstanding_bytes == 0
             }
             _ => {
-                debug_assert!(false, "live reservation must retain its connection record");
+                self.service.quarantine();
                 return;
             }
         };
@@ -1872,1218 +1979,4 @@ fn reserve_locked(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{ConnectionHandle, Duration, Instant};
-    use std::{
-        sync::atomic::{AtomicUsize, Ordering},
-        task::Wake,
-    };
-
-    const RATE_BYTES_PER_SECOND: u64 = 30_720_000;
-    const BURST_BYTES: u64 = 61_440;
-    const DATAGRAM_BYTES: u64 = 1_280;
-    const TEST_KEY: EndpointPacingConnectionKey =
-        EndpointPacingConnectionKey::new(ConnectionHandle(0), 0);
-
-    #[test]
-    fn fixed_candidate_obeys_exact_one_and_ten_millisecond_bounds() {
-        let start = Instant::now();
-        let service = test_service(EndpointPacingServiceConfig::endpoint_window_v1(), start);
-
-        let mut sent_bytes = drain_available(&service, start);
-        for tick in 1..=200 {
-            let now = start + Duration::from_micros(tick * 50);
-            sent_bytes += drain_available(&service, now);
-            if tick == 20 {
-                assert_eq!(sent_bytes, 92_160);
-            }
-        }
-
-        assert_eq!(sent_bytes, 368_640);
-    }
-
-    #[test]
-    fn reservation_drop_and_short_settlement_preserve_conservation() {
-        let now = Instant::now();
-        let service = test_service(EndpointPacingServiceConfig::endpoint_window_v1(), now);
-
-        let reservation = service
-            .reserve(TEST_KEY, now, DATAGRAM_BYTES)
-            .expect("initial burst");
-        assert_conservation_snapshot(&service, BURST_BYTES - DATAGRAM_BYTES, DATAGRAM_BYTES, 0, 1);
-
-        drop(reservation);
-        assert_conservation_snapshot(&service, BURST_BYTES, 0, 0, 1);
-
-        service
-            .reserve(TEST_KEY, now, DATAGRAM_BYTES)
-            .expect("refunded reservation")
-            .settle_built(1_000)
-            .expect("short datagram is valid");
-        assert_conservation_snapshot(&service, BURST_BYTES - 1_000, 0, 1_000, 1);
-
-        service
-            .note_socket_sent(TEST_KEY, 1_000, now)
-            .expect("settled bytes are outstanding");
-        assert_conservation_snapshot(&service, BURST_BYTES - 1_000, 0, 0, 1);
-    }
-
-    #[test]
-    fn deterministic_traces_obey_the_any_window_bound() {
-        for datagram_bytes in [1, 17, 1_279, 1_280, 4_096, BURST_BYTES] {
-            let start = Instant::now();
-            let service = test_service(EndpointPacingServiceConfig::endpoint_window_v1(), start);
-            let mut events = Vec::new();
-            let mut elapsed_micros = 0u64;
-            let mut cumulative = 0u64;
-            let mut seed = 0x4d59_5df4_d0f3_3173u64;
-
-            for event_index in 0..=240 {
-                if event_index != 0 {
-                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-                    elapsed_micros += 1 + seed % 250;
-                }
-                let before = cumulative;
-                cumulative += drain_available_bytes(
-                    &service,
-                    start + Duration::from_micros(elapsed_micros),
-                    datagram_bytes,
-                );
-                events.push((elapsed_micros * 1_000, before, cumulative));
-            }
-
-            for start_index in 0..events.len() {
-                for end_index in start_index..events.len() {
-                    let (window_start, before, _) = events[start_index];
-                    let (window_end, _, after) = events[end_index];
-                    let elapsed_nanos = window_end - window_start;
-                    let bound = u128::from(BURST_BYTES)
-                        + u128::from(RATE_BYTES_PER_SECOND) * u128::from(elapsed_nanos)
-                            / NANOS_PER_SECOND;
-                    let window_bytes = after - before;
-                    assert!(
-                        u128::from(window_bytes) <= bound,
-                        "datagram={datagram_bytes} window={window_start}..={window_end} bytes={window_bytes} bound={bound}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn refill_preserves_rounding_without_minting_early() {
-        let start = Instant::now();
-        let service = test_service(test_config(3, 2), start);
-        assert_eq!(drain_available_bytes(&service, start, 1), 2);
-
-        assert!(service
-            .reserve(TEST_KEY, start + Duration::from_nanos(333_333_333), 1)
-            .is_none());
-        settle_and_send_one(&service, start + Duration::from_nanos(333_333_334));
-        assert!(service
-            .reserve(TEST_KEY, start + Duration::from_nanos(666_666_666), 1)
-            .is_none());
-        settle_and_send_one(&service, start + Duration::from_nanos(666_666_667));
-    }
-
-    #[test]
-    fn time_rollback_cannot_double_mint() {
-        let start = Instant::now();
-        let service = test_service(test_config(1_000, 10), start);
-        assert_eq!(drain_available_bytes(&service, start, 1), 10);
-        assert_eq!(
-            drain_available_bytes(&service, start + Duration::from_millis(5), 1),
-            5
-        );
-        assert_eq!(
-            drain_available_bytes(&service, start + Duration::from_millis(4), 1),
-            0
-        );
-        assert_eq!(
-            drain_available_bytes(&service, start + Duration::from_millis(10), 1),
-            5
-        );
-    }
-
-    #[test]
-    fn full_bucket_discards_stale_refill_credit() {
-        let start = Instant::now();
-        let service = test_service(test_config(3, 2), start);
-        let saturated_at = start + Duration::from_secs(10);
-        assert_eq!(drain_available_bytes(&service, saturated_at, 1), 2);
-        assert!(service
-            .reserve(
-                TEST_KEY,
-                saturated_at + Duration::from_nanos(333_333_333),
-                1,
-            )
-            .is_none());
-        settle_and_send_one(&service, saturated_at + Duration::from_nanos(333_333_334));
-    }
-
-    #[test]
-    fn refill_arithmetic_saturates_without_overflow() {
-        let start = Instant::now();
-        let service = test_service(test_config(u64::MAX, u64::MAX), start);
-        service
-            .reserve(TEST_KEY, start, u64::MAX)
-            .expect("initial full-width burst")
-            .settle_built(u64::MAX)
-            .expect("full-width settlement");
-        service
-            .note_socket_sent(TEST_KEY, u64::MAX, start)
-            .expect("full-width outstanding batch");
-
-        let thousand_years = Duration::from_secs(1_000 * 365 * 24 * 60 * 60);
-        let later = start
-            .checked_add(thousand_years)
-            .expect("platform Instant represents the test interval");
-        assert!(service.reserve(TEST_KEY, later, u64::MAX).is_some());
-    }
-
-    #[test]
-    fn rejected_oversized_settlement_refunds_the_reservation() {
-        let now = Instant::now();
-        let service = test_service(EndpointPacingServiceConfig::endpoint_window_v1(), now);
-        let result = service
-            .reserve(TEST_KEY, now, DATAGRAM_BYTES)
-            .expect("initial burst")
-            .settle_built(DATAGRAM_BYTES + 1);
-        assert_eq!(result, Err(ReservationError));
-        assert_conservation_snapshot(&service, BURST_BYTES, 0, 0, 1);
-    }
-
-    #[test]
-    fn blocked_full_burst_cannot_bank_a_second_burst() {
-        let start = Instant::now();
-        let service = EndpointPacingService::new(EndpointPacingServiceConfig::endpoint_window_v1());
-        let key = test_key(7, 0);
-        assert!(service.attach_connection(key));
-
-        service
-            .reserve(key, start, BURST_BYTES)
-            .expect("initial full burst")
-            .settle_built(BURST_BYTES)
-            .expect("full burst settlement");
-
-        let unblocked_at = start + Duration::from_secs(1);
-        assert!(service.reserve(key, unblocked_at, 1).is_none());
-        assert_conservation_snapshot(&service, 0, 0, BURST_BYTES, 1);
-
-        service
-            .note_socket_sent(key, BURST_BYTES, unblocked_at)
-            .expect("blocked batch belongs to this connection");
-        assert!(service.reserve(key, unblocked_at, 1).is_none());
-        assert!(service
-            .reserve(key, unblocked_at + Duration::from_millis(2), BURST_BYTES)
-            .is_some());
-    }
-
-    #[test]
-    fn abandonment_releases_only_the_named_connection_batch() {
-        let start = Instant::now();
-        let service = EndpointPacingService::new(EndpointPacingServiceConfig::endpoint_window_v1());
-        let first = test_key(1, 0);
-        let second = test_key(2, 0);
-        assert!(service.attach_connection(first));
-        assert!(service.attach_connection(second));
-
-        for key in [first, second] {
-            service
-                .reserve(key, start, BURST_BYTES / 2)
-                .expect("each connection gets half the initial burst")
-                .settle_built(BURST_BYTES / 2)
-                .expect("half-burst settlement");
-        }
-
-        let abandoned_at = start + Duration::from_secs(1);
-        service
-            .note_socket_abandoned(first, BURST_BYTES / 2, abandoned_at)
-            .expect("first connection owns this batch");
-        assert_conservation_snapshot(&service, 0, 0, BURST_BYTES / 2, 2);
-        assert!(service.reserve(first, abandoned_at, 1).is_none());
-        assert!(service.reserve(second, abandoned_at, 1).is_none());
-    }
-
-    #[test]
-    fn detach_cleans_outstanding_and_defers_live_reservation_cleanup() {
-        let start = Instant::now();
-        let service = EndpointPacingService::new(EndpointPacingServiceConfig::endpoint_window_v1());
-        let old_key = test_key(9, 0);
-        assert!(service.attach_connection(old_key));
-
-        let live = service
-            .reserve(old_key, start, DATAGRAM_BYTES)
-            .expect("initial live reservation");
-        let detached = service
-            .detach_connection(old_key, start)
-            .expect("attached connection");
-        assert_eq!(detached.abandoned_bytes, 0);
-        assert_eq!(detached.live_reservation_bytes, DATAGRAM_BYTES);
-        assert!(service.reserve(old_key, start, 1).is_none());
-        assert!(!service.attach_connection(old_key));
-
-        drop(live);
-        assert_eq!(service.snapshot().connection_records, 0);
-        assert!(service.attach_connection(old_key));
-
-        service
-            .reserve(old_key, start, DATAGRAM_BYTES)
-            .expect("reattached connection")
-            .settle_built(1_000)
-            .expect("short datagram");
-        let detached_at = start + Duration::from_secs(1);
-        let detached = service
-            .detach_connection(old_key, detached_at)
-            .expect("reattached connection");
-        assert_eq!(detached.abandoned_bytes, 1_000);
-        assert_eq!(detached.live_reservation_bytes, 0);
-        assert_eq!(service.snapshot().connection_records, 0);
-        assert_eq!(
-            service.note_socket_sent(old_key, 1_000, detached_at),
-            Err(SocketOutcomeError)
-        );
-
-        let migrated_key = test_key(9, 1);
-        assert!(service.attach_connection(migrated_key));
-        assert!(service.reserve(migrated_key, detached_at, 1).is_some());
-    }
-
-    #[test]
-    fn one_bulk_connection_borrows_the_full_endpoint_burst() {
-        let now = Instant::now();
-        let service = EndpointPacingService::new(EndpointPacingServiceConfig::endpoint_window_v1());
-        let key = test_key(21, 0);
-        assert!(service.attach_connection(key));
-
-        let mut granted = 0;
-        while let Some(reservation) = try_reserve_bulk(&service, key, now, now, DATAGRAM_BYTES) {
-            reservation
-                .settle_built(DATAGRAM_BYTES)
-                .expect("bulk datagram fits its reservation");
-            service
-                .note_socket_sent(key, DATAGRAM_BYTES, now)
-                .expect("settled bulk datagram is outstanding");
-            granted += DATAGRAM_BYTES;
-        }
-
-        assert_eq!(granted, BURST_BYTES);
-    }
-
-    #[test]
-    fn two_continuous_bulk_waiters_stay_within_one_quantum_lead() {
-        let start = Instant::now();
-        let ready_at = start + Duration::from_millis(1);
-        let service = EndpointPacingService::new(EndpointPacingServiceConfig::endpoint_window_v1());
-        let first = test_key(31, 0);
-        let second = test_key(32, 0);
-        assert!(service.attach_connection(first));
-        assert!(service.attach_connection(second));
-
-        assert!(try_reserve_bulk(&service, first, start, ready_at, DATAGRAM_BYTES).is_none());
-        assert!(try_reserve_bulk(&service, second, start, ready_at, DATAGRAM_BYTES).is_none());
-
-        let mut first_granted = 0u64;
-        let mut second_granted = 0u64;
-        while let Some(reservation) =
-            try_reserve_bulk(&service, first, ready_at, ready_at, DATAGRAM_BYTES)
-        {
-            reservation
-                .settle_built(DATAGRAM_BYTES)
-                .expect("first-turn datagram fits its reservation");
-            service
-                .note_socket_sent(first, DATAGRAM_BYTES, ready_at)
-                .expect("first-turn datagram is outstanding");
-            first_granted += DATAGRAM_BYTES;
-        }
-        assert_eq!(
-            first_granted,
-            EndpointPacingServiceConfig::endpoint_window_v1().connection_quantum_bytes()
-        );
-
-        while let Some(reservation) =
-            try_reserve_bulk(&service, second, ready_at, ready_at, DATAGRAM_BYTES)
-        {
-            reservation
-                .settle_built(DATAGRAM_BYTES)
-                .expect("second-turn datagram fits its reservation");
-            service
-                .note_socket_sent(second, DATAGRAM_BYTES, ready_at)
-                .expect("second-turn datagram is outstanding");
-            second_granted += DATAGRAM_BYTES;
-        }
-        assert_eq!(
-            second_granted,
-            EndpointPacingServiceConfig::endpoint_window_v1().connection_quantum_bytes()
-        );
-
-        let mut attempts_without_progress = 0;
-        while first_granted + second_granted < BURST_BYTES {
-            let mut progressed = false;
-            for key in [first, second] {
-                if let Some(reservation) =
-                    try_reserve_bulk(&service, key, ready_at, ready_at, DATAGRAM_BYTES)
-                {
-                    reservation
-                        .settle_built(DATAGRAM_BYTES)
-                        .expect("bulk datagram fits its reservation");
-                    service
-                        .note_socket_sent(key, DATAGRAM_BYTES, ready_at)
-                        .expect("settled bulk datagram is outstanding");
-                    if key == first {
-                        first_granted += DATAGRAM_BYTES;
-                    } else {
-                        second_granted += DATAGRAM_BYTES;
-                    }
-                    progressed = true;
-
-                    let lead = first_granted.abs_diff(second_granted);
-                    assert!(
-                        lead <= EndpointPacingServiceConfig::endpoint_window_v1()
-                            .connection_quantum_bytes()
-                            + DATAGRAM_BYTES,
-                        "first={first_granted} second={second_granted} lead={lead}"
-                    );
-                }
-            }
-            attempts_without_progress = if progressed {
-                0
-            } else {
-                attempts_without_progress + 1
-            };
-            assert!(attempts_without_progress < 3, "DRR made no progress");
-        }
-        let fairness = service.snapshot().fairness_lead_high_water_bytes;
-        assert!(fairness > 0);
-        assert!(
-            fairness
-                <= EndpointPacingServiceConfig::endpoint_window_v1().connection_quantum_bytes()
-                    + DATAGRAM_BYTES,
-            "observed fairness lead high water exceeded the formal bound: {fairness}"
-        );
-    }
-
-    #[test]
-    fn cancelling_an_idle_bulk_head_lends_its_turn_to_the_peer() {
-        let start = Instant::now();
-        let ready_at = start + Duration::from_millis(1);
-        let service = EndpointPacingService::new(EndpointPacingServiceConfig::endpoint_window_v1());
-        let idle = test_key(41, 0);
-        let peer = test_key(42, 0);
-        assert!(service.attach_connection(idle));
-        assert!(service.attach_connection(peer));
-
-        assert!(try_reserve_bulk(&service, idle, start, ready_at, DATAGRAM_BYTES).is_none());
-        assert!(try_reserve_bulk(&service, peer, start, ready_at, DATAGRAM_BYTES).is_none());
-        assert!(service.cancel_waiter(idle));
-
-        assert!(try_reserve_bulk(&service, peer, start, start, DATAGRAM_BYTES).is_some());
-    }
-
-    #[test]
-    fn idle_or_cancelled_bulk_connections_retain_no_deficit() {
-        let start = Instant::now();
-        let later = start + Duration::from_millis(1);
-        let service = EndpointPacingService::new(EndpointPacingServiceConfig::endpoint_window_v1());
-        let first = test_key(51, 0);
-        let peer = test_key(52, 0);
-        assert!(service.attach_connection(first));
-        assert!(service.attach_connection(peer));
-
-        drop(
-            try_reserve_bulk(&service, first, start, start, DATAGRAM_BYTES)
-                .expect("single active connection starts a turn"),
-        );
-        assert_ne!(
-            service.lock_state().connections[&first].bulk_deficit_bytes,
-            0
-        );
-
-        assert!(try_reserve_bulk(&service, peer, start, later, DATAGRAM_BYTES).is_none());
-        assert_eq!(
-            service.lock_state().connections[&first].bulk_deficit_bytes,
-            0
-        );
-
-        assert!(service.cancel_waiter(peer));
-        assert_eq!(
-            service.lock_state().connections[&peer].bulk_deficit_bytes,
-            0
-        );
-    }
-
-    #[test]
-    fn one_control_connection_borrows_the_full_endpoint_burst() {
-        let now = Instant::now();
-        let service = EndpointPacingService::new(EndpointPacingServiceConfig::endpoint_window_v1());
-        let key = test_key(61, 0);
-        assert!(service.attach_connection(key));
-
-        let mut granted = 0;
-        while let Some(reservation) = try_reserve_control(&service, key, now, now, DATAGRAM_BYTES) {
-            reservation
-                .settle_built(DATAGRAM_BYTES)
-                .expect("control datagram fits its reservation");
-            service
-                .note_socket_sent(key, DATAGRAM_BYTES, now)
-                .expect("settled control datagram is outstanding");
-            granted += DATAGRAM_BYTES;
-        }
-
-        assert_eq!(granted, BURST_BYTES);
-    }
-
-    #[test]
-    fn continuous_control_and_bulk_rotate_after_their_bounded_quanta() {
-        let start = Instant::now();
-        let ready_at = start + Duration::from_millis(1);
-        let service = EndpointPacingService::new(EndpointPacingServiceConfig::endpoint_window_v1());
-        let control = test_key(71, 0);
-        let bulk = test_key(72, 0);
-        assert!(service.attach_connection(control));
-        assert!(service.attach_connection(bulk));
-
-        assert!(try_reserve_control(&service, control, start, ready_at, DATAGRAM_BYTES).is_none());
-        assert!(try_reserve_bulk(&service, bulk, start, ready_at, DATAGRAM_BYTES).is_none());
-
-        let control_first_turn =
-            drain_scheduled_class(&service, control, PacingTrafficClass::Control, ready_at);
-        assert_eq!(
-            control_first_turn,
-            EndpointPacingServiceConfig::endpoint_window_v1().control_reserve_bytes()
-        );
-
-        let bulk_first_turn =
-            drain_scheduled_class(&service, bulk, PacingTrafficClass::Bulk, ready_at);
-        assert_eq!(
-            bulk_first_turn,
-            EndpointPacingServiceConfig::endpoint_window_v1().connection_quantum_bytes()
-        );
-
-        let control_second_turn =
-            drain_scheduled_class(&service, control, PacingTrafficClass::Control, ready_at);
-        assert_eq!(
-            control_second_turn,
-            EndpointPacingServiceConfig::endpoint_window_v1().control_reserve_bytes()
-        );
-    }
-
-    #[test]
-    fn token_deadline_is_exact_and_combines_with_the_path_deadline() {
-        let start = Instant::now();
-        let service = EndpointPacingService::new(EndpointPacingServiceConfig::endpoint_window_v1());
-        let key = test_key(81, 0);
-        assert!(service.attach_connection(key));
-        assert_eq!(
-            drain_scheduled_class(&service, key, PacingTrafficClass::Bulk, start),
-            BURST_BYTES
-        );
-
-        let endpoint_deadline = blocked_deadline(service.poll_reserve(
-            key,
-            PacingTrafficClass::Bulk,
-            start,
-            DATAGRAM_BYTES,
-            None,
-            start,
-        ));
-        assert_eq!(
-            endpoint_deadline,
-            Some(start + Duration::from_nanos(41_667))
-        );
-
-        let path_ready_at = start + Duration::from_micros(100);
-        let combined_deadline = blocked_deadline(service.poll_reserve(
-            key,
-            PacingTrafficClass::Bulk,
-            path_ready_at,
-            DATAGRAM_BYTES,
-            None,
-            start,
-        ));
-        assert_eq!(combined_deadline, Some(path_ready_at));
-    }
-
-    #[test]
-    fn turn_handoff_wakes_only_the_newly_eligible_peer() {
-        let start = Instant::now();
-        let ready_at = start + Duration::from_millis(1);
-        let service = EndpointPacingService::new(EndpointPacingServiceConfig::endpoint_window_v1());
-        let first = test_key(91, 0);
-        let second = test_key(92, 0);
-        assert!(service.attach_connection(first));
-        assert!(service.attach_connection(second));
-        let first_counter = Arc::new(WakeCounter::default());
-        let second_counter = Arc::new(WakeCounter::default());
-        let first_waker = Waker::from(first_counter.clone());
-        let second_waker = Waker::from(second_counter.clone());
-
-        assert!(matches!(
-            service.poll_reserve(
-                first,
-                PacingTrafficClass::Bulk,
-                ready_at,
-                DATAGRAM_BYTES,
-                Some(&first_waker),
-                start,
-            ),
-            PollReservation::Blocked { .. }
-        ));
-        assert!(matches!(
-            service.poll_reserve(
-                second,
-                PacingTrafficClass::Bulk,
-                ready_at,
-                DATAGRAM_BYTES,
-                Some(&second_waker),
-                start,
-            ),
-            PollReservation::Blocked { .. }
-        ));
-
-        for _ in 0..(EndpointPacingServiceConfig::endpoint_window_v1().connection_quantum_bytes()
-            / DATAGRAM_BYTES)
-        {
-            let reservation = match service.poll_reserve(
-                first,
-                PacingTrafficClass::Bulk,
-                ready_at,
-                DATAGRAM_BYTES,
-                Some(&first_waker),
-                ready_at,
-            ) {
-                PollReservation::Granted(reservation) => reservation,
-                PollReservation::Blocked { reason, .. } => {
-                    panic!("first turn blocked early: {reason:?}")
-                }
-            };
-            reservation
-                .settle_built(DATAGRAM_BYTES)
-                .expect("turn datagram fits");
-            service
-                .note_socket_sent(first, DATAGRAM_BYTES, ready_at)
-                .expect("turn datagram is outstanding");
-        }
-
-        assert!(matches!(
-            service.poll_reserve(
-                first,
-                PacingTrafficClass::Bulk,
-                ready_at,
-                DATAGRAM_BYTES,
-                Some(&first_waker),
-                ready_at,
-            ),
-            PollReservation::Blocked {
-                reason: ReservationBlockReason::Turn,
-                ..
-            }
-        ));
-        assert_eq!(first_counter.count.load(Ordering::SeqCst), 0);
-        assert_eq!(second_counter.count.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn socket_progress_wakes_a_parked_peer_before_control_yields() {
-        let start = Instant::now();
-        let ready_at = start + Duration::from_secs(1);
-        let service = EndpointPacingService::new(EndpointPacingServiceConfig::endpoint_window_v1());
-        let control = test_key(91, 0);
-        let bulk = test_key(92, 0);
-        assert!(service.attach_connection(control));
-        assert!(service.attach_connection(bulk));
-
-        let control_counter = Arc::new(WakeCounter::default());
-        let bulk_counter = Arc::new(WakeCounter::default());
-        let control_waker = Waker::from(control_counter.clone());
-        let bulk_waker = Waker::from(bulk_counter.clone());
-        assert!(matches!(
-            service.poll_reserve(
-                control,
-                PacingTrafficClass::Control,
-                ready_at,
-                DATAGRAM_BYTES,
-                Some(&control_waker),
-                start,
-            ),
-            PollReservation::Blocked {
-                reason: ReservationBlockReason::Path,
-                ..
-            }
-        ));
-        assert!(matches!(
-            service.poll_reserve(
-                bulk,
-                PacingTrafficClass::Bulk,
-                ready_at,
-                DATAGRAM_BYTES,
-                Some(&bulk_waker),
-                start,
-            ),
-            PollReservation::Blocked {
-                reason: ReservationBlockReason::Path,
-                ..
-            }
-        ));
-
-        assert!(matches!(
-            service.poll_reserve(
-                bulk,
-                PacingTrafficClass::Bulk,
-                ready_at,
-                DATAGRAM_BYTES,
-                Some(&bulk_waker),
-                ready_at,
-            ),
-            PollReservation::Blocked {
-                reason: ReservationBlockReason::Turn,
-                deadline: None,
-            }
-        ));
-        for _ in 0..(EndpointPacingServiceConfig::endpoint_window_v1().control_reserve_bytes()
-            / DATAGRAM_BYTES)
-        {
-            settle_and_send_class(&service, control, PacingTrafficClass::Control, ready_at);
-        }
-        assert!(
-            bulk_counter.count.load(Ordering::SeqCst) > 0,
-            "the latest socket outcome must schedule the parked bulk driver"
-        );
-        let reservation = match service.poll_reserve(
-            bulk,
-            PacingTrafficClass::Bulk,
-            ready_at,
-            DATAGRAM_BYTES,
-            Some(&bulk_waker),
-            ready_at,
-        ) {
-            PollReservation::Granted(reservation) => reservation,
-            PollReservation::Blocked { reason, .. } => {
-                panic!("scheduled bulk peer did not make progress: {reason:?}")
-            }
-        };
-        reservation
-            .settle_built(DATAGRAM_BYTES)
-            .expect("scheduled bulk datagram fits its reservation");
-        assert_eq!(control_counter.count.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn cancellation_and_socket_outcome_wake_a_peer_once_without_self_wake() {
-        let start = Instant::now();
-        let outcome_at = start + Duration::from_secs(1);
-        let service = EndpointPacingService::new(EndpointPacingServiceConfig::endpoint_window_v1());
-        let blocker = test_key(101, 0);
-        let cancelled = test_key(102, 0);
-        let peer = test_key(103, 0);
-        for key in [blocker, cancelled, peer] {
-            assert!(service.attach_connection(key));
-        }
-        service
-            .reserve(blocker, start, BURST_BYTES)
-            .expect("blocker takes the full burst")
-            .settle_built(BURST_BYTES)
-            .expect("full burst settlement");
-
-        let cancelled_counter = Arc::new(WakeCounter::default());
-        let peer_counter = Arc::new(WakeCounter::default());
-        let cancelled_waker = Waker::from(cancelled_counter.clone());
-        let peer_waker = Waker::from(peer_counter.clone());
-        assert!(matches!(
-            service.poll_reserve(
-                cancelled,
-                PacingTrafficClass::Bulk,
-                start,
-                DATAGRAM_BYTES,
-                Some(&cancelled_waker),
-                start,
-            ),
-            PollReservation::Blocked {
-                reason: ReservationBlockReason::Tokens,
-                ..
-            }
-        ));
-        for _ in 0..2 {
-            assert!(matches!(
-                service.poll_reserve(
-                    peer,
-                    PacingTrafficClass::Bulk,
-                    start,
-                    DATAGRAM_BYTES,
-                    Some(&peer_waker),
-                    start,
-                ),
-                PollReservation::Blocked { .. }
-            ));
-        }
-        assert_eq!(cancelled_counter.count.load(Ordering::SeqCst), 0);
-        assert_eq!(peer_counter.count.load(Ordering::SeqCst), 0);
-
-        assert!(service.cancel_waiter(cancelled));
-        assert_eq!(cancelled_counter.count.load(Ordering::SeqCst), 0);
-        assert_eq!(peer_counter.count.load(Ordering::SeqCst), 1);
-
-        assert!(matches!(
-            service.poll_reserve(
-                peer,
-                PacingTrafficClass::Bulk,
-                outcome_at,
-                DATAGRAM_BYTES,
-                Some(&peer_waker),
-                outcome_at,
-            ),
-            PollReservation::Blocked { deadline: None, .. }
-        ));
-        service
-            .note_socket_sent(blocker, BURST_BYTES, outcome_at)
-            .expect("socket accepts the blocked batch");
-        assert_eq!(peer_counter.count.load(Ordering::SeqCst), 2);
-    }
-
-    #[test]
-    fn migration_keeps_old_outstanding_charged_until_its_socket_outcome() {
-        let start = Instant::now();
-        let service = EndpointPacingService::new(EndpointPacingServiceConfig::endpoint_window_v1());
-        let old = test_key(111, 0);
-        let new = test_key(111, 1);
-        assert!(service.attach_connection(old));
-        service
-            .reserve(old, start, DATAGRAM_BYTES)
-            .expect("old path reserves a datagram")
-            .settle_built(1_000)
-            .expect("old path settles a short datagram");
-        let wake_counter = Arc::new(WakeCounter::default());
-        let waker = Waker::from(wake_counter);
-        assert!(matches!(
-            service.poll_reserve(
-                old,
-                PacingTrafficClass::Bulk,
-                start + Duration::from_secs(1),
-                DATAGRAM_BYTES,
-                Some(&waker),
-                start,
-            ),
-            PollReservation::Blocked {
-                reason: ReservationBlockReason::Path,
-                ..
-            }
-        ));
-        let before = service.snapshot();
-
-        service
-            .migrate_connection(old, new)
-            .expect("new path generation is vacant");
-        let migrated = service.snapshot();
-        assert_eq!(migrated.available_tokens, before.available_tokens);
-        assert_eq!(migrated.outstanding_bytes, 1_000);
-        assert_eq!(migrated.connection_records, 2);
-        assert_eq!(migrated.stale_waker_events, 1);
-        assert!(service.reserve(old, start, 1).is_none());
-        assert!(service.reserve(new, start, 1).is_some());
-
-        service
-            .note_socket_sent(old, 1_000, start)
-            .expect("old path socket batch remains attributable");
-        assert_eq!(service.snapshot().connection_records, 1);
-        assert_eq!(
-            service.note_socket_sent(old, 1_000, start),
-            Err(SocketOutcomeError)
-        );
-    }
-
-    #[test]
-    fn connection_adapter_keeps_one_batch_attributed_across_migration_and_detach() {
-        let start = Instant::now();
-        let service = EndpointPacingService::new(EndpointPacingServiceConfig::endpoint_window_v1());
-        let old = test_key(121, 0);
-        let mut connection = ConnectionEndpointPacing::attach(service.clone(), old);
-
-        let reservation =
-            match connection.poll_reserve(PacingTrafficClass::Bulk, start, DATAGRAM_BYTES, start) {
-                PollReservation::Granted(reservation) => reservation,
-                PollReservation::Blocked { reason, .. } => {
-                    panic!("initial grant blocked: {reason:?}")
-                }
-            };
-        connection
-            .settle_datagram(reservation, 1_000)
-            .expect("first datagram settles into the socket batch");
-        assert_eq!(connection.pending_socket_batch_bytes(), 1_000);
-        assert!(connection.expose_socket_batch());
-        assert!(matches!(
-            connection.poll_reserve(PacingTrafficClass::Bulk, start, DATAGRAM_BYTES, start,),
-            PollReservation::Blocked {
-                reason: ReservationBlockReason::SocketOutstanding,
-                ..
-            }
-        ));
-
-        connection
-            .migrate(1)
-            .expect("new generation attaches without resetting the bucket");
-        assert_eq!(service.snapshot().connection_records, 2);
-        assert!(connection
-            .note_socket_sent(start)
-            .expect("old generation socket outcome is attributable"));
-        assert_eq!(service.snapshot().connection_records, 1);
-
-        let reservation = match connection.poll_reserve(
-            PacingTrafficClass::Control,
-            start,
-            DATAGRAM_BYTES,
-            start,
-        ) {
-            PollReservation::Granted(reservation) => reservation,
-            PollReservation::Blocked { reason, .. } => panic!("new path grant blocked: {reason:?}"),
-        };
-        connection
-            .settle_datagram(reservation, 900)
-            .expect("new generation datagram settles");
-        assert!(connection.expose_socket_batch());
-        let detached = connection.detach(start).expect("live connection detaches");
-        assert_eq!(detached.abandoned_bytes, 900);
-        assert_eq!(connection.pending_socket_batch_bytes(), 0);
-        assert_eq!(service.snapshot().connection_records, 0);
-        assert!(!connection
-            .note_socket_sent(start)
-            .expect("no pending batch is a no-op"));
-    }
-
-    #[test]
-    fn rejected_migration_keeps_the_old_adapter_attached_and_paced() {
-        let start = Instant::now();
-        let service = EndpointPacingService::new(EndpointPacingServiceConfig::endpoint_window_v1());
-        let old = test_key(122, 0);
-        let occupied = test_key(122, 1);
-        let mut connection = ConnectionEndpointPacing::attach(service.clone(), old);
-        assert!(service.attach_connection(occupied));
-
-        assert_eq!(connection.migrate(1), Err(MigrationError));
-        assert_eq!(
-            connection
-                .snapshot()
-                .expect("failed migration must retain the old adapter")
-                .path_generation,
-            0
-        );
-        let reservation =
-            match connection.poll_reserve(PacingTrafficClass::Bulk, start, DATAGRAM_BYTES, start) {
-                PollReservation::Granted(reservation) => reservation,
-                PollReservation::Blocked { reason, .. } => {
-                    panic!("old adapter must remain paced after migration rejection: {reason:?}")
-                }
-            };
-        connection
-            .settle_datagram(reservation, DATAGRAM_BYTES)
-            .expect("old adapter reservation still settles");
-        assert!(connection.expose_socket_batch());
-        assert!(connection
-            .note_socket_sent(start)
-            .expect("old adapter socket outcome remains attributable"));
-        assert_eq!(service.snapshot().sent_bytes, DATAGRAM_BYTES);
-    }
-
-    #[test]
-    fn stateless_responses_require_immediate_tokens_and_report_socket_outcomes() {
-        let start = Instant::now();
-        let service = EndpointPacingService::new(EndpointPacingServiceConfig::endpoint_window_v1());
-
-        let full_burst = service
-            .reserve_stateless_response(start, BURST_BYTES)
-            .expect("full initial burst must be immediately available");
-        assert_eq!(service.snapshot().outstanding_bytes, BURST_BYTES);
-        assert!(service.reserve_stateless_response(start, 1).is_none());
-        assert_eq!(service.snapshot().stateless_responses_dropped, 1);
-
-        full_burst.note_sent(start);
-        let sent = service.snapshot();
-        assert_eq!(sent.outstanding_bytes, 0);
-        assert_eq!(sent.stateless_responses_sent, 1);
-
-        let later = start + Duration::from_millis(2);
-        let abandoned = service
-            .reserve_stateless_response(later, DATAGRAM_BYTES)
-            .expect("elapsed time must replenish stateless service");
-        abandoned.note_abandoned(later);
-        let final_snapshot = service.snapshot();
-        assert_eq!(final_snapshot.outstanding_bytes, 0);
-        assert_eq!(final_snapshot.stateless_responses_sent, 1);
-        assert_eq!(final_snapshot.stateless_responses_dropped, 2);
-    }
-
-    #[test]
-    fn snapshot_reports_config_service_and_lifecycle_counters() {
-        let start = Instant::now();
-        let service = EndpointPacingService::new(EndpointPacingServiceConfig::endpoint_window_v1());
-        let key = test_key(122, 0);
-        let mut connection = ConnectionEndpointPacing::attach(service.clone(), key);
-
-        let reservation =
-            match connection.poll_reserve(PacingTrafficClass::Bulk, start, BURST_BYTES, start) {
-                PollReservation::Granted(reservation) => reservation,
-                PollReservation::Blocked { reason, .. } => {
-                    panic!("initial grant blocked: {reason:?}")
-                }
-            };
-        connection
-            .settle_datagram(reservation, 60_000)
-            .expect("short full-burst datagram settles");
-        assert!(connection.expose_socket_batch());
-        assert!(connection.note_socket_sent(start).unwrap());
-
-        assert!(matches!(
-            connection.poll_reserve(PacingTrafficClass::Bulk, start, 2_000, start),
-            PollReservation::Blocked {
-                reason: ReservationBlockReason::Tokens,
-                ..
-            }
-        ));
-        assert!(connection.cancel_waiter());
-        connection.detach(start).expect("connection detaches");
-
-        let snapshot = service.snapshot();
-        assert_eq!(snapshot.rate_bytes_per_second, RATE_BYTES_PER_SECOND);
-        assert_eq!(snapshot.burst_bytes, BURST_BYTES);
-        assert_eq!(snapshot.control_reserve_bytes, 10_240);
-        assert_eq!(snapshot.connection_quantum_bytes, 20_480);
-        assert_eq!(snapshot.granted_bytes, BURST_BYTES);
-        assert_eq!(snapshot.granted_datagrams, 1);
-        assert_eq!(snapshot.refunded_bytes, BURST_BYTES - 60_000);
-        assert_eq!(snapshot.refund_events, 1);
-        assert_eq!(snapshot.sent_bytes, 60_000);
-        assert_eq!(snapshot.sent_datagrams, 1);
-        assert_eq!(snapshot.abandoned_bytes, 0);
-        assert_eq!(snapshot.abandoned_datagrams, 0);
-        assert_eq!(snapshot.outstanding_bytes_high_water, 60_000);
-        assert_eq!(snapshot.endpoint_delay_events, 1);
-        assert!(snapshot.max_endpoint_delay_nanos > 0);
-        assert_eq!(snapshot.waiter_high_water, 1);
-        assert_eq!(snapshot.control_waiters, 0);
-        assert_eq!(snapshot.bulk_waiters, 0);
-        assert_eq!(snapshot.cancellations, 1);
-        assert_eq!(snapshot.detaches, 1);
-    }
-
-    #[test]
-    fn connection_snapshot_preserves_service_counters_across_migration() {
-        let start = Instant::now();
-        let service = EndpointPacingService::new(EndpointPacingServiceConfig::endpoint_window_v1());
-        let key = test_key(123, 0);
-        let mut connection = ConnectionEndpointPacing::attach(service, key);
-
-        let bulk = match connection.poll_reserve(PacingTrafficClass::Bulk, start, 1_000, start) {
-            PollReservation::Granted(reservation) => reservation,
-            PollReservation::Blocked { reason, .. } => panic!("bulk grant blocked: {reason:?}"),
-        };
-        connection.settle_datagram(bulk, 1_000).unwrap();
-        assert!(connection.expose_socket_batch());
-        assert!(connection.note_socket_sent(start).unwrap());
-
-        let later = start + Duration::from_millis(1);
-        let control = match connection.poll_reserve(PacingTrafficClass::Control, later, 500, later)
-        {
-            PollReservation::Granted(reservation) => reservation,
-            PollReservation::Blocked { reason, .. } => {
-                panic!("control grant blocked: {reason:?}")
-            }
-        };
-        connection.settle_datagram(control, 500).unwrap();
-        assert!(connection.expose_socket_batch());
-        assert!(connection.note_socket_sent(later).unwrap());
-
-        let before = connection.snapshot().expect("attached connection snapshot");
-        assert_eq!(before.connection_handle, 123);
-        assert_eq!(before.path_generation, 0);
-        assert!(before.attached);
-        assert_eq!(before.granted_bulk_bytes, 1_000);
-        assert_eq!(before.granted_control_bytes, 500);
-        assert!(before.turn_count >= 2);
-        assert!(before.wait_count >= 2);
-        assert!(before.max_service_gap_nanos >= 1_000_000);
-
-        connection.migrate(1).expect("migration succeeds");
-        let migrated = connection.snapshot().expect("migrated connection snapshot");
-        assert_eq!(migrated.connection_handle, 123);
-        assert_eq!(migrated.path_generation, 1);
-        assert_eq!(migrated.granted_bulk_bytes, before.granted_bulk_bytes);
-        assert_eq!(migrated.granted_control_bytes, before.granted_control_bytes);
-        assert_eq!(migrated.turn_count, before.turn_count);
-        assert_eq!(migrated.wait_count, before.wait_count);
-        assert_eq!(migrated.max_service_gap_nanos, before.max_service_gap_nanos);
-    }
-
-    #[derive(Debug, Default)]
-    struct WakeCounter {
-        count: AtomicUsize,
-    }
-
-    impl Wake for WakeCounter {
-        fn wake(self: Arc<Self>) {
-            self.count.fetch_add(1, Ordering::SeqCst);
-        }
-
-        fn wake_by_ref(self: &Arc<Self>) {
-            self.count.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    fn assert_conservation_snapshot(
-        service: &EndpointPacingService,
-        available_tokens: u64,
-        live_reservation_bytes: u64,
-        outstanding_bytes: u64,
-        connection_records: usize,
-    ) {
-        let snapshot = service.snapshot();
-        assert_eq!(snapshot.available_tokens, available_tokens);
-        assert_eq!(snapshot.live_reservation_bytes, live_reservation_bytes);
-        assert_eq!(snapshot.outstanding_bytes, outstanding_bytes);
-        assert_eq!(snapshot.connection_records, connection_records);
-    }
-
-    fn drain_available(service: &EndpointPacingService, now: Instant) -> u64 {
-        drain_available_bytes(service, now, DATAGRAM_BYTES)
-    }
-
-    fn drain_available_bytes(
-        service: &EndpointPacingService,
-        now: Instant,
-        datagram_bytes: u64,
-    ) -> u64 {
-        let mut sent = 0;
-        while let Some(reservation) = service.reserve(TEST_KEY, now, datagram_bytes) {
-            reservation
-                .settle_built(datagram_bytes)
-                .expect("actual bytes do not exceed the reservation");
-            service
-                .note_socket_sent(TEST_KEY, datagram_bytes, now)
-                .expect("the settled datagram is outstanding");
-            sent += datagram_bytes;
-        }
-        sent
-    }
-
-    fn settle_and_send_one(service: &EndpointPacingService, now: Instant) {
-        service
-            .reserve(TEST_KEY, now, 1)
-            .expect("one byte is available")
-            .settle_built(1)
-            .expect("one-byte settlement");
-        service
-            .note_socket_sent(TEST_KEY, 1, now)
-            .expect("one byte is outstanding");
-    }
-
-    fn settle_and_send_class(
-        service: &EndpointPacingService,
-        key: EndpointPacingConnectionKey,
-        class: PacingTrafficClass,
-        now: Instant,
-    ) {
-        let reservation = match service.poll_reserve(key, class, now, DATAGRAM_BYTES, None, now) {
-            PollReservation::Granted(reservation) => reservation,
-            PollReservation::Blocked { reason, .. } => {
-                panic!("class service unexpectedly blocked: {reason:?}")
-            }
-        };
-        reservation
-            .settle_built(DATAGRAM_BYTES)
-            .expect("class reservation settles exactly");
-        service
-            .note_socket_sent(key, DATAGRAM_BYTES, now)
-            .expect("class datagram socket outcome matches");
-    }
-
-    fn try_reserve_bulk(
-        service: &EndpointPacingService,
-        key: EndpointPacingConnectionKey,
-        now: Instant,
-        path_ready_at: Instant,
-        planned_bytes: u64,
-    ) -> Option<DatagramReservation> {
-        match service.poll_reserve(
-            key,
-            PacingTrafficClass::Bulk,
-            path_ready_at,
-            planned_bytes,
-            None,
-            now,
-        ) {
-            PollReservation::Granted(reservation) => Some(reservation),
-            PollReservation::Blocked { .. } => None,
-        }
-    }
-
-    fn try_reserve_control(
-        service: &EndpointPacingService,
-        key: EndpointPacingConnectionKey,
-        now: Instant,
-        path_ready_at: Instant,
-        planned_bytes: u64,
-    ) -> Option<DatagramReservation> {
-        match service.poll_reserve(
-            key,
-            PacingTrafficClass::Control,
-            path_ready_at,
-            planned_bytes,
-            None,
-            now,
-        ) {
-            PollReservation::Granted(reservation) => Some(reservation),
-            PollReservation::Blocked { .. } => None,
-        }
-    }
-
-    fn drain_scheduled_class(
-        service: &EndpointPacingService,
-        key: EndpointPacingConnectionKey,
-        class: PacingTrafficClass,
-        now: Instant,
-    ) -> u64 {
-        let mut granted = 0;
-        loop {
-            let reservation = match class {
-                PacingTrafficClass::Control => {
-                    try_reserve_control(service, key, now, now, DATAGRAM_BYTES)
-                }
-                PacingTrafficClass::Bulk => {
-                    try_reserve_bulk(service, key, now, now, DATAGRAM_BYTES)
-                }
-            };
-            let Some(reservation) = reservation else {
-                break;
-            };
-            reservation
-                .settle_built(DATAGRAM_BYTES)
-                .expect("scheduled datagram fits its reservation");
-            service
-                .note_socket_sent(key, DATAGRAM_BYTES, now)
-                .expect("scheduled datagram is outstanding");
-            granted += DATAGRAM_BYTES;
-        }
-        granted
-    }
-
-    fn blocked_deadline(result: PollReservation) -> Option<Instant> {
-        match result {
-            PollReservation::Granted(_) => panic!("expected reservation to be blocked"),
-            PollReservation::Blocked { deadline, .. } => deadline,
-        }
-    }
-
-    fn test_config(rate_bytes_per_second: u64, burst_bytes: u64) -> EndpointPacingServiceConfig {
-        EndpointPacingServiceConfig::new(rate_bytes_per_second, burst_bytes, 0, burst_bytes)
-            .expect("nonzero test config")
-    }
-
-    fn test_service(config: EndpointPacingServiceConfig, _now: Instant) -> EndpointPacingService {
-        let service = EndpointPacingService::new(config);
-        assert!(service.attach_connection(TEST_KEY));
-        service
-    }
-
-    fn test_key(handle: usize, path_generation: u64) -> EndpointPacingConnectionKey {
-        EndpointPacingConnectionKey::new(ConnectionHandle(handle), path_generation)
-    }
-}
+mod tests;

@@ -1,6 +1,11 @@
 //! Shared actual loopback Quinn fixture; no protocol simulation.
 use super::*;
 
+/// Passive observation of the original admission counter; changes no ownership.
+pub(crate) fn active_tcp_leases(upstream: &TuicUpstream) -> u64 {
+    upstream.tcp_pool_admission.active_total()
+}
+
 pub(crate) struct UdpPair {
     pub(crate) server: Endpoint,
     pub(crate) client: Endpoint,

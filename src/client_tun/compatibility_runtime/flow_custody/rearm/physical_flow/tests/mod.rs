@@ -1,7 +1,10 @@
 //! Exact DATA dispositions and actual pre-receive admission.
 use super::*;
 
-fn flow_mirror() -> FlowMirror {
+#[cfg(feature = "harness")]
+pub(super) mod permit_reset;
+
+pub(super) fn flow_mirror() -> FlowMirror {
     let mut sockets = SocketSet::new(vec![]);
     let handle = sockets.add(build_listener_socket(&ListenerSpec { local_port: 12345 }));
     FlowMirror {
@@ -26,6 +29,9 @@ fn flow_mirror() -> FlowMirror {
         reset: None,
         receipt: None,
         window: None,
+        permit_queue: None,
+        d16_queue: None,
+        native_backing: None, native_stock: None,
     }
 }
 
@@ -45,7 +51,7 @@ fn each_data_event_requires_one_exact_transfer_or_discard() {
     let mut ctx = SocketCtx::new(12345);
     ctx.flow_mirror = Some(flow_mirror());
     assert!(ctx.flow_mirror.as_mut().unwrap().begin_event(7, Some(3)));
-    FlowMirror::accept_data(&mut ctx, &[1, 2, 3], None);
+    FlowMirror::accept_data(&mut ctx, &[1, 2, 3], &mut None);
     let mirror = ctx.flow_mirror.as_mut().unwrap();
     mirror.finish_event();
     assert!(!mirror.quarantined);
@@ -123,6 +129,19 @@ impl FlowMirror {
         self.receipt
     }
 
+    pub(in crate::client_tun) fn stock_receipt_for_test(&self, handle: SocketHandle, epoch: u64, current_epoch: u64,
+        key: &crate::tcp_downlink_pump::StockKey) -> Option<(usize, usize, usize, usize, usize)> {
+        if self.id.handle != handle || self.id.epoch != epoch
+            || !self.native_stock.as_ref().is_some_and(|actual| actual.same_stock(key)) { return None; }
+        self.receipt.filter(|receipt| receipt.identity() == self.id
+            && epoch.checked_add(1) == Some(receipt.next_epoch) && current_epoch == receipt.next_epoch)
+            .map(|receipt| receipt.data_disposition())
+    }
+
+    pub(in crate::client_tun) fn receipt_present_for_test(&self) -> bool {
+        self.receipt.is_some()
+    }
+
     pub(in crate::client_tun::compatibility_runtime::flow_custody) fn replace_receipt(
         &mut self,
         receipt: Option<FlowPhysicalReceipt>,
@@ -154,6 +173,11 @@ pub(in crate::client_tun::compatibility_runtime::flow_custody) enum ReceiptFault
 }
 
 impl FlowPhysicalReceipt {
+    pub(in crate::client_tun::compatibility_runtime::flow_custody) fn discarded_inflight(
+        self,
+    ) -> usize {
+        self.discarded_inflight
+    }
     pub(in crate::client_tun::compatibility_runtime::flow_custody) fn corrupt_actual(
         mut self,
         fault: ReceiptFault,
@@ -208,3 +232,13 @@ impl FlowPhysicalReceipt {
 }
 
 pub(super) mod window;
+
+#[cfg(feature = "harness")]
+mod permit;
+
+mod native_payload;
+
+pub(in crate::client_tun::compatibility_runtime::flow_custody) mod cold;
+
+#[cfg(feature = "harness")]
+mod uplink;

@@ -7,51 +7,7 @@ use tokio::task::JoinSet;
 
 use super::*;
 
-#[derive(Debug, Default, PartialEq, Eq)]
-struct BridgeResult {
-    accepted_connections: usize,
-    completed_connections: usize,
-    terminal_reset_connections: usize,
-    failed_connections: usize,
-    local_to_remote_bytes: u64,
-    remote_to_local_bytes: u64,
-    first_terminal_reset: Option<String>,
-    first_failure: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BridgeFailureKind {
-    TerminalReset,
-    Unexpected,
-}
-
-#[derive(Debug)]
-struct BridgeFailure {
-    kind: BridgeFailureKind,
-    message: String,
-}
-
-impl BridgeFailure {
-    fn unexpected(message: String) -> Self {
-        Self {
-            kind: BridgeFailureKind::Unexpected,
-            message,
-        }
-    }
-
-    fn relay_io(target: &TargetAddr, err: std::io::Error) -> Self {
-        let kind = match err.kind() {
-            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe => {
-                BridgeFailureKind::TerminalReset
-            }
-            _ => BridgeFailureKind::Unexpected,
-        };
-        Self {
-            kind,
-            message: format!("direct TUIC probe relay {target:?}: {err}"),
-        }
-    }
-}
+use super::probe::direct::{BridgeFailure, BridgeFailureKind, BridgeResult};
 
 #[derive(Debug, PartialEq)]
 struct IperfProbeResult {
@@ -244,61 +200,37 @@ async fn run_cross_host_direct_tuic_probe_from_env() -> Result<(), String> {
     config.tcp_pool = 1;
     config.zero_rtt = false;
     config.quic_stats_secs = Some(1);
-    let upstream: Arc<dyn ProxyUpstream> = Arc::new(
-        TuicUpstream::connect(&config, Arc::new(Metrics::new()))
-            .await
-            .map_err(|err| format!("direct TUIC probe connect/authenticate: {err:?}"))?,
-    );
-
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .map_err(|err| format!("direct TUIC probe bind loopback: {err}"))?;
-    let listen_addr = listener
-        .local_addr()
-        .map_err(|err| format!("direct TUIC probe loopback address: {err}"))?;
-    println!(
-        "direct_tuic_probe_start server={} target={:?} listen={} profile=cubic_safe1200 pool=1 relay=ordered_join duration_secs={} floor_mbps={:.3} max_connections={}",
-        config.server, target, listen_addr, duration_secs, floor_mbps, max_connections,
-    );
-
-    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let bridge = tokio::spawn(run_bounded_loopback_bridge(
-        listener,
-        upstream,
-        target,
-        max_connections as usize,
-        stop_rx,
-    ));
-
-    let mut command = tokio::process::Command::new(
+    let command = tokio::process::Command::new(
         std::env::var("MINI_VPN_KNIFE14_DIRECT_TUIC_IPERF3")
             .unwrap_or_else(|_| "iperf3".to_string()),
     );
-    command
-        .arg("-c")
-        .arg(listen_addr.ip().to_string())
-        .arg("-p")
-        .arg(listen_addr.port().to_string())
-        .arg("-t")
-        .arg(duration_secs.to_string())
-        .arg("-P")
-        .arg("1")
-        .arg("-R")
-        .arg("-i")
-        .arg("1")
-        .arg("--json")
-        .kill_on_drop(true);
-    let output = tokio::time::timeout(
-        Duration::from_secs(duration_secs.saturating_add(30)),
-        command.output(),
+    let mut probe = super::probe::prepare_direct(
+        config,
+        target,
+        duration_secs,
+        max_connections as usize,
+        command,
+        Arc::new(Metrics::new()),
+        Some(floor_mbps),
     )
-    .await;
-    let _ = stop_tx.send(true);
-    let bridge_result = finish_bridge(bridge, Duration::from_secs(5)).await?;
-    let output = output
-        .map_err(|_| "direct TUIC probe iperf3 timed out".to_string())?
-        .map_err(|err| format!("direct TUIC probe run iperf3: {err}"))?;
-    let stdout = String::from_utf8(output.stdout)
+    .map_err(|err| format!("direct TUIC probe prepare: {err:?}"))?;
+    let observed = probe.run().await;
+    let direct = probe
+        .direct_report()
+        .cloned()
+        .ok_or_else(|| format!("direct TUIC probe no report: {:?}", observed.phase))?;
+    let bridge_result = direct.bridge;
+    let output = direct.child;
+    if !output.joined || !output.waited || !output.stdout_eof || !output.stderr_eof {
+        return Err(format!(
+            "direct TUIC probe child incomplete: {:?}",
+            observed.phase
+        ));
+    }
+    if let Some(error) = output.error.as_ref() {
+        return Err(error.clone());
+    }
+    let stdout = String::from_utf8((*output.stdout).clone())
         .map_err(|err| format!("direct TUIC probe iperf3 stdout is not UTF-8: {err}"))?;
     if let Ok(path) = std::env::var("MINI_VPN_KNIFE14_DIRECT_TUIC_IPERF_JSON_OUT") {
         std::fs::write(&path, &stdout)
@@ -318,11 +250,18 @@ async fn run_cross_host_direct_tuic_probe_from_env() -> Result<(), String> {
             .unwrap_or("none"),
         bridge_result.first_failure.as_deref().unwrap_or("none"),
     );
-    if !output.status.success() {
+    if !output.success {
         return Err(format!(
             "direct TUIC probe iperf3 failed status={} stderr={}",
-            output.status,
+            output.status.as_deref().unwrap_or("unknown"),
             String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    if observed.phase != super::probe::Phase::Complete {
+        return Err(format!(
+            "direct TUIC probe {:?}: {:?}",
+            observed.phase,
+            probe.failure()
         ));
     }
     let result =

@@ -76,7 +76,7 @@ async fn maintenance_ingress(mode: usize) {
     let mut fake = FakeIpPool::new();
     let metrics = Metrics::default();
     let mut sink = NoopSink;
-    let (events, _events_rx) = mpsc::channel(64);
+    let (events, _events_rx) = crate::client_tun::relay_channel::channel(64);
     let (actions, _actions_rx) = mpsc::channel(1);
     let pressure = DownlinkBackpressureConfig {
         high_bytes: 4096,

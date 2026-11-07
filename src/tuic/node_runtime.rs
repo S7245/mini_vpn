@@ -2,15 +2,17 @@
 //! Owns one saved UDP pump and its bounded children, stop gate and join evidence.
 //! Public start_udp is single-use; its caller retains the unique shutdown token.
 //! The pump retains children outside its guarded body and joins before completion.
-//! Connection startup/drain, stats and monitor settlement are NOT certified here.
-//! Their existing implementations remain below; lifecycle tests live in tests/.
+//! Native cold stock and callback/JOIN disposition live in native; original
+//! Node/generation retain their witnesses. Legacy keeps its original branch.
+//! Connection startup/drain and stats remain Node-owned; lifecycle tests live in tests/.
 
 use super::*;
 use crate::owned_upstream::{
     UdpDownlinkSource,
-    generation::{GenerationControl, GenerationSender},
+    generation::{GenerationControl, GenerationSender, callbacks::CallbackError},
 };
 use crate::shared::errors::{FailureOrigin, FailurePhase, FailureResource, RetainedFailure};
+use bytes::Bytes;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
@@ -19,6 +21,7 @@ pub(super) struct UdpRuntime {
     pub(super) monitor_started: AtomicBool,
     pub(super) owner: std::sync::OnceLock<std::sync::Weak<node::StartupResources>>,
     pub(super) generation: Arc<GenerationControl>,
+    native: std::sync::OnceLock<native::Native>,
     state: StdMutex<UdpState>,
     stop: watch::Sender<bool>,
     #[cfg(test)]
@@ -35,6 +38,9 @@ struct UdpState {
     typed: bool,
     token_issued: bool,
     task: Option<JoinHandle<UdpOutcome>>,
+    // Only an actually returned, complete pump outcome proves child joins.
+    // Quarantine may coexist with this fact; an outer JoinError never mints it.
+    subtree_joined: bool,
     outcome: Option<UdpOutcome>,
     deadline: Option<tokio::time::Instant>,
     quarantined: bool,
@@ -97,7 +103,12 @@ impl UdpOutcome {
         }
     }
 
-    fn child(&mut self, result: Result<UdpOutcome, JoinError>, runtime: &UdpRuntime) {
+    fn child(
+        &mut self,
+        result: Result<UdpOutcome, JoinError>,
+        runtime: &UdpRuntime,
+        guard: Option<&native::Guard>,
+    ) {
         self.children_joined = self.children_joined.saturating_add(1);
         #[cfg(test)]
         runtime.child_count.fetch_sub(1, Ordering::Relaxed);
@@ -109,7 +120,27 @@ impl UdpOutcome {
                 self.additional = self.additional.saturating_add(child.additional);
                 self.quarantined |= child.quarantined;
             }
-            Err(error) => self.join_error(error),
+            Err(error) => {
+                if let (Some(native), Some(guard)) = (runtime.native.get(), guard) {
+                    self.quarantined = true;
+                    match error.try_into_panic() {
+                        Ok(payload) => guard.capture(native::Field::Join, payload),
+                        Err(cancelled) => {
+                            let failure = RetainedFailure::from_join(udp_origin(), cancelled);
+                            if let Some(clock) = native.clock() {
+                                let order = clock.retained(&failure);
+                                if !clock.reported(order) {
+                                    self.record(failure);
+                                }
+                            } else {
+                                self.record(failure);
+                            }
+                        }
+                    }
+                } else {
+                    self.join_error(error);
+                }
+            }
         }
         if self.quarantined {
             runtime.request_stop();
@@ -132,6 +163,7 @@ impl Default for UdpRuntime {
             monitor_started: AtomicBool::new(false),
             owner: std::sync::OnceLock::new(),
             generation: Arc::new(GenerationControl::default()),
+            native: std::sync::OnceLock::new(),
             state: StdMutex::new(UdpState::default()),
             stop: watch::channel(false).0,
             #[cfg(test)]
@@ -161,18 +193,36 @@ impl UdpRuntime {
         }
         Ok(())
     }
-    pub(super) async fn settle_source(&self) -> bool {
-        let typed = self.state().typed;
+    /// Err preserves the original Native callback/Q failure; Ok(false) is a
+    /// distinct inventory rejection that still needs the Node's original IO.
+    pub(super) async fn settle_source(&self) -> Result<bool, CallbackError> {
+        let (typed, subtree_joined) = {
+            let state = self.state();
+            (state.typed, state.subtree_joined)
+        };
         if !typed {
-            return true;
+            let settled = self.finish_lane();
+            return if self.native.get().is_some_and(|n| n.meter.is_quarantined()) {
+                Err(CallbackError::Quarantined)
+            } else {
+                Ok(settled)
+            };
         }
         let epoch = self.generation.epoch();
         if !self.generation.freeze(epoch) {
-            return false;
+            return Ok(false);
         }
-        self.generation.producer_sealed(epoch); // Caller has joined the original pump.
+        if !subtree_joined {
+            // Unknown completion freezes delivery, never certifies children.
+            self.generation.changed.notify_waiters();
+            return Ok(false);
+        }
+        self.generation.producer_sealed(epoch);
+        if self.native.get().is_some() {
+            return self.finish_source_proof(epoch).await;
+        }
         self.generation.wait_sealed(epoch).await;
-        self.generation.valid()
+        Ok(self.generation.valid())
     }
     pub(super) fn node_owned(&self) -> bool {
         self.owner.get().is_some()
@@ -189,7 +239,7 @@ impl UdpRuntime {
             Err(poisoned) => {
                 let mut state = poisoned.into_inner();
                 state.quarantined = true;
-                self.stop.send_replace(true);
+
                 if state.outcome.is_none() {
                     let mut outcome = UdpOutcome::default();
                     outcome.record(RetainedFailure::opaque_panic(udp_origin()));
@@ -200,56 +250,104 @@ impl UdpRuntime {
         }
     }
 
-    fn request_stop(&self) -> tokio::time::Instant {
+    fn tighten_deadline(&self) -> tokio::time::Instant {
+        let parent = self
+            .native
+            .get()
+            .and_then(|n| n.clock())
+            .and_then(|clock| clock.parent_deadline_for_stop());
+        let proposed = tokio::time::Instant::now() + Duration::from_secs(15);
         let mut state = self.state();
-        let deadline = *state
+        let deadline = state
             .deadline
-            .get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(15));
-        self.stop.send_replace(true);
+            .into_iter()
+            .chain(parent)
+            .fold(proposed, std::cmp::min);
+        state.deadline = Some(deadline);
+        deadline
+    }
+    fn publish_stop(&self) {
+        if !*self.stop.borrow() {
+            self.stop.send_replace(true);
+        }
+    }
+    pub(super) fn request_stop(&self) -> tokio::time::Instant {
+        let deadline = self.tighten_deadline();
+        self.publish_stop();
         deadline
     }
 
-    fn poll_join(&self, cx: &mut Context<'_>) -> Poll<UdpShutdownState> {
-        let mut state = self.state();
-        let failed_join = if let Some(task) = state.task.as_mut() {
-            let result = match Pin::new(task).poll(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(result) => result,
-            };
-            state.task = None;
-            match result {
-                Ok(outcome) => {
-                    state.publish(outcome);
-                    None
+    fn poll_join(
+        &self,
+        cx: &mut Context<'_>,
+        guard: Option<&native::Guard>,
+    ) -> Poll<UdpShutdownState> {
+        let task = self.state().task.take();
+        if let Some(task) = task {
+            let mut task = native::Owned::new(Some(task), guard, native::Field::Source0);
+            let result = if let Some(handle) = task.as_mut() {
+                match catch_unwind(AssertUnwindSafe(|| Pin::new(handle).poll(cx))) {
+                    Ok(result) => result,
+                    Err(payload) => {
+                        self.state().task = task.take();
+                        if let Some(guard) = guard {
+                            guard.capture(native::Field::Join, payload);
+                        } else {
+                            let mut outcome = UdpOutcome::default();
+                            outcome.panic(payload);
+                            self.state().publish(outcome);
+                        }
+                        self.state().quarantined = true;
+                        return Poll::Ready(UdpShutdownState::Quarantined);
+                    }
                 }
-                Err(error) => {
-                    // Seal unknown debt, preserving any earlier failure. Only the
-                    // known cancelled variant may be consumed while locked.
-                    state.quarantined = true;
-                    let outcome = state.outcome.get_or_insert_with(UdpOutcome::default);
-                    if error.is_panic() {
-                        outcome.record(RetainedFailure::opaque_panic(udp_origin()));
-                        Some(error)
-                    } else {
-                        outcome.record(RetainedFailure::from_join(udp_origin(), error));
-                        None
+            } else {
+                return Poll::Ready(UdpShutdownState::Quarantined);
+            };
+            match result {
+                Poll::Pending => {
+                    self.state().task = task.take();
+                    return Poll::Pending;
+                }
+                Poll::Ready(result) => {
+                    drop(task); // actual handle Drop, separately guarded and outside UdpState
+                    match result {
+                        Ok(outcome) => {
+                            let mut state = self.state();
+                            state.subtree_joined = outcome.children_started
+                                == outcome.children_joined
+                                && (self.native.get().is_none() || !outcome.quarantined);
+                            state.publish(outcome);
+                        }
+                        Err(error) => {
+                            let mut outcome = UdpOutcome::default();
+                            if let (Some(native), Some(guard)) = (self.native.get(), guard) {
+                                outcome.quarantined = true;
+                                match error.try_into_panic() {
+                                    Ok(payload) => guard.capture(native::Field::Join, payload),
+                                    Err(cancelled) => {
+                                        let failure =
+                                            RetainedFailure::from_join(udp_origin(), cancelled);
+                                        if let Some(clock) = native.clock() {
+                                            let order = clock.retained(&failure);
+                                            if !clock.reported(order) {
+                                                outcome.record(failure);
+                                            }
+                                        } else {
+                                            outcome.record(failure);
+                                        }
+                                    }
+                                }
+                            } else {
+                                outcome.join_error(error);
+                            }
+                            let mut state = self.state();
+                            state.quarantined = true;
+                            state.publish(outcome);
+                        }
                     }
                 }
             }
-        } else {
-            None
-        };
-        drop(state);
-        if let Some(error) = failed_join {
-            // No lock across conversion/payload Drop: it may reenter request_stop.
-            let mut outcome = UdpOutcome::default();
-            match error.try_into_panic() {
-                Ok(payload) => outcome.dispose_panic(payload),
-                Err(cancelled) => {
-                    outcome.record(RetainedFailure::from_join(udp_origin(), cancelled))
-                }
-            }
-            self.state().publish(outcome);
         }
         let mut state = self.state();
         if state.started && state.task.is_none() && state.outcome.is_none() {
@@ -260,9 +358,11 @@ impl UdpRuntime {
         }
         Poll::Ready(
             if state.quarantined
-                || state.outcome.as_ref().is_some_and(|outcome| {
-                    outcome.quarantined || outcome.children_started != outcome.children_joined
-                })
+                || self.native.get().is_some_and(|n| n.meter.is_quarantined())
+                || state
+                    .outcome
+                    .as_ref()
+                    .is_some_and(|o| o.quarantined || o.children_started != o.children_joined)
             {
                 UdpShutdownState::Quarantined
             } else {
@@ -284,6 +384,17 @@ pub(crate) enum UdpShutdownState {
 pub(crate) struct UdpShutdown(Arc<UdpRuntime>);
 
 impl UdpShutdown {
+    pub(in crate::tuic) fn settled_for_rebuild(&self) -> bool {
+        let state = self.0.state();
+        !state.quarantined
+            && state.subtree_joined
+            && state.task.is_none()
+            && state
+                .outcome
+                .as_ref()
+                .is_some_and(|o| !o.quarantined && o.children_started == o.children_joined)
+    }
+
     // The unique node token transfers bounded error facts to the parent ledger.
     pub(super) fn take_node_failure(&mut self) -> (Option<RetainedFailure>, u64) {
         let mut state = self.0.state();
@@ -294,15 +405,33 @@ impl UdpShutdown {
             )
         })
     }
+    pub(super) fn retire_native(&self, monitored: bool) -> bool {
+        self.0.retire_native(monitored)
+    }
+    pub(super) fn runtime(&self) -> Arc<UdpRuntime> {
+        self.0.clone()
+    }
+    pub(super) fn native_enabled(&self) -> bool {
+        self.0.native_enabled()
+    }
+    pub(super) fn prepare_monitor_join(
+        &self,
+        task: JoinHandle<()>,
+    ) -> Result<impl Future<Output = bool> + '_, JoinHandle<()>> {
+        self.0.prepare_monitor_join(task)
+    }
     pub(crate) fn request_stop(&self) {
         self.0.request_stop();
     }
 
     pub(crate) async fn observe_shutdown(&mut self) -> UdpShutdownState {
         let deadline = self.0.request_stop();
+        if self.0.native.get().is_some_and(|n| n.clock().is_some()) {
+            return self.0.native_join(Some(deadline)).await;
+        }
         tokio::select! {
             biased;
-            state = std::future::poll_fn(|cx| self.0.poll_join(cx)) => state,
+            state = std::future::poll_fn(|cx| self.0.poll_join(cx, None)) => state,
             _ = async {
                 if tokio::time::Instant::now() < deadline {
                     tokio::time::sleep_until(deadline).await;
@@ -313,7 +442,10 @@ impl UdpShutdown {
 
     pub(crate) async fn drive_shutdown(&mut self) -> UdpShutdownState {
         self.request_stop();
-        std::future::poll_fn(|cx| self.0.poll_join(cx)).await
+        if self.0.native.get().is_some_and(|n| n.clock().is_some()) {
+            return self.0.native_join(None).await;
+        }
+        std::future::poll_fn(|cx| self.0.poll_join(cx, None)).await
     }
 
     pub(crate) async fn finish(&mut self) {
@@ -329,9 +461,28 @@ impl UdpShutdown {
     }
 }
 
+impl UdpRuntime {
+    pub(super) fn abandon_native_owner(&self) {
+        let Some(native) = self.native.get() else {
+            return;
+        };
+        let Some(clock) = native.clock() else {
+            return;
+        }; // real retired stock
+        self.tighten_deadline();
+        // Seal before waking any actor; DATA/observer Arcs cannot replace root.
+        clock.quarantine();
+        native.meter.quarantine();
+        self.generation.freeze(self.generation.epoch());
+        self.generation.changed.notify_waiters();
+        self.publish_stop();
+    }
+}
 impl Drop for UdpShutdown {
     fn drop(&mut self) {
-        self.request_stop();
+        self.0.abandon_native_owner();
+        self.0.tighten_deadline();
+        self.0.publish_stop();
     }
 }
 
@@ -357,9 +508,29 @@ impl DownlinkSender {
             Self::Typed(tx) => tx.closed().await,
         }
     }
-    async fn send(&self, epoch: u64, bytes: Vec<u8>) -> Result<(), ()> {
+    async fn send_legacy(
+        &self,
+        epoch: u64,
+        bytes: Vec<u8>,
+    ) -> Result<(), crate::shared::bounded_channel::ReserveError> {
         match self {
-            Self::Raw(tx) => tx.send(bytes).await.map_err(|_| ()),
+            Self::Raw(tx) => tx
+                .send(bytes)
+                .await
+                .map_err(|_| crate::shared::bounded_channel::ReserveError::Closed),
+            Self::Typed(tx) => tx.send_legacy(epoch, bytes).await,
+        }
+    }
+    async fn send(
+        &self,
+        epoch: u64,
+        bytes: Bytes,
+    ) -> Result<(), crate::shared::bounded_channel::ReserveError> {
+        match self {
+            Self::Raw(tx) => tx
+                .send(bytes.to_vec())
+                .await
+                .map_err(|_| crate::shared::bounded_channel::ReserveError::Closed),
             Self::Typed(tx) => tx.send(epoch, bytes).await,
         }
     }
@@ -434,7 +605,13 @@ async fn guarded_udp_child(work: impl Future<Output = ()>, runtime: Arc<UdpRunti
 async fn drive_udp(upstream: Arc<TuicUpstream>, sender: DownlinkSender) -> UdpOutcome {
     let mut children = JoinSet::new();
     let mut outcome = UdpOutcome::default();
-    let mut body = Box::pin(udp_body(&upstream, &sender, &mut children, &mut outcome));
+    let mut body = Box::pin(udp_body(
+        &upstream,
+        &sender,
+        &mut children,
+        &mut outcome,
+        None,
+    ));
     let result = std::future::poll_fn(|cx| {
         match catch_unwind(AssertUnwindSafe(|| body.as_mut().poll(cx))) {
             Ok(Poll::Pending) => Poll::Pending,
@@ -457,7 +634,7 @@ async fn drive_udp(upstream: Arc<TuicUpstream>, sender: DownlinkSender) -> UdpOu
         .blocked_send
         .store(false, Ordering::Relaxed);
     while let Some(child) = children.join_next().await {
-        outcome.child(child, &upstream.udp_runtime);
+        outcome.child(child, &upstream.udp_runtime, None);
     }
     outcome
 }
@@ -468,13 +645,34 @@ enum UdpTurn {
     Stop,
 }
 
+impl UdpRuntime {
+    fn heartbeat(&self, conn: &Connection) -> UdpTurn {
+        match udp_send::send_heartbeat(conn) {
+            Ok(()) => UdpTurn::Continue,
+            Err(quinn::SendDatagramError::Admission { error, .. }) => {
+                self.uplink_error(error);
+                match error {
+                    bytes::MeteredCopyError::BudgetFull | bytes::MeteredCopyError::TooLarge => UdpTurn::Continue,
+                    _ => UdpTurn::Stop,
+                }
+            }
+            Err(_) => UdpTurn::Disconnected,
+        }
+    }
+}
+
 async fn udp_body(
     me: &Arc<TuicUpstream>,
     downlink_tx: &DownlinkSender,
     children: &mut JoinSet<UdpOutcome>,
     outcome: &mut UdpOutcome,
+    guard: Option<&crate::owned_upstream::generation::callbacks::Guard>,
 ) {
-    let mut stop = me.udp_runtime.stop.subscribe();
+    let mut stop = native::Owned::new(
+        me.udp_runtime.stop.subscribe(),
+        guard,
+        native::Field::Source3,
+    );
     let mut attempt: u32 = 0;
     'driver: loop {
         if *stop.borrow() || downlink_tx.is_closed() {
@@ -502,12 +700,21 @@ async fn udp_body(
                 continue;
             }
         };
-        let mut hb = tokio::time::interval(Duration::from_secs(TUIC_HEARTBEAT_SECS));
+        let conn = native::Owned::new(conn, guard, native::Field::Source4);
+        let mut hb = native::Owned::new(
+            tokio::time::interval(Duration::from_secs(TUIC_HEARTBEAT_SECS)),
+            guard,
+            native::Field::Source5,
+        );
         hb.tick().await;
-        let mut stats = tokio::time::interval(Duration::from_secs(UDP_STATS_LOG_SECS));
+        let mut stats = native::Owned::new(
+            tokio::time::interval(Duration::from_secs(UDP_STATS_LOG_SECS)),
+            guard,
+            native::Field::Source6,
+        );
         stats.tick().await;
         let mut prev_pressured = false;
-        let mut work_stop = stop.clone();
+        let mut work_stop = native::Owned::new((*stop).clone(), guard, native::Field::Source7);
         loop {
             let turn = tokio::select! {
                 biased;
@@ -517,14 +724,14 @@ async fn udp_body(
                 turn = async {
                     tokio::select! {
                 child = children.join_next(), if !children.is_empty() => {
-                    if let Some(child) = child { outcome.child(child, &me.udp_runtime); }
+                    if let Some(child) = child { outcome.child(child, &me.udp_runtime, guard); }
                     if outcome.quarantined { return UdpTurn::Stop; }
                 }
                 dg = conn.read_datagram() => {
                     let Ok(bytes) = dg else { return UdpTurn::Disconnected; };
                     #[cfg(test)]
                     me.udp_runtime.blocked_send.store(true, Ordering::Relaxed);
-                    let send = downlink_tx.send(epoch, bytes.to_vec());
+                    let send = downlink_tx.send(epoch, bytes);
                     tokio::pin!(send);
                     loop {
                         tokio::select! {
@@ -533,11 +740,16 @@ async fn udp_body(
                             _ = me.udp_runtime.generation.wait_frozen(epoch), if me.udp_runtime.node_owned() => return UdpTurn::Disconnected,
                             _ = conn.closed(), if me.udp_runtime.node_owned() => return UdpTurn::Disconnected,
                             child = children.join_next(), if !children.is_empty() => {
-                                if let Some(child) = child { outcome.child(child, &me.udp_runtime); }
+                                if let Some(child) = child { outcome.child(child, &me.udp_runtime, guard); }
                                 if outcome.quarantined { return UdpTurn::Stop; }
                             }
                             sent = &mut send => {
-                                if sent.is_err() { return UdpTurn::Stop; }
+                                if let Err(reason) = sent {
+                                    if reason == crate::shared::bounded_channel::ReserveError::Capacity {
+                                        me.udp_runtime.callback_error(crate::owned_upstream::generation::callbacks::CallbackError::Capacity);
+                                    }
+                                    return UdpTurn::Stop;
+                                }
                                 break;
                             }
                         }
@@ -551,6 +763,14 @@ async fn udp_body(
                         me.metrics.inc_udp_drops_down();
                         return UdpTurn::Continue;
                     }
+                    #[cfg(test)]
+                    let parent_fault = me.udp_runtime.fault.load(Ordering::Relaxed);
+                    if me.udp_runtime.native.get().is_some() {
+                        match native::child(me, downlink_tx.clone(), recv, epoch) {
+                            Ok(child) => { children.spawn(child); },
+                            Err(error) => { me.udp_runtime.callback_error(error); return UdpTurn::Stop; }
+                        }
+                    } else {
                     let tx = downlink_tx.clone();
                     let metrics = Arc::clone(&me.metrics);
                     let mut child_stop = work_stop.clone();
@@ -579,16 +799,17 @@ async fn udp_body(
                                 biased;
                                 _ = stopped(&mut child_stop) => {},
                                 _ = generation.wait_frozen(epoch), if owned => {},
-                                _ = tx.send(epoch, packet) => {},
+                                _ = tx.send_legacy(epoch, packet) => {},
                             }
                         } else { metrics.inc_udp_drops_down(); }
                     }, child_runtime));
+                    }
                     outcome.children_started = outcome.children_started.saturating_add(1);
                     outcome.children_peak = outcome.children_peak.max(children.len());
                     #[cfg(test)]
                     me.udp_runtime.child_count.fetch_add(1, Ordering::Relaxed);
                     #[cfg(test)]
-                    if fault == 1 { panic!("injected UDP parent panic with a live child"); }
+                    if parent_fault == 1 { panic!("injected UDP parent panic with a live child"); }
                 }
                 _ = stats.tick() => {
                     let fb = me.udp_stream_fallbacks.load(Ordering::Relaxed);
@@ -614,8 +835,9 @@ async fn udp_body(
                 _ = hb.tick() => {
                     let now = me.clock.elapsed().as_secs();
                     let last = me.last_udp_activity.load(Ordering::Relaxed);
-                    if should_send_heartbeat(last, now, TUIC_HB_IDLE_WINDOW_SECS)
-                        && conn.send_datagram(encode_heartbeat().into()).is_err() { return UdpTurn::Disconnected; }
+                    if should_send_heartbeat(last, now, TUIC_HB_IDLE_WINDOW_SECS) {
+                        return me.udp_runtime.heartbeat(&conn);
+                    }
                 }
                     }
                     UdpTurn::Continue
@@ -637,7 +859,7 @@ async fn udp_body(
             }
             drop(conn);
             while let Some(child) = children.join_next().await {
-                outcome.child(child, &me.udp_runtime);
+                outcome.child(child, &me.udp_runtime, guard);
             }
             if outcome.quarantined {
                 return;
@@ -660,7 +882,8 @@ impl TuicUpstream {
     pub fn start_udp(self: &Arc<Self>) -> mpsc::Receiver<Vec<u8>> {
         let (sender, receiver) = mpsc::channel(TUIC_DOWNLINK_CAPACITY);
         let mut state = self.udp_runtime.state();
-        if state.started
+        if self.udp_runtime.native.get().is_some()
+            || state.started
             || *self.udp_runtime.stop.borrow()
             || self
                 .udp_runtime
@@ -691,14 +914,28 @@ impl TuicUpstream {
         if state.started || *self.udp_runtime.stop.borrow() || control.frozen(control.epoch()) {
             return Err(io_err("UDP source", "already started, frozen or stopped"));
         }
-        let (sender, source) =
-            crate::owned_upstream::generation::channel(control.clone(), TUIC_DOWNLINK_CAPACITY);
+        let (source, task) = if let Some(native) = self.udp_runtime.native.get() {
+            let lease = native
+                .acquire(crate::owned_upstream::generation::callbacks::Role::Parent)
+                .map_err(|error| io_err("UDP parent", &format!("{error:?}")))?;
+            let (sender, source, tasks) = native
+                .take_prepared()
+                .ok_or_else(|| io_err("UDP source", "cold inventory unavailable"))?;
+            (
+                source,
+                tokio::spawn(native::start(self.clone(), sender, tasks, lease)),
+            )
+        } else {
+            let (sender, source) =
+                crate::owned_upstream::generation::channel(control.clone(), TUIC_DOWNLINK_CAPACITY);
+            (
+                source,
+                tokio::spawn(drive_udp(self.clone(), DownlinkSender::Typed(sender))),
+            )
+        };
         state.started = true;
         state.typed = true;
-        state.task = Some(tokio::spawn(drive_udp(
-            self.clone(),
-            DownlinkSender::Typed(sender),
-        )));
+        state.task = Some(task);
         drop(state);
         self.start_endpoint_recovery_monitor();
         Ok(source)
@@ -723,142 +960,183 @@ impl TuicUpstream {
             return;
         }
 
-        let weak = Arc::downgrade(self);
-        let mut stop = self.udp_runtime.stop.subscribe();
+        let mut lease = if let Some(native) = self.udp_runtime.native.get() {
+            match native.acquire(crate::owned_upstream::generation::callbacks::Role::Monitor) {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    self.udp_runtime.callback_error(error);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let guard = lease.as_ref().map(|lease| lease.guard());
+        let weak = native::Owned::new(Arc::downgrade(self), guard.as_ref(), native::Field::Source0);
+        let mut stop = native::Owned::new(
+            self.udp_runtime.stop.subscribe(),
+            guard.as_ref(),
+            native::Field::Source1,
+        );
         let spawn = || {
             tokio::spawn(async move {
-                let mut state = EndpointRecoveryState::default();
-                let mut evidence_observer =
-                    tcp_diag_enabled().then(RecoveryEvidenceObserver::default);
-                let mut last_tcp_pool_activity = None;
-                let mut tick = tokio::time::interval(ENDPOINT_RECOVERY_SAMPLE_INTERVAL);
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = stopped(&mut stop) => return,
-                        _ = tick.tick() => {}
-                    }
-                    let Some(upstream) = weak.upgrade() else {
-                        return;
-                    };
-                    if let Some(owner) = upstream
-                        .udp_runtime
-                        .owner
-                        .get()
-                        .and_then(std::sync::Weak::upgrade)
-                    {
-                        owner.wake_recovery();
-                    }
-                    let Some(input) = upstream.endpoint_recovery_input() else {
-                        continue;
-                    };
-                    if let Some(active_leases) = note_tcp_pool_activity_transition(
-                        &mut last_tcp_pool_activity,
-                        input.active_tcp,
-                    ) {
-                        println!("🔎 tuic-tcp-pool-activity active_leases={active_leases}");
-                    }
-                    let now = Instant::now();
-                    if let Some(observer) = evidence_observer.as_mut() {
-                        for event in observer.observe(now, &input) {
-                            log_recovery_evidence(event);
+                let mut work = Some(async {
+                    let mut state = EndpointRecoveryState::default();
+                    let mut evidence_observer =
+                        tcp_diag_enabled().then(RecoveryEvidenceObserver::default);
+                    let mut last_tcp_pool_activity = None;
+                    let mut tick = native::Owned::new(
+                        tokio::time::interval(ENDPOINT_RECOVERY_SAMPLE_INTERVAL),
+                        guard.as_ref(),
+                        native::Field::Source2,
+                    );
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = stopped(&mut stop) => return,
+                            _ = tick.tick() => {}
                         }
-                    }
-                    if *stop.borrow() {
-                        return;
-                    }
-                    match state.observe(now, &input) {
-                        EndpointRecoveryAction::None => {}
-                        EndpointRecoveryAction::Recovered {
-                            generation,
-                            socket_generation,
-                            recovery_time,
-                            connection_count,
-                        } => {
-                            println!(
-                                "✅ tuic-endpoint-rebind-recovered generation={generation} first_rx_ms={} socket_generation={socket_generation} connections={connection_count}",
-                                recovery_time.as_millis(),
-                            );
+                        let Some(upstream) = weak.upgrade() else {
+                            return;
+                        };
+                        let upstream =
+                            native::Owned::new(upstream, guard.as_ref(), native::Field::Source3);
+                        if let Some(owner) = upstream
+                            .udp_runtime
+                            .owner
+                            .get()
+                            .and_then(std::sync::Weak::upgrade)
+                        {
+                            let owner =
+                                native::Owned::new(owner, guard.as_ref(), native::Field::Source4);
+                            owner.wake_recovery();
                         }
-                        EndpointRecoveryAction::Rebind {
-                            generation,
-                            trigger,
-                            stalled_for,
-                            stall_bound,
-                            tx_bytes_since_rx,
-                            max_rtt,
-                        } => {
-                            let (
-                                write_conn,
-                                write_writer,
-                                write_stream,
-                                write_episode,
-                                write_acknowledged_bytes,
-                                write_pending_ms,
-                            ) = trigger.tcp_write_fields();
-                            let (
-                                read_conn,
-                                read_reader,
-                                read_stream,
-                                read_episode,
-                                read_offset,
-                                read_next_offset,
-                                read_highest_offset,
-                                read_buffered_bytes,
-                                read_gap_bytes,
-                                read_observations,
-                            ) = trigger.tcp_read_fields();
-                            match quic::rebind_client_endpoint_udp_socket(
-                                &upstream.endpoint,
-                                upstream.udp_send_service_policy,
-                                upstream.udp_send_service_stats.as_ref(),
-                            ) {
-                                Ok(rebound) => {
-                                    state.note_rebind_succeeded(now, rebound.rebind_generation);
-                                    println!(
-                                        "🔄 tuic-endpoint-rebind generation={generation} trigger={} write_conn={} write_writer={} write_stream={} write_episode={} write_acknowledged={}B write_pending_ms={} read_conn={read_conn} read_reader={read_reader} read_stream={read_stream} read_episode={read_episode} read_offset={read_offset} read_next_offset={read_next_offset} read_highest_offset={read_highest_offset} read_buffered={read_buffered_bytes}B read_gap={read_gap_bytes}B read_observations={read_observations} old_local={} new_local={} socket_generation={} active_tcp={} udp_active={} live_connections={} stalled_ms={} bound_ms={} tx_since_rx={}B max_rtt_ms={}",
-                                        trigger.label(),
-                                        write_conn,
-                                        write_writer,
-                                        write_stream,
-                                        write_episode,
-                                        write_acknowledged_bytes,
-                                        write_pending_ms,
-                                        rebound.old_local_addr,
-                                        rebound.new_local_addr,
-                                        rebound.rebind_generation,
-                                        input.active_tcp,
-                                        input.udp_active,
-                                        input.connections.len(),
-                                        stalled_for.as_millis(),
-                                        stall_bound.as_millis(),
-                                        tx_bytes_since_rx,
-                                        max_rtt.as_millis(),
-                                    );
-                                }
-                                Err(error) => {
-                                    println!(
-                                        "⚠️ tuic-endpoint-rebind-failed generation={generation} trigger={} write_conn={} write_writer={} write_stream={} write_episode={} write_acknowledged={}B write_pending_ms={} read_conn={read_conn} read_reader={read_reader} read_stream={read_stream} read_episode={read_episode} read_offset={read_offset} read_next_offset={read_next_offset} read_highest_offset={read_highest_offset} read_buffered={read_buffered_bytes}B read_gap={read_gap_bytes}B read_observations={read_observations} active_tcp={} udp_active={} live_connections={} stalled_ms={} bound_ms={} tx_since_rx={}B max_rtt_ms={} error={error}",
-                                        trigger.label(),
-                                        write_conn,
-                                        write_writer,
-                                        write_stream,
-                                        write_episode,
-                                        write_acknowledged_bytes,
-                                        write_pending_ms,
-                                        input.active_tcp,
-                                        input.udp_active,
-                                        input.connections.len(),
-                                        stalled_for.as_millis(),
-                                        stall_bound.as_millis(),
-                                        tx_bytes_since_rx,
-                                        max_rtt.as_millis(),
-                                    );
+                        // D12: Proto receive Full failstops only that connection.
+                        upstream.failstop_admission_refused();
+                        let Some(input) = upstream.endpoint_recovery_input() else {
+                            continue;
+                        };
+                        if let Some(active_leases) = note_tcp_pool_activity_transition(
+                            &mut last_tcp_pool_activity,
+                            input.active_tcp,
+                        ) {
+                            println!("🔎 tuic-tcp-pool-activity active_leases={active_leases}");
+                        }
+                        let now = Instant::now();
+                        if let Some(observer) = evidence_observer.as_mut() {
+                            for event in observer.observe(now, &input) {
+                                log_recovery_evidence(event);
+                            }
+                        }
+                        if *stop.borrow() {
+                            return;
+                        }
+                        match state.observe(now, &input) {
+                            EndpointRecoveryAction::None => {}
+                            EndpointRecoveryAction::Recovered {
+                                generation,
+                                socket_generation,
+                                recovery_time,
+                                connection_count,
+                            } => {
+                                println!(
+                                    "✅ tuic-endpoint-rebind-recovered generation={generation} first_rx_ms={} socket_generation={socket_generation} connections={connection_count}",
+                                    recovery_time.as_millis(),
+                                );
+                            }
+                            EndpointRecoveryAction::Rebind {
+                                generation,
+                                trigger,
+                                stalled_for,
+                                stall_bound,
+                                tx_bytes_since_rx,
+                                max_rtt,
+                            } => {
+                                let (
+                                    write_conn,
+                                    write_writer,
+                                    write_stream,
+                                    write_episode,
+                                    write_acknowledged_bytes,
+                                    write_pending_ms,
+                                ) = trigger.tcp_write_fields();
+                                let (
+                                    read_conn,
+                                    read_reader,
+                                    read_stream,
+                                    read_episode,
+                                    read_offset,
+                                    read_next_offset,
+                                    read_highest_offset,
+                                    read_buffered_bytes,
+                                    read_gap_bytes,
+                                    read_observations,
+                                ) = trigger.tcp_read_fields();
+                                match quic::rebind_client_endpoint_udp_socket(
+                                    &upstream.endpoint,
+                                    upstream.udp_send_service_policy,
+                                    upstream.udp_send_service_stats.as_ref(),
+                                ) {
+                                    Ok(rebound) => {
+                                        state.note_rebind_succeeded(now, rebound.rebind_generation);
+                                        println!(
+                                            "🔄 tuic-endpoint-rebind generation={generation} trigger={} write_conn={} write_writer={} write_stream={} write_episode={} write_acknowledged={}B write_pending_ms={} read_conn={read_conn} read_reader={read_reader} read_stream={read_stream} read_episode={read_episode} read_offset={read_offset} read_next_offset={read_next_offset} read_highest_offset={read_highest_offset} read_buffered={read_buffered_bytes}B read_gap={read_gap_bytes}B read_observations={read_observations} old_local={} new_local={} socket_generation={} active_tcp={} udp_active={} live_connections={} stalled_ms={} bound_ms={} tx_since_rx={}B max_rtt_ms={}",
+                                            trigger.label(),
+                                            write_conn,
+                                            write_writer,
+                                            write_stream,
+                                            write_episode,
+                                            write_acknowledged_bytes,
+                                            write_pending_ms,
+                                            rebound.old_local_addr,
+                                            rebound.new_local_addr,
+                                            rebound.rebind_generation,
+                                            input.active_tcp,
+                                            input.udp_active,
+                                            input.connections.len(),
+                                            stalled_for.as_millis(),
+                                            stall_bound.as_millis(),
+                                            tx_bytes_since_rx,
+                                            max_rtt.as_millis(),
+                                        );
+                                    }
+                                    Err(error) => {
+                                        println!(
+                                            "⚠️ tuic-endpoint-rebind-failed generation={generation} trigger={} write_conn={} write_writer={} write_stream={} write_episode={} write_acknowledged={}B write_pending_ms={} read_conn={read_conn} read_reader={read_reader} read_stream={read_stream} read_episode={read_episode} read_offset={read_offset} read_next_offset={read_next_offset} read_highest_offset={read_highest_offset} read_buffered={read_buffered_bytes}B read_gap={read_gap_bytes}B read_observations={read_observations} active_tcp={} udp_active={} live_connections={} stalled_ms={} bound_ms={} tx_since_rx={}B max_rtt_ms={} error={error}",
+                                            trigger.label(),
+                                            write_conn,
+                                            write_writer,
+                                            write_stream,
+                                            write_episode,
+                                            write_acknowledged_bytes,
+                                            write_pending_ms,
+                                            input.active_tcp,
+                                            input.udp_active,
+                                            input.connections.len(),
+                                            stalled_for.as_millis(),
+                                            stall_bound.as_millis(),
+                                            tx_bytes_since_rx,
+                                            max_rtt.as_millis(),
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
+                });
+                if let Some(lease) = lease.as_mut() {
+                    let _ = match lease.run(&mut work) {
+                        Ok(work) => work.await.map(|_| ()),
+                        Err(error) => Err(
+                            crate::owned_upstream::generation::callbacks::CallbackFailure {
+                                output: None,
+                                error,
+                            },
+                        ),
+                    };
+                } else if let Some(work) = work.take() {
+                    work.await;
                 }
             })
         };
@@ -1025,3 +1303,5 @@ impl Drop for TuicUpstream {
 
 #[cfg(test)]
 mod tests;
+
+mod native;

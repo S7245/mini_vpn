@@ -53,7 +53,7 @@ fn ready_custody(owner: &SessionControl) -> (FrozenReady, tokio::time::Instant) 
             deadline: slot.deadline,
             open_deadline: flow.open_deadline,
             view,
-            escrow: flow.escrow.clone(),
+            escrow: flow.escrow.to_vec(),
         },
         probe,
     )

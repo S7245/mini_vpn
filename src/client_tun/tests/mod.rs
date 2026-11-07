@@ -1,4 +1,5 @@
 use super::*;
+mod native_permit_owner;
 use crate::dns;
 use crate::upstream::NativeTcpReader;
 use compatibility_lifecycle::{DnsInjectRecorder, NoopTestUpstream};
@@ -1907,8 +1908,8 @@ async fn relay_full_duplex_idle_survives_legacy_timeout() {
     let stream: RelayStream = Box::new(IdleStream {
         shutdown_called: flag.clone(),
     });
-    let (tx, rx) = mpsc::channel::<RelayCommand>(8);
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (tx, rx) = crate::client_tun::uplink::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
     let (_credit_tx, credit_rx) = relay_read_credit_channel();
     let task = tokio::spawn(run_relay(handle, 7, stream, rx, back_tx, credit_rx));
 
@@ -1947,7 +1948,7 @@ async fn relay_full_duplex_idle_survives_legacy_timeout() {
 
 #[test]
 fn coalesced_relay_payload_preserves_finish_order() {
-    let (tx, mut rx) = mpsc::channel(4);
+    let (tx, mut rx) = crate::client_tun::uplink::channel(4);
     tx.try_send(RelayCommand::Data(b"two".to_vec())).unwrap();
     tx.try_send(RelayCommand::Finish).unwrap();
 
@@ -1967,7 +1968,7 @@ fn coalesced_relay_payload_preserves_finish_order() {
 
 #[test]
 fn coalesced_relay_payload_defers_data_that_would_exceed_cap() {
-    let (tx, mut rx) = mpsc::channel(4);
+    let (tx, mut rx) = crate::client_tun::uplink::channel(4);
     tx.try_send(RelayCommand::Data(vec![2; 2])).unwrap();
 
     let coalesced = coalesce_relay_payload(vec![1; RELAY_WRITER_COALESCE_MAX_BYTES - 1], &mut rx);
@@ -1992,14 +1993,14 @@ async fn relay_writer_coalesces_queued_data_before_single_write() {
         shutdown_called: shutdown_called.clone(),
         writes: writes.clone(),
     });
-    let (tx, rx) = mpsc::channel::<RelayCommand>(8);
+    let (tx, rx) = crate::client_tun::uplink::channel(8);
     tx.send(RelayCommand::Data(b"one".to_vec())).await.unwrap();
     tx.send(RelayCommand::Data(b"two".to_vec())).await.unwrap();
     tx.send(RelayCommand::Data(b"three".to_vec()))
         .await
         .unwrap();
     drop(tx);
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
     let (_credit_tx, credit_rx) = relay_read_credit_channel();
 
     let task = tokio::spawn(run_relay(handle, 41, stream, rx, back_tx, credit_rx));
@@ -2043,8 +2044,8 @@ async fn relay_writer_flushes_payload_to_release_remote_response() {
         writes: writes.clone(),
         read_sent: false,
     });
-    let (tx, rx) = mpsc::channel::<RelayCommand>(8);
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (tx, rx) = crate::client_tun::uplink::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
     let (_credit_tx, credit_rx) = relay_read_credit_channel();
     let task = tokio::spawn(run_relay(handle, 43, stream, rx, back_tx, credit_rx));
 
@@ -2155,8 +2156,8 @@ async fn continuous_relay_reader_ignores_read_credit_pause_until_byte_queue_full
         chunks: std::collections::VecDeque::from([b"after-paused-credit".to_vec()]),
         eof_after_chunks: true,
     });
-    let (_tx, rx) = mpsc::channel::<RelayCommand>(8);
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (_tx, rx) = crate::client_tun::uplink::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
     let (_credit_tx, credit_rx) = watch::channel(RelayReadCredit {
         paused: true,
         max_batch_bytes: 0,
@@ -2291,9 +2292,9 @@ fn native_tcp_chunk_assembler_waits_for_gap_then_drains_contiguous_prefix() {
     assembler.push_chunk(NativeTcpChunk {
         offset: 4,
         bytes: Bytes::from_static(b"efgh"),
-    });
+    }).unwrap();
     assert!(
-        assembler.drain_ordered_up_to(8).is_none(),
+        assembler.drain_ordered_up_to(8).unwrap().is_none(),
         "out-of-order bytes must not cross the missing prefix"
     );
     assert_eq!(assembler.buffered_bytes(), 4);
@@ -2301,8 +2302,8 @@ fn native_tcp_chunk_assembler_waits_for_gap_then_drains_contiguous_prefix() {
     assembler.push_chunk(NativeTcpChunk {
         offset: 0,
         bytes: Bytes::from_static(b"abcd"),
-    });
-    let drained = assembler.drain_ordered_up_to(8).unwrap();
+    }).unwrap();
+    let drained = assembler.drain_ordered_up_to(8).unwrap().unwrap();
     assert_eq!(&drained[..], b"abcdefgh");
     assert_eq!(assembler.buffered_bytes(), 0);
 }
@@ -2314,16 +2315,16 @@ fn native_tcp_chunk_assembler_keeps_remainder_and_ignores_duplicates() {
     assembler.push_chunk(NativeTcpChunk {
         offset: 0,
         bytes: Bytes::from_static(b"abcdef"),
-    });
-    let first = assembler.drain_ordered_up_to(3).unwrap();
+    }).unwrap();
+    let first = assembler.drain_ordered_up_to(3).unwrap().unwrap();
     assert_eq!(&first[..], b"abc");
     assert_eq!(assembler.buffered_bytes(), 3);
 
     assembler.push_chunk(NativeTcpChunk {
         offset: 0,
         bytes: Bytes::from_static(b"abcdef"),
-    });
-    let second = assembler.drain_ordered_up_to(16).unwrap();
+    }).unwrap();
+    let second = assembler.drain_ordered_up_to(16).unwrap().unwrap();
     assert_eq!(&second[..], b"def");
     assert_eq!(assembler.buffered_bytes(), 0);
 }
@@ -2436,7 +2437,7 @@ async fn downlink_pending_releases_downstream_permits_on_admission_and_clear() {
     let (bytes, permit) = leased.into_parts();
 
     let mut ctx = SocketCtx::new(12345);
-    ctx.append_downlink_pending_with_permit(bytes.as_ref(), Some(permit));
+    ctx.append_downlink_pending_with_permit(bytes.as_ref(), &mut Some(permit));
     assert_eq!(ctx.downlink_pending.len(), 64 * 1024);
     assert_eq!(queue.snapshot().await.leased_bytes, 64 * 1024);
 
@@ -2461,7 +2462,7 @@ async fn d6_downlink_admission_retains_permit_until_egress_drain() {
     let (bytes, permit) = leased.into_parts();
 
     let mut ctx = SocketCtx::new(12345);
-    ctx.append_downlink_pending_with_permit(bytes.as_ref(), Some(permit));
+    ctx.append_downlink_pending_with_permit(bytes.as_ref(), &mut Some(permit));
     assert_eq!(ctx.downlink_pending.len(), 64 * 1024);
     assert_eq!(ctx.downlink_inflight_permit_bytes(), 0);
     assert_eq!(queue.snapshot().await.leased_bytes, 64 * 1024);
@@ -2491,84 +2492,7 @@ async fn d6_downlink_admission_retains_permit_until_egress_drain() {
 
 #[tokio::test]
 async fn d6_flushed_tcp_payload_releases_matching_flow_permit() {
-    let mut device = DnsInjectRecorder::default();
-    let mut iface = Interface::new(
-        SmolConfig::new(smoltcp::wire::HardwareAddress::Ip),
-        &mut device,
-        smoltcp::time::Instant::now(),
-    );
-    iface.update_ip_addrs(|addrs| {
-        addrs
-            .push(IpCidr::new(IpAddress::v4(10, 0, 0, 2), 24))
-            .unwrap();
-    });
-
-    let mut tcp_socket = TcpSocket::new(
-        TcpSocketBuffer::new(vec![0; 64 * 1024]),
-        TcpSocketBuffer::new(vec![0; 64 * 1024]),
-    );
-    configure_local_tcp_socket(&mut tcp_socket);
-    tcp_socket
-        .connect(
-            iface.context(),
-            IpEndpoint::new(IpAddress::v4(10, 0, 0, 2), 53124),
-            IpEndpoint::new(IpAddress::v4(203, 0, 113, 9), 443),
-        )
-        .unwrap();
-    let mut sockets = SocketSet::new(vec![]);
-    let handle = sockets.add(tcp_socket);
-
-    let queue = AsyncLeasedByteFlowQueue::new_with_release_mode(
-        128 * 1024,
-        DownstreamPermitReleaseMode::OnEgressDrain,
-    )
-    .unwrap();
-    queue.push(Bytes::from(vec![1; 64 * 1024])).await.unwrap();
-    let leased = queue.recv_up_to(64 * 1024).await.unwrap();
-    let (bytes, permit) = leased.into_parts();
-
-    let mut ctx = SocketCtx::new(443);
-    ctx.append_downlink_pending_with_permit(bytes.as_ref(), Some(permit));
-    ctx.admit_downlink_pending_prefix(16 * 1024);
-    assert_eq!(ctx.downlink_inflight_permit_bytes(), 16 * 1024);
-    let mut ctxs = HashMap::from([(handle, ctx)]);
-
-    let release = release_downlink_inflight_permits_for_flushed_tcp_packets(
-        vec![TunFlushedTcpPacket {
-            src_addr: Ipv4Addr::new(203, 0, 113, 9),
-            dst_addr: Ipv4Addr::new(10, 0, 0, 2),
-            src_port: 443,
-            dst_port: 53124,
-            payload_bytes: 1200,
-        }],
-        &sockets,
-        &mut ctxs,
-    );
-
-    assert_eq!(release.flushed_tcp_payload_bytes, 1200);
-    assert_eq!(release.released_inflight_permit_bytes, 1200);
-    assert_eq!(
-        ctxs.get(&handle).unwrap().downlink_inflight_permit_bytes(),
-        16 * 1024 - 1200
-    );
-    assert_eq!(queue.snapshot().await.leased_bytes, 64 * 1024 - 1200);
-
-    let release = release_downlink_inflight_permits_for_flushed_tcp_packets(
-        vec![TunFlushedTcpPacket {
-            src_addr: Ipv4Addr::new(203, 0, 113, 9),
-            dst_addr: Ipv4Addr::new(10, 0, 0, 99),
-            src_port: 443,
-            dst_port: 53124,
-            payload_bytes: 1200,
-        }],
-        &sockets,
-        &mut ctxs,
-    );
-    assert_eq!(release.flushed_tcp_payload_bytes, 1200);
-    assert_eq!(
-        release.released_inflight_permit_bytes, 0,
-        "non-matching packet summaries must not release another flow's permit"
-    );
+    local_egress_service::matching_flow_only().await;
 }
 
 #[tokio::test]
@@ -2583,8 +2507,8 @@ async fn permit_relay_reader_rearms_only_after_downstream_permit_release() {
             .collect(),
         eof_after_chunks: false,
     });
-    let (_tx, rx) = mpsc::channel::<RelayCommand>(8);
-    let (back_tx, mut back_rx) = mpsc::channel(256);
+    let (_tx, rx) = crate::client_tun::uplink::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(256);
     let (_credit_tx, credit_rx) = watch::channel(RelayReadCredit {
         paused: true,
         max_batch_bytes: 0,
@@ -2676,8 +2600,8 @@ async fn ordered_egress_permit_reader_respects_paused_read_credit() {
         chunks: std::collections::VecDeque::from([vec![7; chunk_len]]),
         eof_after_chunks: false,
     });
-    let (_tx, rx) = mpsc::channel::<RelayCommand>(8);
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (_tx, rx) = crate::client_tun::uplink::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
     let (credit_tx, credit_rx) = watch::channel(RelayReadCredit {
         paused: true,
         max_batch_bytes: 0,
@@ -2751,8 +2675,8 @@ async fn ordered_egress_permit_rearms_only_after_egress_permit_release() {
             .collect(),
         eof_after_chunks: false,
     });
-    let (_tx, rx) = mpsc::channel::<RelayCommand>(8);
-    let (back_tx, mut back_rx) = mpsc::channel(256);
+    let (_tx, rx) = crate::client_tun::uplink::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(256);
     let (_credit_tx, credit_rx) = watch::channel(RelayReadCredit {
         paused: false,
         max_batch_bytes: chunk_len,
@@ -2851,8 +2775,8 @@ async fn ordered_egress_permit_clamps_read_len_to_reader_buffer() {
         chunks: std::collections::VecDeque::from([vec![7; 65_536]]),
         eof_after_chunks: false,
     });
-    let (_tx, rx) = mpsc::channel::<RelayCommand>(8);
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (_tx, rx) = crate::client_tun::uplink::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
     let (_credit_tx, credit_rx) = watch::channel(RelayReadCredit {
         paused: false,
         max_batch_bytes: queue_capacity,
@@ -2895,248 +2819,6 @@ async fn ordered_egress_permit_clamps_read_len_to_reader_buffer() {
             );
         }
         other => panic!("expected first clamped ordered permit data, got {other:?}"),
-    }
-
-    task.abort();
-    let _ = task.await;
-}
-
-#[tokio::test]
-async fn native_permit_relay_respects_paused_read_credit() {
-    let mut sockets = SocketSet::new(vec![]);
-    let handle = mk_test_handle(&mut sockets);
-    let chunk_len = 16 * 1024;
-    let queue_capacity = 128 * 1024;
-    let reader: NativeTcpReadHalf = Box::new(BurstNativeReader {
-        chunks: std::collections::VecDeque::from([NativeTcpChunk {
-            offset: 0,
-            bytes: Bytes::from(vec![7; chunk_len]),
-        }]),
-        eof_after_chunks: false,
-    });
-    let writer_shutdown = Arc::new(AtomicBool::new(false));
-    let writer: NativeTcpWriteHalf = Box::new(NoopNativeWriter {
-        shutdown_called: writer_shutdown,
-    });
-    let (_tx, rx) = mpsc::channel::<RelayCommand>(8);
-    let (back_tx, mut back_rx) = mpsc::channel(8);
-    let (credit_tx, credit_rx) = watch::channel(RelayReadCredit {
-        paused: true,
-        max_batch_bytes: 0,
-    });
-    let task = tokio::spawn(run_relay_native_permit(
-        handle,
-        94,
-        reader,
-        writer,
-        rx,
-        back_tx,
-        credit_rx,
-        queue_capacity,
-        false,
-    ));
-
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(30), back_rx.recv())
-            .await
-            .is_err(),
-        "paused native permit read credit must keep ready remote bytes unread"
-    );
-
-    credit_tx
-        .send(RelayReadCredit {
-            paused: false,
-            max_batch_bytes: chunk_len,
-        })
-        .unwrap();
-    match tokio::time::timeout(std::time::Duration::from_millis(200), back_rx.recv())
-        .await
-        .expect("remote data should arrive after native permit credit resumes")
-        .expect("relay should still be alive")
-    {
-        (
-            h,
-            RelayEvent::Data {
-                epoch,
-                bytes,
-                downstream_permit,
-                ..
-            },
-        ) => {
-            assert_eq!(h, handle);
-            assert_eq!(epoch, 94);
-            assert_eq!(bytes.len(), chunk_len);
-            assert!(downstream_permit.is_some());
-        }
-        other => panic!("expected native permit data after credit resumes, got {other:?}"),
-    }
-
-    task.abort();
-    let _ = task.await;
-}
-
-#[tokio::test]
-async fn native_permit_relay_read_floor_services_full_quantum_from_tiny_credit() {
-    let mut sockets = SocketSet::new(vec![]);
-    let handle = mk_test_handle(&mut sockets);
-    let floor = RELAY_REMOTE_DISPATCH_SEGMENT_MAX_BYTES;
-    let reader: NativeTcpReadHalf = Box::new(BurstNativeReader {
-        chunks: std::collections::VecDeque::from([NativeTcpChunk {
-            offset: 0,
-            bytes: Bytes::from(vec![7; floor]),
-        }]),
-        eof_after_chunks: false,
-    });
-    let writer_shutdown = Arc::new(AtomicBool::new(false));
-    let writer: NativeTcpWriteHalf = Box::new(NoopNativeWriter {
-        shutdown_called: writer_shutdown,
-    });
-    let (_tx, rx) = mpsc::channel::<RelayCommand>(8);
-    let (back_tx, mut back_rx) = mpsc::channel(8);
-    let (_credit_tx, credit_rx) = watch::channel(RelayReadCredit {
-        paused: false,
-        max_batch_bytes: relay_remote_read_ack_drain_floor_bytes(1200),
-    });
-    let task = tokio::spawn(run_relay_native_permit(
-        handle, 96, reader, writer, rx, back_tx, credit_rx, floor, true,
-    ));
-
-    match tokio::time::timeout(std::time::Duration::from_millis(200), back_rx.recv())
-        .await
-        .expect("native read floor should keep remote reads service-sized")
-        .expect("relay should still be alive")
-    {
-        (
-            h,
-            RelayEvent::Data {
-                epoch,
-                bytes,
-                downstream_permit,
-                ..
-            },
-        ) => {
-            assert_eq!(h, handle);
-            assert_eq!(epoch, 96);
-            assert_eq!(
-                bytes.len(),
-                floor,
-                "tiny read credit should be lifted to the service floor"
-            );
-            assert!(downstream_permit.is_some());
-        }
-        other => panic!("expected native floor data, got {other:?}"),
-    }
-
-    task.abort();
-    let _ = task.await;
-}
-
-#[tokio::test]
-async fn d6_native_permit_relay_rearms_only_after_egress_permit_release() {
-    let mut sockets = SocketSet::new(vec![]);
-    let handle = mk_test_handle(&mut sockets);
-    let chunk_len = 64 * 1024;
-    let queue_capacity = 128 * 1024;
-    let chunks = (0..((queue_capacity / chunk_len) + 4))
-        .map(|idx| NativeTcpChunk {
-            offset: (idx * chunk_len) as u64,
-            bytes: Bytes::from(vec![7; chunk_len]),
-        })
-        .collect();
-    let reader: NativeTcpReadHalf = Box::new(BurstNativeReader {
-        chunks,
-        eof_after_chunks: false,
-    });
-    let writer_shutdown = Arc::new(AtomicBool::new(false));
-    let writer: NativeTcpWriteHalf = Box::new(NoopNativeWriter {
-        shutdown_called: writer_shutdown,
-    });
-    let (_tx, rx) = mpsc::channel::<RelayCommand>(8);
-    let (back_tx, mut back_rx) = mpsc::channel(256);
-    let (_credit_tx, credit_rx) = watch::channel(RelayReadCredit {
-        paused: false,
-        max_batch_bytes: chunk_len,
-    });
-    let task = tokio::spawn(run_relay_native_permit(
-        handle,
-        95,
-        reader,
-        writer,
-        rx,
-        back_tx,
-        credit_rx,
-        queue_capacity,
-        false,
-    ));
-
-    let mut leased_payload_bytes = 0usize;
-    let mut permits = Vec::new();
-    tokio::time::timeout(std::time::Duration::from_millis(500), async {
-        while leased_payload_bytes < queue_capacity {
-            match back_rx
-                .recv()
-                .await
-                .expect("native permit pump should emit data")
-            {
-                (
-                    h,
-                    RelayEvent::Data {
-                        epoch,
-                        bytes,
-                        downstream_permit,
-                        ..
-                    },
-                ) => {
-                    assert_eq!(h, handle);
-                    assert_eq!(epoch, 95);
-                    leased_payload_bytes = leased_payload_bytes.saturating_add(bytes.len());
-                    let permit =
-                        downstream_permit.expect("native D6 data must carry downstream permit");
-                    assert_eq!(
-                        permit.release_mode(),
-                        DownstreamPermitReleaseMode::OnEgressDrain
-                    );
-                    permits.push(permit);
-                }
-                other => panic!("expected native permit data, got {other:?}"),
-            }
-        }
-    })
-    .await
-    .expect("native permit pump should fill leased capacity");
-    assert_eq!(leased_payload_bytes, queue_capacity);
-
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(30), back_rx.recv())
-            .await
-            .is_err(),
-        "native permit pump must stop while all bytes are leased downstream"
-    );
-
-    assert_eq!(permits[0].release(chunk_len), chunk_len);
-    match tokio::time::timeout(std::time::Duration::from_millis(200), back_rx.recv())
-        .await
-        .expect("egress permit release should re-arm native remote reads")
-        .expect("relay should remain alive")
-    {
-        (
-            h,
-            RelayEvent::Data {
-                epoch,
-                bytes,
-                downstream_permit,
-                ..
-            },
-        ) => {
-            assert_eq!(h, handle);
-            assert_eq!(epoch, 95);
-            assert_eq!(bytes.len(), chunk_len);
-            assert!(
-                downstream_permit.is_some(),
-                "newly re-armed native data must carry a downstream permit"
-            );
-        }
-        other => panic!("expected native data after permit release, got {other:?}"),
     }
 
     task.abort();
@@ -3476,7 +3158,7 @@ async fn d16_pending_read_pause_refunds_reservation_before_delivery() {
         paused: false,
         max_batch_bytes: 64 * 1024,
     });
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(run_d16_native_reader(
         handle,
@@ -3487,8 +3169,8 @@ async fn d16_pending_read_pause_refunds_reservation_before_delivery() {
         back_tx,
         None,
         stop_rx,
+        None,
     ));
-
     tokio::time::timeout(std::time::Duration::from_millis(200), async {
         while !entered.load(Ordering::SeqCst) {
             tokio::task::yield_now().await;
@@ -3535,7 +3217,7 @@ async fn d16_running_credit_preserves_its_pending_read_reservation() {
     .unwrap();
     let initial_credit = RelayReadCredit::initial();
     let (credit_tx, credit_rx) = watch::channel(initial_credit);
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(run_d16_native_reader(
         handle,
@@ -3546,8 +3228,8 @@ async fn d16_running_credit_preserves_its_pending_read_reservation() {
         back_tx,
         None,
         stop_rx,
+        None,
     ));
-
     tokio::time::timeout(std::time::Duration::from_millis(200), async {
         while queue.snapshot_now().reserved_bytes != D16_PER_FLOW_BYTE_CAPACITY
             || read_waker.lock().unwrap().is_none()
@@ -3628,7 +3310,7 @@ async fn d16_real_quinn_reader_sustains_byte_owned_queue_progress() {
     });
 
     let connection = client_endpoint
-        .connect(server_addr, "example.com")
+        .connect(server_addr, "localhost")
         .unwrap()
         .await
         .unwrap();
@@ -3644,7 +3326,7 @@ async fn d16_real_quinn_reader_sustains_byte_owned_queue_progress() {
     )
     .unwrap();
     let (_credit_tx, credit_rx) = watch::channel(RelayReadCredit::initial());
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
     let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     let reader_task = tokio::spawn(run_d16_native_reader(
         handle,
@@ -3655,8 +3337,8 @@ async fn d16_real_quinn_reader_sustains_byte_owned_queue_progress() {
         back_tx,
         None,
         stop_rx,
+        None,
     ));
-
     let started = std::time::Instant::now();
     let mut received = 0usize;
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
@@ -3712,14 +3394,14 @@ async fn h10d16_native_byte_owned_variant_selects_readiness_only_relay() {
     let writer: NativeTcpWriteHalf = Box::new(NoopNativeWriter {
         shutdown_called: writer_shutdown.clone(),
     });
-    let (uplink_tx, uplink_rx) = mpsc::channel::<RelayCommand>(8);
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (uplink_tx, uplink_rx) = crate::client_tun::uplink::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
 
     let spawned = spawn_remote_relay(
         &RelayFamilyPolicy::default(),
         handle,
         19,
-        OpenedTcpRelay::NativeByteOwned(NativeTcpRelayStream { reader, writer }),
+        OpenedTcpRelay::NativeByteOwned(NativeTcpRelayStream::new(reader, writer)),
         uplink_rx,
         back_tx,
         &Metrics::new(),
@@ -3779,8 +3461,8 @@ async fn d16_terminal_writer_error_refunds_pending_read_before_close_event() {
         DownstreamPermitReleaseMode::OnEgressDrain,
     )
     .unwrap();
-    let (uplink_tx, uplink_rx) = mpsc::channel::<RelayCommand>(1);
-    let (back_tx, mut back_rx) = mpsc::channel(1);
+    let (uplink_tx, uplink_rx) = crate::client_tun::uplink::channel(1);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(1);
     let (_credit_tx, credit_rx) = watch::channel(RelayReadCredit {
         paused: false,
         max_batch_bytes: 64 * 1024,
@@ -3788,8 +3470,7 @@ async fn d16_terminal_writer_error_refunds_pending_read_before_close_event() {
     let task = tokio::spawn(run_relay_d16(
         handle,
         23,
-        reader,
-        writer,
+        NativeTcpRelayStream::new(reader, writer),
         uplink_rx,
         back_tx,
         credit_rx,
@@ -3854,8 +3535,8 @@ async fn d16_reader_task_failure_is_terminal_without_payload_idle_timer() {
         DownstreamPermitReleaseMode::OnEgressDrain,
     )
     .unwrap();
-    let (_uplink_tx, uplink_rx) = mpsc::channel::<RelayCommand>(1);
-    let (back_tx, mut back_rx) = mpsc::channel(1);
+    let (_uplink_tx, uplink_rx) = crate::client_tun::uplink::channel(1);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(1);
     let (_credit_tx, credit_rx) = watch::channel(RelayReadCredit {
         paused: false,
         max_batch_bytes: 64 * 1024,
@@ -3864,8 +3545,7 @@ async fn d16_reader_task_failure_is_terminal_without_payload_idle_timer() {
     run_relay_d16(
         handle,
         26,
-        reader,
-        writer,
+        NativeTcpRelayStream::new(reader, writer),
         uplink_rx,
         back_tx,
         credit_rx,
@@ -3907,8 +3587,8 @@ async fn d16_full_duplex_idle_survives_legacy_timeout() {
         DownstreamPermitReleaseMode::OnEgressDrain,
     )
     .unwrap();
-    let (uplink_tx, uplink_rx) = mpsc::channel::<RelayCommand>(1);
-    let (back_tx, mut back_rx) = mpsc::channel(1);
+    let (uplink_tx, uplink_rx) = crate::client_tun::uplink::channel(1);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(1);
     let (_credit_tx, credit_rx) = watch::channel(RelayReadCredit {
         paused: true,
         max_batch_bytes: 0,
@@ -3916,8 +3596,7 @@ async fn d16_full_duplex_idle_survives_legacy_timeout() {
     let task = tokio::spawn(run_relay_d16(
         handle,
         24,
-        reader,
-        writer,
+        NativeTcpRelayStream::new(reader, writer),
         uplink_rx,
         back_tx,
         credit_rx,
@@ -3969,8 +3648,8 @@ async fn d16_half_closed_idle_waits_for_owned_payload_to_drain() {
         DownstreamPermitReleaseMode::OnEgressDrain,
     )
     .unwrap();
-    let (uplink_tx, uplink_rx) = mpsc::channel::<RelayCommand>(1);
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (uplink_tx, uplink_rx) = crate::client_tun::uplink::channel(1);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
     let (_credit_tx, credit_rx) = watch::channel(RelayReadCredit {
         paused: false,
         max_batch_bytes: 64 * 1024,
@@ -3978,8 +3657,7 @@ async fn d16_half_closed_idle_waits_for_owned_payload_to_drain() {
     let task = tokio::spawn(run_relay_d16(
         handle,
         25,
-        reader,
-        writer,
+        NativeTcpRelayStream::new(reader, writer),
         uplink_rx,
         back_tx,
         credit_rx,
@@ -4070,8 +3748,8 @@ async fn d16_half_closed_idle_owned_payload_without_local_progress_is_bounded() 
         DownstreamPermitReleaseMode::OnEgressDrain,
     )
     .unwrap();
-    let (uplink_tx, uplink_rx) = mpsc::channel::<RelayCommand>(1);
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (uplink_tx, uplink_rx) = crate::client_tun::uplink::channel(1);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
     let (_credit_tx, credit_rx) = watch::channel(RelayReadCredit {
         paused: false,
         max_batch_bytes: 64 * 1024,
@@ -4079,8 +3757,7 @@ async fn d16_half_closed_idle_owned_payload_without_local_progress_is_bounded() 
     let task = tokio::spawn(run_relay_d16(
         handle,
         26,
-        reader,
-        writer,
+        NativeTcpRelayStream::new(reader, writer),
         uplink_rx,
         back_tx,
         credit_rx,
@@ -4139,13 +3816,19 @@ async fn d16_local_terminal_cause_survives_writer_shutdown() {
     )
     .unwrap();
     queue.close_and_drop_queued_for_terminal("local_to_remote", "local_socket_terminal");
-    let (uplink_tx, uplink_rx) = mpsc::channel::<RelayCommand>(1);
-    let (back_tx, mut back_rx) = mpsc::channel(1);
+    let (uplink_tx, uplink_rx) = crate::client_tun::uplink::channel(1);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(1);
     let (_credit_tx, credit_rx) = watch::channel(RelayReadCredit::initial());
     drop(uplink_tx);
 
     run_relay_d16(
-        handle, 24, reader, writer, uplink_rx, back_tx, credit_rx, queue,
+        handle,
+        24,
+        NativeTcpRelayStream::new(reader, writer),
+        uplink_rx,
+        back_tx,
+        credit_rx,
+        queue,
     )
     .await;
 
@@ -4186,7 +3869,7 @@ async fn d16_reader_emits_one_readiness_and_no_payload_event_before_closed_queue
         paused: false,
         max_batch_bytes: 128 * 1024,
     });
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
     let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel();
 
     run_d16_native_reader(
@@ -4198,9 +3881,9 @@ async fn d16_reader_emits_one_readiness_and_no_payload_event_before_closed_queue
         back_tx,
         None,
         stop_rx,
+        None,
     )
     .await;
-
     assert!(matches!(
         back_rx.recv().await,
         Some((h, RelayEvent::DataReady { epoch: 9 })) if h == handle
@@ -4324,14 +4007,14 @@ async fn d16_local_fin_keeps_useful_reverse_queue_alive() {
     .unwrap();
     let reservation = queue.reserve_read_up_to(32 * 1024).await.unwrap();
     reservation.commit(Bytes::from(vec![5; 32 * 1024])).unwrap();
-    let (tx, mut rx) = mpsc::channel(1);
+    let (tx, mut rx) = crate::client_tun::uplink::channel(1);
     let mut ctx = SocketCtx::new(443);
     ctx.state = SocketState::Relaying;
     ctx.uplink_tx = Some(tx);
     ctx.d16_downlink_queue = Some(queue.clone());
 
     assert!(matches!(
-        pump_established_uplink(&mut ctx, TcpState::CloseWait, 10, || None),
+        pump_established_uplink(&mut ctx, TcpState::CloseWait, 10, |_| None),
         EstablishedUplink::Handled
     ));
     assert!(matches!(
@@ -4339,7 +4022,7 @@ async fn d16_local_fin_keeps_useful_reverse_queue_alive() {
             &mut ctx,
             TcpState::CloseWait,
             10 + LOCAL_FINISH_DEFER_SECS,
-            || None,
+            |_| None,
         ),
         EstablishedUplink::Handled
     ));
@@ -4407,8 +4090,8 @@ async fn relay_ready_burst_delivers_data_before_eof_close() {
         chunks: std::collections::VecDeque::from([b"one".to_vec(), b"two".to_vec()]),
         eof_after_chunks: true,
     });
-    let (_tx, rx) = mpsc::channel::<RelayCommand>(8);
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (_tx, rx) = crate::client_tun::uplink::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
     let (_credit_tx, credit_rx) = relay_read_credit_channel();
 
     run_relay(handle, 78, stream, rx, back_tx, credit_rx).await;
@@ -4463,8 +4146,8 @@ async fn relay_read_credit_pause_stops_remote_reads_until_resumed() {
         chunks: std::collections::VecDeque::from([b"after-credit".to_vec()]),
         eof_after_chunks: true,
     });
-    let (_tx, rx) = mpsc::channel::<RelayCommand>(8);
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (_tx, rx) = crate::client_tun::uplink::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
     let (credit_tx, credit_rx) = watch::channel(RelayReadCredit {
         paused: true,
         max_batch_bytes: 0,
@@ -4530,8 +4213,8 @@ async fn relay_read_credit_update_keeps_inflight_remote_read_armed() {
         read_waker: read_waker.clone(),
         read_sent: false,
     });
-    let (_tx, rx) = mpsc::channel::<RelayCommand>(8);
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (_tx, rx) = crate::client_tun::uplink::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
     let (credit_tx, credit_rx) = relay_read_credit_channel();
     let task = tokio::spawn(run_relay(handle, 83, stream, rx, back_tx, credit_rx));
 
@@ -4613,8 +4296,8 @@ async fn local_pressure_credit_does_not_cap_ordered_stream_poll_below_dispatch_w
             .collect(),
         eof_after_chunks: true,
     });
-    let (_tx, rx) = mpsc::channel::<RelayCommand>(8);
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (_tx, rx) = crate::client_tun::uplink::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
     let (_credit_tx, credit_rx) = watch::channel(RelayReadCredit {
         paused: false,
         max_batch_bytes: pressure_floor,
@@ -4661,8 +4344,8 @@ async fn relay_remote_write_failed_notifies_main_loop() {
     let stream: RelayStream = Box::new(FailingWriteStream {
         shutdown_called: flag.clone(),
     });
-    let (tx, rx) = mpsc::channel::<RelayCommand>(8);
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (tx, rx) = crate::client_tun::uplink::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
     let (_credit_tx, credit_rx) = relay_read_credit_channel();
     let task = tokio::spawn(run_relay(handle, 11, stream, rx, back_tx, credit_rx));
 
@@ -4695,8 +4378,8 @@ async fn relay_pending_remote_write_uses_stalled_write_timeout() {
     let stream: RelayStream = Box::new(PendingWriteStream {
         shutdown_called: flag.clone(),
     });
-    let (tx, rx) = mpsc::channel::<RelayCommand>(8);
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (tx, rx) = crate::client_tun::uplink::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
     let (_credit_tx, credit_rx) = relay_read_credit_channel();
     let task = tokio::spawn(run_relay(handle, 17, stream, rx, back_tx, credit_rx));
 
@@ -4751,8 +4434,8 @@ async fn relay_partial_write_progress_resets_stalled_write_timeout() {
         write_waker: write_waker.clone(),
         shutdown_called: shutdown_called.clone(),
     });
-    let (tx, rx) = mpsc::channel::<RelayCommand>(8);
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (tx, rx) = crate::client_tun::uplink::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
     let (_credit_tx, credit_rx) = relay_read_credit_channel();
     let task = tokio::spawn(run_relay(handle, 18, stream, rx, back_tx, credit_rx));
 
@@ -4802,8 +4485,8 @@ async fn relay_remote_read_progresses_while_local_write_is_pending() {
         shutdown_called: shutdown_called.clone(),
         read_sent: false,
     });
-    let (tx, rx) = mpsc::channel::<RelayCommand>(8);
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (tx, rx) = crate::client_tun::uplink::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
     let (_credit_tx, credit_rx) = relay_read_credit_channel();
     let task = tokio::spawn(run_relay(handle, 23, stream, rx, back_tx, credit_rx));
 
@@ -4852,8 +4535,8 @@ async fn relay_local_finish_keeps_remote_read_open() {
         shutdown_called: shutdown_called.clone(),
         read_sent: false,
     });
-    let (tx, rx) = mpsc::channel::<RelayCommand>(8);
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (tx, rx) = crate::client_tun::uplink::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
     let (_credit_tx, credit_rx) = relay_read_credit_channel();
     let task = tokio::spawn(run_relay(handle, 29, stream, rx, back_tx, credit_rx));
 
@@ -4897,8 +4580,8 @@ async fn relay_local_finish_without_remote_progress_uses_half_closed_idle_timeou
     let stream: RelayStream = Box::new(IdleStream {
         shutdown_called: shutdown_called.clone(),
     });
-    let (tx, rx) = mpsc::channel::<RelayCommand>(8);
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (tx, rx) = crate::client_tun::uplink::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
     let (_credit_tx, credit_rx) = relay_read_credit_channel();
     let task = tokio::spawn(run_relay(handle, 31, stream, rx, back_tx, credit_rx));
 
@@ -4941,8 +4624,8 @@ async fn relay_completed_write_disarms_stalled_write_timer() {
     let stream: RelayStream = Box::new(IdleStream {
         shutdown_called: flag.clone(),
     });
-    let (tx, rx) = mpsc::channel::<RelayCommand>(8);
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (tx, rx) = crate::client_tun::uplink::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
     let (_credit_tx, credit_rx) = relay_read_credit_channel();
     let task = tokio::spawn(run_relay(handle, 13, stream, rx, back_tx, credit_rx));
 
@@ -5350,7 +5033,7 @@ fn retired_owned_action_waits_for_terminal_delivery_but_cannot_leak_a_slot() {
 fn reap_predicate_preserves_active_closewait_pending_downlink() {
     let mut ctx = SocketCtx::new(443);
     ctx.state = SocketState::Relaying;
-    ctx.downlink_pending = vec![1, 2, 3];
+    ctx.downlink_pending = vec![1, 2, 3].into();
 
     assert!(
         !should_reap_slot(&ctx, TcpState::CloseWait, true, true, 0),
@@ -5363,7 +5046,7 @@ fn reap_predicate_preserves_active_closewait_pending_downlink() {
         "CloseWait is reapable again once pending downlink drains"
     );
 
-    ctx.downlink_pending = vec![1, 2, 3];
+    ctx.downlink_pending = vec![1, 2, 3].into();
     ctx.downlink_pending_last_progress_secs = Some(10);
     ctx.downlink_pending_last_pending_bytes = 3;
     assert!(
@@ -5382,7 +5065,7 @@ fn reap_predicate_preserves_active_closewait_pending_downlink() {
 
 #[test]
 fn reap_predicate_preserves_active_closewait_live_relay() {
-    let (tx, _rx) = mpsc::channel(1);
+    let (tx, _rx) = crate::client_tun::uplink::channel(1);
     let mut ctx = SocketCtx::new(443);
     ctx.state = SocketState::Relaying;
     ctx.uplink_tx = Some(tx);
@@ -5492,7 +5175,7 @@ fn reap_predicate_preserves_deferred_close_egress_after_drop_guard() {
 fn reap_predicate_preserves_active_send_capable_deferred_close_tail() {
     let mut ctx = SocketCtx::new(443);
     ctx.state = SocketState::Closing;
-    ctx.downlink_pending = vec![0; 376_912];
+    ctx.downlink_pending = vec![0; 376_912].into();
     ctx.pending_relay_close = Some(RelayClose {
         epoch: 7,
         direction: "local_to_remote",
@@ -5525,7 +5208,7 @@ fn reap_predicate_preserves_active_send_capable_deferred_close_tail() {
 fn reap_predicate_graces_deferred_close_pending_downlink() {
     let mut ctx = SocketCtx::new(443);
     ctx.state = SocketState::Closing;
-    ctx.downlink_pending = vec![1, 2, 3];
+    ctx.downlink_pending = vec![1, 2, 3].into();
     ctx.pending_relay_close = Some(RelayClose {
         epoch: 9,
         direction: "remote_to_local",
@@ -5575,7 +5258,7 @@ fn reap_predicate_graces_deferred_close_pending_downlink() {
 #[test]
 fn deferred_close_drain_progress_tracks_only_pending_decrease() {
     let mut ctx = SocketCtx::new(443);
-    ctx.downlink_pending = vec![0; 100];
+    ctx.downlink_pending = vec![0; 100].into();
     ctx.pending_relay_close = Some(RelayClose {
         epoch: 1,
         direction: "remote_to_local",
@@ -5617,7 +5300,7 @@ fn deferred_close_drain_progress_tracks_only_pending_decrease() {
 #[test]
 fn downlink_pending_progress_tracks_observation_accept_and_growth() {
     let mut ctx = SocketCtx::new(443);
-    ctx.downlink_pending = vec![0; 100];
+    ctx.downlink_pending = vec![0; 100].into();
     note_downlink_pending_progress(&mut ctx, 10, 0);
     assert_eq!(ctx.downlink_pending_last_progress_secs, Some(10));
     assert_eq!(ctx.downlink_pending_last_pending_bytes, 100);
@@ -5658,7 +5341,7 @@ fn downlink_pending_progress_tracks_observation_accept_and_growth() {
 fn close_pending_accounting_classifies_pending_close_taxonomy() {
     let mut ctx = SocketCtx::new(443);
     ctx.state = SocketState::Relaying;
-    ctx.downlink_pending = vec![0; 224_765];
+    ctx.downlink_pending = vec![0; 224_765].into();
 
     let terminal = SocketCloseSnapshot {
         tcp_state: TcpState::Closed,
@@ -5754,11 +5437,11 @@ fn close_egress_accounting_reports_send_queue_without_app_pending() {
 fn tcp_lifecycle_transition_diag_reports_previous_state_and_context() {
     let mut sockets = SocketSet::new(vec![]);
     let handle = sockets.add(build_listener_socket(&ListenerSpec { local_port: 443 }));
-    let (tx, _rx) = mpsc::channel(1);
+    let (tx, _rx) = crate::client_tun::uplink::channel(1);
     let mut ctx = SocketCtx::new(443);
     ctx.state = SocketState::Relaying;
     ctx.uplink_tx = Some(tx);
-    ctx.downlink_pending = vec![0; 41_208];
+    ctx.downlink_pending = vec![0; 41_208].into();
     ctx.downlink_diag.note_remote_payload(221_884, 41_208);
     ctx.downlink_diag.note_send_slice_ok(180_676, 41_208);
 
@@ -5840,7 +5523,7 @@ fn remote_payload_allowed_after_local_finish_without_uplink_sender() {
 
 #[test]
 fn remote_payload_rejected_after_terminal_no_send_socket() {
-    let (tx, _rx) = mpsc::channel(1);
+    let (tx, _rx) = crate::client_tun::uplink::channel(1);
     let mut ctx = SocketCtx::new(443);
     ctx.state = SocketState::Relaying;
     ctx.uplink_tx = Some(tx);
@@ -5970,7 +5653,7 @@ async fn d3_egress_actor_remote_payload_appends_without_inline_flush() {
     let mut sockets = SocketSet::new(vec![]);
     let handle = sockets.add(build_listener_socket(&ListenerSpec { local_port: 443 }));
 
-    let (tx, _rx) = mpsc::channel(1);
+    let (tx, _rx) = crate::client_tun::uplink::channel(1);
     let mut ctx = SocketCtx::new(443);
     ctx.state = SocketState::Relaying;
     ctx.conn_epoch = 3;
@@ -6046,7 +5729,7 @@ async fn terminal_remote_payload_rearms_slot_and_stales_followup_payloads() {
     let handle = sockets.add(build_listener_socket(&ListenerSpec { local_port: 443 }));
     sockets.get_mut::<TcpSocket>(handle).abort();
 
-    let (tx, _rx) = mpsc::channel(1);
+    let (tx, _rx) = crate::client_tun::uplink::channel(1);
     let mut ctx = SocketCtx::new(443);
     ctx.state = SocketState::Relaying;
     ctx.conn_epoch = 9;
@@ -6179,7 +5862,7 @@ async fn reap_dead_async_open_drops_stale_result() {
     );
     assert_eq!(pool.sweep(1000, 300), 1, "release 后映射可回收");
 
-    let (global_tx, _grx) = mpsc::channel(8);
+    let (global_tx, _grx) = crate::client_tun::relay_channel::channel(8);
     let (owned_action_tx, _owned_action_rx) = mpsc::channel(8);
     let stale = HandshakeDone {
         handle: closed_pending,
@@ -6213,7 +5896,7 @@ async fn reap_dead_async_open_drops_stale_result() {
 fn relay_closed_epoch_guard_drops_stale_close() {
     let mut sockets = SocketSet::new(vec![]);
     let handle = sockets.add(build_listener_socket(&ListenerSpec { local_port: 12345 }));
-    let (tx, _rx) = mpsc::channel(1);
+    let (tx, _rx) = crate::client_tun::uplink::channel(1);
     let mut ctx = SocketCtx::new(12345);
     ctx.state = SocketState::Relaying;
     ctx.conn_epoch = 22;
@@ -6250,12 +5933,12 @@ fn relay_closed_epoch_guard_drops_stale_close() {
 fn relay_closed_with_pending_downlink_defers_rearm() {
     let mut sockets = SocketSet::new(vec![]);
     let handle = sockets.add(build_listener_socket(&ListenerSpec { local_port: 12345 }));
-    let (tx, _rx) = mpsc::channel(1);
+    let (tx, _rx) = crate::client_tun::uplink::channel(1);
     let mut ctx = SocketCtx::new(12345);
     ctx.state = SocketState::Relaying;
     ctx.conn_epoch = 5;
     ctx.uplink_tx = Some(tx);
-    ctx.downlink_pending = vec![1, 2, 3];
+    ctx.downlink_pending = vec![1, 2, 3].into();
     let mut socket_ctxs = HashMap::new();
     socket_ctxs.insert(handle, ctx);
     let mut pool = FakeIpPool::new();
@@ -6281,7 +5964,7 @@ fn relay_closed_with_pending_downlink_defers_rearm() {
     );
     assert_eq!(ctx.state, SocketState::Closing);
     assert!(ctx.uplink_tx.is_none());
-    assert_eq!(ctx.downlink_pending, vec![1, 2, 3]);
+    assert_eq!(ctx.downlink_pending.as_slice(), &[1, 2, 3]);
     assert!(ctx.pending_relay_close.is_some());
     assert_eq!(ctx.pending_relay_close_since_secs, Some(1));
     assert_eq!(ctx.pending_relay_close_last_progress_secs, Some(1));
@@ -6316,7 +5999,7 @@ fn relay_closed_with_pending_downlink_defers_rearm() {
 
 #[test]
 fn deferred_close_egress_starts_for_send_capable_closewait_queue() {
-    let (tx, _rx) = mpsc::channel(1);
+    let (tx, _rx) = crate::client_tun::uplink::channel(1);
     let mut ctx = SocketCtx::new(12345);
     ctx.state = SocketState::Relaying;
     ctx.conn_epoch = 5;
@@ -6358,7 +6041,7 @@ fn deferred_close_egress_starts_for_send_capable_closewait_queue() {
 
 #[test]
 fn deferred_close_egress_starts_for_send_capable_tail_above_low_watermark() {
-    let (tx, _rx) = mpsc::channel(1);
+    let (tx, _rx) = crate::client_tun::uplink::channel(1);
     let mut ctx = SocketCtx::new(12345);
     ctx.state = SocketState::Relaying;
     ctx.conn_epoch = 5;
@@ -6401,12 +6084,12 @@ fn deferred_close_egress_starts_for_send_capable_tail_above_low_watermark() {
 
 #[test]
 fn pending_downlink_close_deferral_is_direction_agnostic() {
-    let (tx, _rx) = mpsc::channel(1);
+    let (tx, _rx) = crate::client_tun::uplink::channel(1);
     let mut ctx = SocketCtx::new(12345);
     ctx.state = SocketState::Relaying;
     ctx.conn_epoch = 5;
     ctx.uplink_tx = Some(tx);
-    ctx.downlink_pending = vec![1, 2, 3, 4];
+    ctx.downlink_pending = vec![1, 2, 3, 4].into();
     let close = RelayClose {
         epoch: 5,
         direction: "local_to_remote",
@@ -6435,7 +6118,7 @@ fn pending_downlink_close_deferral_is_direction_agnostic() {
 
 #[test]
 fn pending_downlink_close_deferral_ignores_empty_pending() {
-    let (tx, _rx) = mpsc::channel(1);
+    let (tx, _rx) = crate::client_tun::uplink::channel(1);
     let mut ctx = SocketCtx::new(12345);
     ctx.state = SocketState::Relaying;
     ctx.conn_epoch = 5;
@@ -6522,7 +6205,7 @@ fn deferred_close_sends_local_eof_after_pending_drains() {
         direction: "remote_to_local",
         reason: "remote_eof",
     });
-    ctx.downlink_pending = vec![1, 2, 3];
+    ctx.downlink_pending = vec![1, 2, 3].into();
     let snapshot = SocketCloseSnapshot {
         tcp_state: TcpState::Established,
         active: true,
@@ -6576,14 +6259,14 @@ fn uplink_buffer_enforces_cap() {
 fn established_uplink_batch_drains_multiple_payloads_in_one_pass() {
     use std::collections::VecDeque;
 
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = crate::client_tun::uplink::channel(8);
     let mut ctx = SocketCtx::new(80);
     ctx.uplink_tx = Some(tx);
     let mut payloads: VecDeque<Vec<u8>> =
         VecDeque::from([b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]);
 
     assert!(matches!(
-        pump_established_uplink(&mut ctx, TcpState::Established, 0, || payloads.pop_front()),
+        pump_established_uplink(&mut ctx, TcpState::Established, 0, |_| payloads.pop_front()),
         EstablishedUplink::Handled
     ));
     assert!(
@@ -6605,7 +6288,7 @@ fn established_uplink_batch_drains_multiple_payloads_in_one_pass() {
 fn established_uplink_batch_stops_at_fairness_cap() {
     use std::collections::VecDeque;
 
-    let (tx, mut rx) = mpsc::channel(MAX_ESTABLISHED_UPLINK_BATCH + 2);
+    let (tx, mut rx) = crate::client_tun::uplink::channel(MAX_ESTABLISHED_UPLINK_BATCH + 2);
     let mut ctx = SocketCtx::new(80);
     ctx.uplink_tx = Some(tx);
     let mut payloads: VecDeque<Vec<u8>> = (0..=MAX_ESTABLISHED_UPLINK_BATCH)
@@ -6613,7 +6296,7 @@ fn established_uplink_batch_stops_at_fairness_cap() {
         .collect();
 
     assert!(matches!(
-        pump_established_uplink(&mut ctx, TcpState::Established, 0, || payloads.pop_front()),
+        pump_established_uplink(&mut ctx, TcpState::Established, 0, |_| payloads.pop_front()),
         EstablishedUplink::Handled
     ));
     assert_eq!(
@@ -6634,7 +6317,7 @@ fn established_uplink_batch_stops_at_fairness_cap() {
 fn established_uplink_full_channel_does_not_consume_payload() {
     use std::collections::VecDeque;
 
-    let (tx, _rx) = mpsc::channel(1);
+    let (tx, _rx) = crate::client_tun::uplink::channel(1);
     tx.try_send(RelayCommand::Data(b"occupied".to_vec()))
         .unwrap();
     let mut ctx = SocketCtx::new(80);
@@ -6642,7 +6325,7 @@ fn established_uplink_full_channel_does_not_consume_payload() {
     let mut payloads: VecDeque<Vec<u8>> = VecDeque::from([b"must-stay".to_vec()]);
 
     assert!(matches!(
-        pump_established_uplink(&mut ctx, TcpState::Established, 0, || payloads.pop_front()),
+        pump_established_uplink(&mut ctx, TcpState::Established, 0, |_| payloads.pop_front()),
         EstablishedUplink::Handled
     ));
     assert_eq!(
@@ -6680,12 +6363,12 @@ fn resumable_uplink_treats_flow_and_session_byte_and_segment_exhaustion_as_backp
 
 #[test]
 fn established_uplink_defers_finish_after_payloads_drain() {
-    let (tx, mut rx) = mpsc::channel(4);
+    let (tx, mut rx) = crate::client_tun::uplink::channel(4);
     let mut ctx = SocketCtx::new(80);
     ctx.uplink_tx = Some(tx);
 
     assert!(matches!(
-        pump_established_uplink(&mut ctx, TcpState::CloseWait, 10, || None),
+        pump_established_uplink(&mut ctx, TcpState::CloseWait, 10, |_| None),
         EstablishedUplink::Handled
     ));
     assert!(!ctx.local_fin_sent);
@@ -6696,14 +6379,14 @@ fn established_uplink_defers_finish_after_payloads_drain() {
     );
 
     assert!(matches!(
-        pump_established_uplink(&mut ctx, TcpState::CloseWait, 14, || None),
+        pump_established_uplink(&mut ctx, TcpState::CloseWait, 14, |_| None),
         EstablishedUplink::Handled
     ));
     assert!(!ctx.local_fin_sent);
     assert!(rx.try_recv().is_err(), "defer window has not expired");
 
     assert!(matches!(
-        pump_established_uplink(&mut ctx, TcpState::CloseWait, 15, || None),
+        pump_established_uplink(&mut ctx, TcpState::CloseWait, 15, |_| None),
         EstablishedUplink::Handled
     ));
     assert!(ctx.local_fin_sent);
@@ -6716,18 +6399,18 @@ fn established_uplink_defers_finish_after_payloads_drain() {
 
 #[test]
 fn established_uplink_remote_progress_extends_finish_defer() {
-    let (tx, mut rx) = mpsc::channel(4);
+    let (tx, mut rx) = crate::client_tun::uplink::channel(4);
     let mut ctx = SocketCtx::new(80);
     ctx.uplink_tx = Some(tx);
 
     assert!(matches!(
-        pump_established_uplink(&mut ctx, TcpState::CloseWait, 10, || None),
+        pump_established_uplink(&mut ctx, TcpState::CloseWait, 10, |_| None),
         EstablishedUplink::Handled
     ));
     note_local_finish_remote_progress(&mut ctx, 13);
 
     assert!(matches!(
-        pump_established_uplink(&mut ctx, TcpState::CloseWait, 15, || None),
+        pump_established_uplink(&mut ctx, TcpState::CloseWait, 15, |_| None),
         EstablishedUplink::Handled
     ));
     assert!(!ctx.local_fin_sent);
@@ -6737,7 +6420,7 @@ fn established_uplink_remote_progress_extends_finish_defer() {
     );
 
     assert!(matches!(
-        pump_established_uplink(&mut ctx, TcpState::CloseWait, 18, || None),
+        pump_established_uplink(&mut ctx, TcpState::CloseWait, 18, |_| None),
         EstablishedUplink::Handled
     ));
     assert!(ctx.local_fin_sent);
@@ -6813,7 +6496,7 @@ fn stale_resumable_handshake_result_abandons_old_epoch_without_installing() {
     let mut ctx = mk_pending_ctx(5);
     ctx.pending_open_mode = Some(TcpOwnershipMode::Resumable);
     let mut socket_ctxs = HashMap::from([(handle, ctx)]);
-    let (global_tx, _global_rx) = mpsc::channel(1);
+    let (global_tx, _global_rx) = crate::client_tun::relay_channel::channel(1);
     let (owned_action_tx, _owned_action_rx) = mpsc::channel(1);
     let mut pool = FakeIpPool::new();
     let (endpoint, mut driver, expected_flow) = resumable_adapter_test_pair();
@@ -6855,7 +6538,7 @@ async fn handshake_done_epoch_guard_drops_stale_then_installs_match() {
     let handle = sockets.add(build_listener_socket(&ListenerSpec { local_port: 12345 }));
     let mut socket_ctxs = HashMap::new();
     socket_ctxs.insert(handle, mk_pending_ctx(5));
-    let (global_tx, _grx) = mpsc::channel(8);
+    let (global_tx, _grx) = crate::client_tun::relay_channel::channel(8);
     let (owned_action_tx, _owned_action_rx) = mpsc::channel(8);
     let mut pool = FakeIpPool::new();
 
@@ -6929,7 +6612,7 @@ async fn handshake_done_failure_rearms_and_releases_fakeip() {
     ctx.buffer_uplink(b"buffered");
     let mut socket_ctxs = HashMap::new();
     socket_ctxs.insert(handle, ctx);
-    let (global_tx, _grx) = mpsc::channel(8);
+    let (global_tx, _grx) = crate::client_tun::relay_channel::channel(8);
     let (owned_action_tx, _owned_action_rx) = mpsc::channel(8);
 
     let err = HandshakeDone {
@@ -6977,7 +6660,7 @@ async fn handshake_done_flushes_buffered_uplink_in_order() {
     ctx.buffer_uplink(b"HELLO-BUFFERED");
     let mut socket_ctxs = HashMap::new();
     socket_ctxs.insert(handle, ctx);
-    let (global_tx, _grx) = mpsc::channel(8);
+    let (global_tx, _grx) = crate::client_tun::relay_channel::channel(8);
     let (owned_action_tx, _owned_action_rx) = mpsc::channel(8);
     let mut pool = FakeIpPool::new();
 
@@ -7257,7 +6940,7 @@ fn tcp_downlink_diag_tracks_headroom_limited_flushes() {
 #[test]
 fn tcp_downlink_flush_aggregate_formats_progress_signal() {
     let mut a = SocketCtx::new(443);
-    a.downlink_pending = vec![0; 10];
+    a.downlink_pending = vec![0; 10].into();
     a.downlink_diag.note_remote_payload(100, 100);
     a.downlink_diag.note_downstream_permit(100, 100);
     a.downlink_diag.note_downstream_permit_release(64, 36);
@@ -7279,7 +6962,7 @@ fn tcp_downlink_flush_aggregate_formats_progress_signal() {
     a.downlink_credit_controller.egress_payload_credit_bytes = 1234;
 
     let mut b = SocketCtx::new(443);
-    b.downlink_pending = vec![0; 25];
+    b.downlink_pending = vec![0; 25].into();
     b.downlink_diag.note_remote_payload(200, 200);
     b.downlink_diag.note_downstream_permit(200, 200);
     b.downlink_diag.note_downstream_permit_release(25, 175);
@@ -7870,9 +7553,9 @@ fn downlink_egress_pacer_defers_pending_flush_at_send_queue_high_watermark() {
 #[test]
 fn downlink_pending_stats_track_max_and_total() {
     let mut a = SocketCtx::new(443);
-    a.downlink_pending = vec![0; 10];
+    a.downlink_pending = vec![0; 10].into();
     let mut b = SocketCtx::new(443);
-    b.downlink_pending = vec![0; 25];
+    b.downlink_pending = vec![0; 25].into();
 
     let stats = downlink_pending_stats([&a, &b]);
     assert_eq!(stats.max_pending, 25);
@@ -9818,7 +9501,7 @@ fn pre_payload_tun_rx_drain_budget_requires_current_accepting_payload() {
         high_bytes: 100,
         low_bytes: 40,
     };
-    let (tx, _rx) = mpsc::channel(1);
+    let (tx, _rx) = crate::client_tun::uplink::channel(1);
     let mut ctx = SocketCtx::new(443);
     ctx.state = SocketState::Relaying;
     ctx.uplink_tx = Some(tx);
@@ -10051,7 +9734,7 @@ fn dirty_close_drain_tracks_pending_or_egress_tail() {
             direction: "local_to_remote",
             reason: "uplink_channel_closed",
         });
-        ctx.downlink_pending = vec![1, 2, 3];
+        ctx.downlink_pending = vec![1, 2, 3].into();
     }
     assert!(
         has_dirty_close_drain(&dirty, &ctxs, cfg),

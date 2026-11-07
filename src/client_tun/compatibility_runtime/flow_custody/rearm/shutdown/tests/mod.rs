@@ -61,7 +61,7 @@ async fn physical_scan_shares_control_budget_wraps_and_leaves_unused_epochs_unch
     assert!(!owner.ledger().quarantined);
     // A stopped default Legacy owner still has legal physical relay resources.
     *owner.opens() = OpenCustody::default();
-    contexts.values_mut().next().unwrap().uplink_tx = Some(mpsc::channel(1).0);
+    contexts.values_mut().next().unwrap().uplink_tx = Some(crate::client_tun::uplink::channel(1).0);
     assert!(!dispatch.flow_shutdown_complete(&sockets, &mut contexts, &pool));
     assert!(
         !owner.ledger().quarantined,
@@ -86,7 +86,7 @@ async fn unknown_no_flow_identity_or_resources_are_retained_without_reset() {
                 }
                 1 => ctx.local_port = 0,
                 2 => ctx.local_port = 10001,
-                3 => ctx.uplink_tx = Some(mpsc::channel(1).0),
+                3 => ctx.uplink_tx = Some(crate::client_tun::uplink::channel(1).0),
                 4 => ctx.uplink_buffer.extend_from_slice(b"owned"),
                 5 => ctx.d16_egress_phase = EgressPhase::DrainOnly,
                 6 => ctx.owned_terminal_wait_since_secs = Some(1),
@@ -297,3 +297,4 @@ async fn delayed_no_flow_reset_keeps_first_root_shutdown_deadline() {
         tuple
     );
 }
+mod census;

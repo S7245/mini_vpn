@@ -14,7 +14,7 @@ async fn relay_remote_ready_burst_forwards_immediate_chunks() {
         eof_after_chunks: false,
     });
     let (mut remote_reader, _remote_writer) = tokio::io::split(stream);
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
     let mut diag = RelayTaskDiag::default();
     let mut buf = [0u8; 65_536];
 
@@ -81,7 +81,7 @@ async fn relay_remote_ready_burst_respects_byte_limit_without_overshoot() {
         eof_after_chunks: false,
     });
     let (mut remote_reader, _remote_writer) = tokio::io::split(stream);
-    let (back_tx, mut back_rx) = mpsc::channel(8);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(8);
     let mut diag = RelayTaskDiag::default();
     let mut buf = [0u8; 65_536];
 
@@ -199,7 +199,7 @@ async fn relay_remote_ready_burst_tapers_when_global_rx_queue_is_busy() {
         eof_after_chunks: false,
     });
     let (mut remote_reader, _remote_writer) = tokio::io::split(stream);
-    let (back_tx, mut back_rx) = mpsc::channel(4);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(4);
     for _ in 0..3 {
         back_tx
             .try_send((
@@ -286,7 +286,7 @@ async fn relay_remote_ready_burst_stops_extra_reads_at_global_rx_critical_edge()
         eof_after_chunks: false,
     });
     let (mut remote_reader, _remote_writer) = tokio::io::split(stream);
-    let (back_tx, mut back_rx) = mpsc::channel(1024);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(1024);
     for _ in 0..1019 {
         back_tx
             .try_send((

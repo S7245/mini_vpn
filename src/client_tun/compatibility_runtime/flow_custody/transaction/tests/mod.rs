@@ -18,3 +18,19 @@ mod observation;
 mod positive_fake_ip;
 
 pub(super) mod receipt_gate;
+
+#[cfg(feature = "harness")]
+mod factory_panic;
+
+#[cfg(feature = "harness")]
+mod drive_panic;
+
+#[cfg(feature = "harness")]
+mod role_remainder;
+
+#[cfg(feature = "harness")]
+mod fatal_settle;
+
+pub(super) mod release;
+
+mod capacity;

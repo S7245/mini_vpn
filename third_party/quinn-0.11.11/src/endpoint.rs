@@ -1,4 +1,5 @@
 use std::{
+    alloc::{alloc_zeroed, Layout},
     collections::VecDeque,
     fmt,
     future::Future,
@@ -7,7 +8,7 @@ use std::{
     mem,
     net::{SocketAddr, SocketAddrV6},
     pin::Pin,
-    str,
+    ptr, str,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -21,12 +22,23 @@ use crate::{
     runtime::{AsyncUdpSocket, Runtime},
     udp_transmit, Instant,
 };
-use bytes::{Bytes, BytesMut};
+
+pub(crate) mod budgeted_events;
+mod catalog;
+mod construction;
+mod fanout;
+mod native_connect;
+mod rebind;
+use budgeted_events::{ForwardControlPermit, ForwardSender};
+use bytes::{BackingBudgetReservation, BackingMeter, Bytes, BytesMut, MeteredCopyError};
+use catalog::Catalog;
 use pin_project_lite::pin_project;
+use proto::owned_events::ControlKind;
 use proto::{
     self as proto, ClientConfig, ConnectError, ConnectionError, ConnectionHandle, DatagramEvent,
     ServerConfig,
 };
+use rebind::PreviousSocketInventory;
 use rustc_hash::{FxHashMap, FxHashSet};
 #[cfg(all(not(wasm_browser), any(feature = "aws-lc-rs", feature = "ring"),))]
 use socket2::{Domain, Protocol, Socket, Type};
@@ -39,6 +51,9 @@ use crate::{
     ConnectionToEndpointEvent, EndpointConfig, VarInt, IO_LOOP_BOUND, RECV_TIME_BOUND,
 };
 
+const BUDGETED_FORWARD_ORDINARY_CAPACITY: usize = 64;
+const BUDGETED_CONNECTION_LIMIT: usize = proto::BUDGETED_CONNECTION_LIMIT;
+
 /// A QUIC endpoint.
 ///
 /// An endpoint corresponds to a single UDP socket, may host many connections, and may act as both
@@ -48,6 +63,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct Endpoint {
     pub(crate) inner: EndpointRef,
+    receive_backing_meter: Option<BackingMeter>,
     pub(crate) default_client_config: Option<ClientConfig>,
     runtime: Arc<dyn Runtime>,
     driver_drain: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
@@ -113,18 +129,18 @@ impl Endpoint {
 
     /// Returns relevant stats from this Endpoint
     pub fn stats(&self) -> EndpointStats {
-        self.inner.state.lock().unwrap().stats
+        let state = self.inner.lock_state();
+        let mut stats = state.stats;
+        stats.budget_rejected_datagrams = state.recv_state.budget_rejected_datagrams;
+        stats.receive_backing_rejected_datagrams = state.recv_state.receive_backing_rejected_datagrams;
+        stats.owned_event_rejected_datagrams = state.recv_state.owned_event_rejected_datagrams;
+        stats
     }
 
     /// Return endpoint pacing conservation state when the optional service is configured.
     #[doc(hidden)]
     pub fn endpoint_pacing_snapshot(&self) -> Option<proto::EndpointPacingSnapshot> {
-        self.inner
-            .state
-            .lock()
-            .unwrap()
-            .inner
-            .endpoint_pacing_snapshot()
+        self.inner.lock_state().inner.endpoint_pacing_snapshot()
     }
 
     /// Helper to construct an endpoint for use with both incoming and outgoing connections
@@ -168,44 +184,26 @@ impl Endpoint {
         socket: Arc<dyn AsyncUdpSocket>,
         runtime: Arc<dyn Runtime>,
     ) -> io::Result<Self> {
-        let addr = socket.local_addr()?;
-        let allow_mtud = !socket.may_fragment();
-        let rc = EndpointRef::new(
-            socket,
-            proto::Endpoint::new(
-                Arc::new(config),
-                server_config.map(Arc::new),
-                allow_mtud,
-                None,
-            ),
-            addr.is_ipv6(),
-            runtime.clone(),
-        );
-        let driver = EndpointDriver(rc.clone());
-        let (driver_released_send, driver_released_recv) = oneshot::channel();
-        runtime.spawn(Box::pin(
-            async {
-                // The await temporary, including its EndpointRef and socket
-                // ownership, is dropped at this statement boundary. Only then
-                // may normal completion mint the release acknowledgement.
-                let result = driver.await;
-                match result {
-                    Ok(()) => {
-                        let _ = driver_released_send.send(());
-                    }
-                    Err(e) => {
-                        tracing::error!("I/O error: {}", e);
-                    }
-                }
-            }
-            .instrument(Span::current()),
-        ));
-        Ok(Self {
-            inner: rc,
-            default_client_config: None,
-            runtime,
-            driver_drain: Arc::new(Mutex::new(Some(driver_released_recv))),
-        })
+        Self::new_with_receive_meter(config, server_config, socket, runtime, None)
+    }
+
+    /// Construct an endpoint with its receive meter installed before driver spawn.
+    #[doc(hidden)]
+    pub fn new_with_metered_abstract_socket(
+        config: EndpointConfig,
+        server_config: Option<ServerConfig>,
+        socket: Arc<dyn AsyncUdpSocket>,
+        runtime: Arc<dyn Runtime>,
+        meter: BackingMeter,
+    ) -> io::Result<Self> {
+        Self::new_with_receive_meter(config, server_config, socket, runtime, Some(meter))
+    }
+
+    /// Authority installed through the metered endpoint constructor before
+    /// its driver starts; ordinary constructors return None.
+    #[doc(hidden)]
+    pub fn receive_backing_meter(&self) -> Option<BackingMeter> {
+        self.receive_backing_meter.clone()
     }
 
     /// Take the sole normal-completion witness for this endpoint's I/O driver.
@@ -267,29 +265,62 @@ impl Endpoint {
         addr: SocketAddr,
         server_name: &str,
     ) -> Result<Connecting, ConnectError> {
-        let mut endpoint = self.inner.state.lock().unwrap();
+        let now = self.runtime.now();
+        let mut endpoint = self.inner.lock_state();
         if endpoint.driver_lost || endpoint.recv_state.connections.close.is_some() {
             return Err(ConnectError::EndpointStopping);
         }
         if addr.is_ipv6() && !endpoint.ipv6 {
             return Err(ConnectError::InvalidRemoteAddress(addr));
         }
+        if endpoint.inner.native_registration() {
+            drop(endpoint);
+            return self.connect_native(now, config, addr, server_name);
+        }
         let addr = if endpoint.ipv6 {
             SocketAddr::V6(ensure_ipv6(addr))
         } else {
             addr
         };
+        if endpoint
+            .recv_state
+            .backing_meter
+            .as_ref()
+            .and_then(BackingMeter::budget_limit)
+            .is_some()
+            && endpoint.recv_state.connections.catalog.len() >= BUDGETED_CONNECTION_LIMIT
+        {
+            return Err(ConnectError::EventCapacityUnavailable);
+        }
 
-        let (ch, conn) = endpoint
-            .inner
-            .connect(self.runtime.now(), config, addr, server_name)?;
+        // Reserve the entire per-connection event lane before Proto inserts a
+        // CID or creates TLS/connection state. A rejected budget leaves Proto
+        // and the old connection set untouched.
+        let forward = budgeted_events::connection_channels(
+            endpoint.recv_state.backing_meter.as_ref(),
+            BUDGETED_FORWARD_ORDINARY_CAPACITY,
+        )
+        .map_err(|_| ConnectError::EventCapacityUnavailable)?;
+
+        let (ch, conn) = endpoint.inner.connect(now, config, addr, server_name)?;
 
         let socket = endpoint.socket.clone();
         endpoint.stats.outgoing_handshakes += 1;
-        Ok(endpoint
-            .recv_state
-            .connections
-            .insert(ch, conn, socket, self.runtime.clone()))
+        let registration = (
+            self.inner.self_weak.clone(),
+            endpoint.inner.registration_observer(),
+        );
+        let (connecting, start) = endpoint.recv_state.connections.insert(
+            ch,
+            conn,
+            socket,
+            self.runtime.clone(),
+            forward,
+            registration,
+        )?;
+        drop(endpoint);
+        start.start();
+        Ok(connecting)
     }
 
     /// Switch to a new UDP socket
@@ -300,61 +331,25 @@ impl Endpoint {
         self.rebind_abstract(self.runtime.wrap_udp_socket(socket)?)
     }
 
-    /// Switch to a new UDP socket
-    ///
-    /// Allows the endpoint's address to be updated live, affecting all active connections. Incoming
-    /// connections and connections to servers unreachable from the new address will be lost.
-    ///
-    /// On error, the old UDP socket is retained.
-    pub fn rebind_abstract(&self, socket: Arc<dyn AsyncUdpSocket>) -> io::Result<()> {
-        let addr = socket.local_addr()?;
-        let mut inner = self.inner.state.lock().unwrap();
-        let previous_socket = mem::replace(&mut inner.socket, socket);
-        let rebind_generation = inner.stats.socket_rebinds.saturating_add(1);
-        inner.prev_socket_connections = PreviousSocketConnections::at_rebind(
-            rebind_generation,
-            inner.recv_state.connections.senders.keys().copied(),
-        );
-        inner.prev_socket = inner
-            .prev_socket_connections
-            .must_retain_previous_socket()
-            .then_some(previous_socket);
-        inner.ipv6 = addr.is_ipv6();
-        inner.stats.socket_rebinds = rebind_generation;
-
-        // Update connection socket references
-        for sender in inner.recv_state.connections.senders.values() {
-            // Ignoring errors from dropped connections
-            let _ = sender.send(ConnectionEvent::Rebind(inner.socket.clone()));
-        }
-        if let Some(driver) = inner.driver.take() {
-            // Ensure the driver can register for wake-ups from the new socket
-            driver.wake();
-        }
-
-        Ok(())
-    }
-
     /// Replace the server configuration, affecting new incoming connections only
     ///
     /// Useful for e.g. refreshing TLS certificates without disrupting existing connections.
     pub fn set_server_config(&self, server_config: Option<ServerConfig>) {
-        self.inner
-            .state
-            .lock()
-            .unwrap()
-            .inner
-            .set_server_config(server_config.map(Arc::new))
+        let mut state = self.inner.lock_state();
+        if state.driver_lost {
+            return;
+        }
+        state.inner.set_server_config(server_config.map(Arc::new));
     }
 
     /// Get the local `SocketAddr` the underlying socket is bound to
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.state.lock().unwrap().socket.local_addr()
+        self.inner.lock_state().socket.local_addr()
     }
 
     /// Get the number of connections that are currently open
     pub fn open_connections(&self) -> usize {
-        self.inner.state.lock().unwrap().inner.open_connections()
+        self.inner.lock_state().inner.open_connections()
     }
 
     /// Close all of this endpoint's connections immediately and cease accepting new connections.
@@ -363,16 +358,65 @@ impl Endpoint {
     ///
     /// [`Connection::close()`]: crate::Connection::close
     pub fn close(&self, error_code: VarInt, reason: &[u8]) {
-        let reason = Bytes::copy_from_slice(reason);
-        let mut endpoint = self.inner.state.lock().unwrap();
-        endpoint.recv_state.connections.close = Some((error_code, reason.clone()));
-        for sender in endpoint.recv_state.connections.senders.values() {
-            // Ignoring errors from dropped connections
-            let _ = sender.send(ConnectionEvent::Close {
-                error_code,
-                reason: reason.clone(),
-            });
+        let mut fanout = fanout::Fanout::new();
+        let mut endpoint = self.inner.lock_state();
+        let meter = endpoint.recv_state.backing_meter.clone();
+        fanout.meter = meter.clone();
+        fanout.driver = endpoint.driver.take();
+        let _panic = fanout::RootPanic(&meter);
+        if endpoint.driver_lost || meter.as_ref().is_some_and(BackingMeter::is_quarantined) {
+            return;
         }
+        if let Some(meter) = meter
+            .as_ref()
+            .filter(|meter| meter.budget_limit().is_some())
+        {
+            if endpoint.recv_state.connections.close.is_some() {
+                return;
+            }
+            if !endpoint.registration_inventory_valid() {
+                meter.quarantine();
+                return;
+            }
+            let Some(reason) = Bytes::copy_from_slice_metered(reason, meter) else {
+                meter.quarantine();
+                return;
+            };
+            if fanout
+                .prepare(&endpoint, ControlKind::Close, || ConnectionEvent::Close {
+                    error_code,
+                    reason: reason.clone(),
+                })
+                .is_err()
+            {
+                meter.quarantine();
+                return;
+            }
+            if fanout
+                .apply(&mut endpoint, ControlKind::Close, |endpoint, _| {
+                    endpoint.recv_state.connections.close = Some((error_code, reason));
+                    [None, None]
+                })
+                .is_err()
+            {
+                meter.quarantine();
+                return;
+            }
+        } else {
+            let reason = Bytes::copy_from_slice(reason);
+            endpoint.recv_state.connections.close = Some((error_code, reason.clone()));
+            for sender in endpoint.recv_state.connections.catalog.values() {
+                let _ = sender.send_control(
+                    ForwardControlPermit::Legacy,
+                    ConnectionEvent::Close {
+                        error_code,
+                        reason: reason.clone(),
+                    },
+                );
+            }
+        }
+        drop(endpoint);
+        fanout.finish();
         self.inner.shared.incoming.notify_waiters();
     }
 
@@ -389,7 +433,7 @@ impl Endpoint {
     pub async fn wait_idle(&self) {
         loop {
             {
-                let endpoint = &mut *self.inner.state.lock().unwrap();
+                let endpoint = &mut *self.inner.lock_state();
                 if endpoint.recv_state.connections.is_empty() {
                     break;
                 }
@@ -406,7 +450,7 @@ impl Endpoint {
     pub async fn wait_idle_or_driver_lost(&self) -> bool {
         loop {
             let notified = {
-                let endpoint = &mut *self.inner.state.lock().unwrap();
+                let endpoint = &mut *self.inner.lock_state();
                 if let Some(idle) = idle_or_driver_lost(
                     endpoint.driver_lost,
                     endpoint.recv_state.connections.is_empty(),
@@ -451,6 +495,13 @@ pub struct EndpointStats {
     ///
     /// Packets received on the temporarily retained previous socket do not advance this value.
     pub current_socket_rx_rebind_generation: u64,
+    /// Unadmitted UDP datagrams rejected for backing or owned-event capacity.
+    /// Retains the existing combined counter's semantics.
+    pub budget_rejected_datagrams: u64,
+    /// GRO segments rejected before Proto because receive backing was full.
+    pub receive_backing_rejected_datagrams: u64,
+    /// Datagrams rejected by owned-event admission (slots or an outstanding reservation).
+    pub owned_event_rejected_datagrams: u64,
 }
 
 /// A future that drives IO on an endpoint
@@ -471,11 +522,27 @@ impl Future for EndpointDriver {
     type Output = Result<(), io::Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        let mut endpoint = self.0.state.lock().unwrap();
-        if endpoint.driver.is_none() {
-            endpoint.driver = Some(cx.waker().clone());
+        let mut endpoint = self.0.lock_state();
+        // A future may be moved between tasks after its first poll. Last-handle
+        // Drop must wake the current driver, not the original polling task.
+        match &mut endpoint.driver {
+            Some(waker) => waker.clone_from(cx.waker()),
+            None => endpoint.driver = Some(cx.waker().clone()),
         }
 
+        if endpoint.driver_lost {
+            return Poll::Ready(Err(io::Error::other("endpoint state unavailable")));
+        }
+        if endpoint
+            .recv_state
+            .backing_meter
+            .as_ref()
+            .is_some_and(BackingMeter::is_quarantined)
+        {
+            return Poll::Ready(Err(io::Error::other(
+                "endpoint receive authority quarantined",
+            )));
+        }
         let now = endpoint.runtime.now();
         let mut keep_going = false;
         keep_going |= endpoint.drive_recv(cx, now)?;
@@ -504,8 +571,16 @@ impl Future for EndpointDriver {
 
 impl Drop for EndpointDriver {
     fn drop(&mut self) {
-        let mut endpoint = self.0.state.lock().unwrap();
+        let mut endpoint = self.0.lock_state();
         endpoint.driver_lost = true;
+        // A queued Drained witness may already own its ACK sender, so no
+        // subsequent Connection Drop is guaranteed to report its loss. Record
+        // quarantine at this owner before discarding any live settlement.
+        if !endpoint.recv_state.connections.is_empty() {
+            if let Some(meter) = endpoint.recv_state.backing_meter.as_ref() {
+                meter.quarantine();
+            }
+        }
         self.0.shared.incoming.notify_waiters();
         self.0.shared.idle.notify_waiters();
         // No endpoint event can be acknowledged once this driver is gone.
@@ -514,27 +589,134 @@ impl Drop for EndpointDriver {
         // to fail closed instead of waiting forever.
         endpoint.events.close();
         while endpoint.events.try_recv().is_ok() {}
+        // A reverse event held for forward capacity may carry the one-shot
+        // release witness. Drop it now so its waiter sees driver loss.
+        endpoint.pending_reverse_event = None;
         // Drop all outgoing channels, signaling the termination of the endpoint to the associated
         // connections.
-        endpoint.recv_state.connections.senders.clear();
+        endpoint.recv_state.connections.catalog.clear();
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct EndpointInner {
+    pub(crate) self_weak: std::sync::Weak<EndpointInner>,
     pub(crate) state: Mutex<State>,
     pub(crate) shared: Shared,
 }
 
 impl EndpointInner {
+    /// Recover only to the original fatal authority, never to ordinary publication.
+    /// Drop and observations must not panic again and hide an opaque constructor panic.
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, State> {
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                if let Some(meter) = &state.recv_state.backing_meter {
+                    meter.quarantine();
+                }
+                state.driver_lost = true;
+                state
+            }
+        }
+    }
+
+    /// Control-only reverse settlement. The caller holds its Connection lock;
+    /// this path must never acquire a Connection lock or wait for a DATA slot.
+    pub(crate) fn settle_connection_event(
+        &self,
+        ch: ConnectionHandle,
+        event: ConnectionToEndpointEvent,
+    ) -> Result<Option<proto::ConnectionEvent>, ()> {
+        let mut state = self.state.lock().map_err(|_| ())?;
+        if !state.registration_inventory_valid() {
+            if let Some(meter) = &state.recv_state.backing_meter {
+                meter.quarantine();
+            }
+            return Err(());
+        }
+        if state.driver_lost || !state.recv_state.connections.catalog.contains_key(&ch) {
+            return Err(());
+        }
+        match event {
+            ConnectionToEndpointEvent::AuthenticatedCurrentSocketRx(key, generation) => {
+                if !state.inner.registration_matches(ch, key) {
+                    if key.is_none() && state.inner.native_registration() {
+                        return Err(());
+                    }
+                    return Ok(None);
+                }
+                state.note_authenticated_socket(ch, key, generation);
+                Ok(None)
+            }
+            ConnectionToEndpointEvent::Proto {
+                event,
+                endpoint_released: None,
+            } if !event.is_drained() => {
+                let outcome = state.inner.handle_event_checked(ch, event);
+                if outcome.disposition == proto::EndpointEventDisposition::Rejected {
+                    Err(())
+                } else {
+                    Ok(outcome.response)
+                }
+            }
+            _ => Err(()),
+        }
+    }
+    /// Same control Root, with the real Connection exclusively loaned by its
+    /// State lock. Every reply admission/Pool lock precedes route publication.
+    pub(crate) fn settle_connection_protocol(
+        &self,
+        ch: ConnectionHandle,
+        event: proto::EndpointEvent,
+        connection: &mut proto::Connection,
+    ) -> Result<(), ()> {
+        let mut state = self.lock_state();
+        if !state.registration_inventory_valid() {
+            if let Some(meter) = &state.recv_state.backing_meter {
+                meter.quarantine();
+            }
+            return Err(());
+        }
+        if state.driver_lost || !state.recv_state.connections.catalog.contains_key(&ch) {
+            return Err(());
+        }
+        let outcome = state.inner.handle_connection_event(ch, event, connection);
+        if outcome.disposition == proto::EndpointEventDisposition::Rejected
+            || outcome.response.is_some()
+        {
+            Err(())
+        } else {
+            Ok(())
+        }
+    }
     pub(crate) fn accept(
         &self,
         incoming: proto::Incoming,
         server_config: Option<Arc<ServerConfig>>,
     ) -> Result<Connecting, ConnectionError> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock_state();
+        if state.driver_lost {
+            return Err(ConnectionError::LocallyClosed);
+        }
         let mut response_buffer = Vec::new();
         let now = state.runtime.now();
+        if state
+            .recv_state
+            .backing_meter
+            .as_ref()
+            .and_then(BackingMeter::budget_limit)
+            .is_some()
+            && state.recv_state.connections.catalog.len() >= BUDGETED_CONNECTION_LIMIT
+        {
+            return Err(ConnectionError::LocallyClosed);
+        }
+        let forward = budgeted_events::connection_channels(
+            state.recv_state.backing_meter.as_ref(),
+            BUDGETED_FORWARD_ORDINARY_CAPACITY,
+        )
+        .map_err(|_| ConnectionError::LocallyClosed)?;
         match state
             .inner
             .accept(incoming, now, &mut response_buffer, server_config)
@@ -543,10 +725,15 @@ impl EndpointInner {
                 state.stats.accepted_handshakes += 1;
                 let socket = state.socket.clone();
                 let runtime = state.runtime.clone();
-                Ok(state
+                let registration = (self.self_weak.clone(), state.inner.registration_observer());
+                let (connecting, start) = state
                     .recv_state
                     .connections
-                    .insert(handle, conn, socket, runtime))
+                    .insert(handle, conn, socket, runtime, forward, registration)
+                    .map_err(|_| ConnectionError::LocallyClosed)?;
+                drop(state);
+                start.start();
+                Ok(connecting)
             }
             Err(error) => {
                 if let Some(transmit) = error.response {
@@ -559,7 +746,7 @@ impl EndpointInner {
     }
 
     pub(crate) fn refuse(&self, incoming: proto::Incoming) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock_state();
         state.stats.refused_handshakes += 1;
         let now = state.runtime.now();
         let mut response_buffer = Vec::new();
@@ -569,7 +756,7 @@ impl EndpointInner {
     }
 
     pub(crate) fn retry(&self, incoming: proto::Incoming) -> Result<(), proto::RetryError> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock_state();
         let now = state.runtime.now();
         let mut response_buffer = Vec::new();
         let transmit = state.inner.retry(incoming, &mut response_buffer)?;
@@ -579,7 +766,7 @@ impl EndpointInner {
     }
 
     pub(crate) fn ignore(&self, incoming: proto::Incoming) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock_state();
         state.stats.ignored_handshakes += 1;
         state.inner.ignore(incoming);
     }
@@ -591,12 +778,13 @@ pub(crate) struct State {
     /// During active migration, the previous socket receives traffic until every connection that
     /// was live at rebind has authenticated a packet from the current socket or drained.
     prev_socket: Option<Arc<dyn AsyncUdpSocket>>,
-    prev_socket_connections: PreviousSocketConnections,
+    prev_socket_connections: PreviousSocketInventory,
     inner: proto::Endpoint,
     recv_state: RecvState,
     driver: Option<Waker>,
     ipv6: bool,
     events: mpsc::UnboundedReceiver<(ConnectionHandle, ConnectionToEndpointEvent)>,
+    pending_reverse_event: Option<(ConnectionHandle, ConnectionToEndpointEvent)>,
     driver_lost: bool,
     runtime: Arc<dyn Runtime>,
     stats: EndpointStats,
@@ -650,8 +838,9 @@ pub(crate) struct Shared {
 
 impl State {
     fn drive_recv(&mut self, cx: &mut Context, now: Instant) -> Result<bool, io::Error> {
-        let get_time = || self.runtime.now();
-        self.recv_state.recv_limiter.start_cycle(get_time);
+        self.recv_state
+            .recv_limiter
+            .start_cycle(|| self.runtime.now());
         if let Some(socket) = &self.prev_socket {
             // We don't care about the `PollProgress` from old sockets.
             let poll_res = self.recv_state.poll_socket(
@@ -663,8 +852,7 @@ impl State {
                 None,
             );
             if poll_res.is_err() {
-                self.prev_socket = None;
-                self.prev_socket_connections = PreviousSocketConnections::default();
+                self.discard_failed_previous_socket();
             }
         };
         let poll_res = self.recv_state.poll_socket(
@@ -675,14 +863,44 @@ impl State {
             now,
             Some(self.stats.socket_rebinds),
         );
-        self.recv_state.recv_limiter.finish_cycle(get_time);
+        self.recv_state
+            .recv_limiter
+            .finish_cycle(|| self.runtime.now());
         let poll_res = poll_res?;
         Ok(poll_res.keep_going)
     }
 
     fn handle_events(&mut self, cx: &mut Context, shared: &Shared) -> bool {
+        // Native ordinary replies settle synchronously with the actual receiver.
+        // Do not take a corrupt Legacy pending value before checking its owner.
+        if self.inner.native_registration() && self.pending_reverse_event.is_some() {
+            if let Some(meter) = &self.recv_state.backing_meter {
+                meter.quarantine();
+            }
+            return false;
+        }
         for _ in 0..IO_LOOP_BOUND {
-            let (ch, event) = match self.events.poll_recv(cx) {
+            let (ch, event) = match self
+                .pending_reverse_event
+                .take()
+                .map(|event| Poll::Ready(Some(event)))
+                .unwrap_or_else(|| {
+                    let connections = &mut self.recv_state.connections;
+                    for _ in 0..2 {
+                        if let Some(index) = connections.terminal_ready.take() {
+                            if let Some(event) = connections.catalog.poll_terminal(index, cx) {
+                                return Poll::Ready(Some(event));
+                            }
+                        }
+                        if connections.terminal_wait.as_mut().poll(cx).is_pending() {
+                            break;
+                        }
+                        connections
+                            .terminal_wait
+                            .set(connections.terminal_ready.notify.clone().notified_owned());
+                    }
+                    self.events.poll_recv(cx)
+                }) {
                 Poll::Ready(Some(x)) => x,
                 Poll::Ready(None) => unreachable!("EndpointInner owns one sender"),
                 Poll::Pending => {
@@ -690,17 +908,31 @@ impl State {
                 }
             };
 
+            if !self.registration_inventory_valid() {
+                if let Some(meter) = &self.recv_state.backing_meter {
+                    meter.quarantine();
+                }
+                continue;
+            }
+            if self.inner.native_registration()
+                && !matches!(&event, ConnectionToEndpointEvent::Proto { event, .. } if event.is_drained())
+            {
+                if let Some(meter) = &self.recv_state.backing_meter {
+                    meter.quarantine();
+                }
+                continue;
+            }
             let (event, endpoint_released) = match event {
-                ConnectionToEndpointEvent::AuthenticatedCurrentSocketRx(generation) => {
-                    self.stats.current_socket_rx_rebind_generation = self
-                        .stats
-                        .current_socket_rx_rebind_generation
-                        .max(generation);
-                    self.prev_socket_connections
-                        .note_authenticated_current_socket_packet(ch, generation);
-                    if !self.prev_socket_connections.must_retain_previous_socket() {
-                        self.prev_socket = None;
+                ConnectionToEndpointEvent::AuthenticatedCurrentSocketRx(key, generation) => {
+                    if !self.inner.registration_matches(ch, key) {
+                        if key.is_none() && self.inner.native_registration() {
+                            if let Some(meter) = &self.recv_state.backing_meter {
+                                meter.quarantine();
+                            }
+                        }
+                        continue;
                     }
+                    self.note_authenticated_socket(ch, key, generation);
                     continue;
                 }
                 ConnectionToEndpointEvent::Proto {
@@ -708,34 +940,85 @@ impl State {
                     endpoint_released,
                 } => (event, endpoint_released),
             };
-            if event.is_drained() {
-                self.recv_state.connections.senders.remove(&ch);
-                self.prev_socket_connections.note_connection_drained(ch);
-                if !self.prev_socket_connections.must_retain_previous_socket() {
-                    self.prev_socket = None;
+            let mut permit = None;
+            if !event.is_drained() {
+                if let Some(sender) = self.recv_state.connections.catalog.get(&ch) {
+                    match sender.poll_reserve_proto(cx) {
+                        Poll::Ready(Ok(reserved)) => permit = Some(reserved),
+                        Poll::Pending => {
+                            self.pending_reverse_event = Some((
+                                ch,
+                                ConnectionToEndpointEvent::Proto {
+                                    event,
+                                    endpoint_released,
+                                },
+                            ));
+                            return false;
+                        }
+                        Poll::Ready(Err(_)) => {
+                            if let Some(meter) = self.recv_state.backing_meter.as_ref() {
+                                meter.quarantine();
+                            }
+                        }
+                    }
+                } else if let Some(meter) = self.recv_state.backing_meter.as_ref() {
+                    meter.quarantine();
                 }
+            }
+            let was_settled = self
+                .inner
+                .registration_was_settled(event.registration_key());
+            let mut outcome = self.inner.handle_event_checked(ch, event);
+            if outcome.disposition == proto::EndpointEventDisposition::Accepted && outcome.terminal
+            {
+                // Only a matched Proto retirement permits host/terminal-key settlement.
+                if !self
+                    .recv_state
+                    .connections
+                    .catalog
+                    .remove(&ch, outcome.registration)
+                {
+                    if let Some(meter) = &self.recv_state.backing_meter {
+                        meter.quarantine();
+                    }
+                    continue;
+                }
+                self.note_socket_connection_drained(ch);
+                outcome.finish_settlement();
                 if self.recv_state.connections.is_empty() {
                     shared.idle.notify_waiters();
                 }
             }
-            let event = self.inner.handle_event(ch, event);
             if let Some(endpoint_released) = endpoint_released {
-                let _ = endpoint_released.send(());
+                if outcome.disposition == proto::EndpointEventDisposition::Accepted || was_settled {
+                    let _ = endpoint_released.send(());
+                }
             }
+            let event = outcome.response;
             let Some(event) = event else {
                 continue;
             };
             // Ignoring errors from dropped connections that haven't yet been cleaned up
-            let _ = self
-                .recv_state
-                .connections
-                .senders
-                .get_mut(&ch)
-                .unwrap()
-                .send(ConnectionEvent::Proto {
-                    event,
-                    current_socket_rx_rebind_generation: None,
-                });
+            if let (Some(sender), Some(permit)) =
+                (self.recv_state.connections.catalog.get(&ch), permit)
+            {
+                if sender
+                    .send_proto(
+                        permit,
+                        ConnectionEvent::Proto {
+                            event,
+                            current_socket_rx_rebind_generation: None,
+                        },
+                    )
+                    .is_err()
+                {
+                    if let Some(meter) = self.recv_state.backing_meter.as_ref() {
+                        meter.quarantine();
+                    }
+                }
+            } else if let Some(meter) = self.recv_state.backing_meter.as_ref() {
+                meter.quarantine();
+            }
         }
 
         true
@@ -804,7 +1087,9 @@ fn proto_ecn(ecn: udp::EcnCodepoint) -> proto::EcnCodepoint {
 #[derive(Debug)]
 struct ConnectionSet {
     /// Senders for communicating with the endpoint's connections
-    senders: FxHashMap<ConnectionHandle, mpsc::UnboundedSender<ConnectionEvent>>,
+    catalog: Catalog,
+    terminal_ready: Arc<budgeted_events::TerminalReady>,
+    terminal_wait: Pin<Box<tokio::sync::futures::OwnedNotified>>,
     /// Stored to give out clones to new ConnectionInners
     sender: mpsc::UnboundedSender<(ConnectionHandle, ConnectionToEndpointEvent)>,
     /// Set if the endpoint has been manually closed
@@ -818,21 +1103,71 @@ impl ConnectionSet {
         conn: proto::Connection,
         socket: Arc<dyn AsyncUdpSocket>,
         runtime: Arc<dyn Runtime>,
-    ) -> Connecting {
-        let (send, recv) = mpsc::unbounded_channel();
+        forward: budgeted_events::ConnectionChannels,
+        registration: (
+            std::sync::Weak<EndpointInner>,
+            Option<proto::RegistrationObserver>,
+        ),
+    ) -> Result<(Connecting, crate::connection::ConnectionStart), ConnectError> {
+        let (owner, registration_observer) = registration;
+        let key = conn.registration_key();
+        let (send, recv) = forward.forward;
+        let mut ready = None;
+        let terminal = forward.terminal.map(|(sender, receiver)| {
+            ready = Some((self.terminal_ready.clone(), handle.0));
+            (sender, receiver)
+        });
         if let Some((error_code, ref reason)) = self.close {
-            send.send(ConnectionEvent::Close {
-                error_code,
-                reason: reason.clone(),
-            })
-            .unwrap();
+            if let Ok(permit) = send.reserve_control(ControlKind::Close) {
+                let _ = send.send_control(
+                    permit,
+                    ConnectionEvent::Close {
+                        error_code,
+                        reason: reason.clone(),
+                    },
+                );
+            }
         }
-        self.senders.insert(handle, send);
-        Connecting::new(handle, conn, self.sender.clone(), recv, socket, runtime)
+        let owner = send.is_budgeted().then_some(owner);
+        let meter = conn.receive_backing_meter();
+        let (terminal_sender, terminal_receiver) = match terminal {
+            Some((sender, receiver)) => (Some(sender), Some(receiver)),
+            None => (None, None),
+        };
+        let entry = catalog::Entry {
+            handle,
+            key,
+            sender: send,
+            terminal: terminal_receiver,
+            previous_socket: None,
+        };
+        if (entry.terminal.is_some() && !key.is_some_and(|key| self.catalog.reserve(key)))
+            || !self.catalog.can_publish(&entry)
+        {
+            if let Some(meter) = &meter {
+                meter.quarantine();
+            }
+            return Err(ConnectError::EventCapacityUnavailable);
+        }
+        self.catalog.publish(entry);
+        let mut events = budgeted_events::EndpointEventSender::new(
+            self.sender.clone(),
+            owner,
+            meter,
+            terminal_sender,
+        );
+        events.ready = ready;
+        if let Some(observer) = registration_observer {
+            events.prepare_registration();
+            if let Some(key) = conn.registration_key() {
+                events.bind_registration(observer.bind(key));
+            }
+        }
+        Ok(Connecting::new(handle, conn, events, recv, socket, runtime))
     }
 
     fn is_empty(&self) -> bool {
-        self.senders.is_empty()
+        self.catalog.is_empty()
     }
 }
 
@@ -856,7 +1191,7 @@ impl Future for Accept<'_> {
     type Output = Option<Incoming>;
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
-        let mut endpoint = this.endpoint.inner.state.lock().unwrap();
+        let mut endpoint = this.endpoint.inner.lock_state();
         if endpoint.driver_lost {
             return Poll::Ready(None);
         }
@@ -891,10 +1226,15 @@ impl EndpointRef {
         inner: proto::Endpoint,
         ipv6: bool,
         runtime: Arc<dyn Runtime>,
+        backing_meter: Option<BackingMeter>,
+        recv_buffer: PreparedRecvBuffer,
     ) -> Self {
         let (sender, events) = mpsc::unbounded_channel();
-        let recv_state = RecvState::new(sender, socket.max_receive_segments(), &inner);
-        Self(Arc::new(EndpointInner {
+        let recv_state = RecvState::new(sender, backing_meter, recv_buffer);
+        let prev_socket_connections =
+            PreviousSocketInventory::new(recv_state.connections.catalog.is_native());
+        Self(Arc::new_cyclic(|owner| EndpointInner {
+            self_weak: owner.clone(),
             shared: Shared {
                 incoming: Notify::new(),
                 idle: Notify::new(),
@@ -903,10 +1243,11 @@ impl EndpointRef {
             state: Mutex::new(State {
                 socket,
                 prev_socket: None,
-                prev_socket_connections: PreviousSocketConnections::default(),
+                prev_socket_connections,
                 inner,
                 ipv6,
                 events,
+                pending_reverse_event: None,
                 driver: None,
                 driver_lost: false,
                 recv_state,
@@ -930,7 +1271,7 @@ impl Drop for EndpointRef {
             return;
         }
 
-        let endpoint = &mut *self.0.state.lock().unwrap();
+        let endpoint = &mut *self.0.lock_state();
         // If the driver is about to be on its own, ensure it can shut down if the last
         // connection is gone.
         if let Some(task) = endpoint.driver.take() {
@@ -951,30 +1292,124 @@ struct RecvState {
     incoming: VecDeque<proto::Incoming>,
     connections: ConnectionSet,
     recv_buf: Box<[u8]>,
+    /// Drops after recv_buf, returning its exact cold allocation layout.
+    recv_buf_reservation: Option<BackingBudgetReservation>,
+    response_scratch: Option<proto::ResponseScratch>,
+    max_receive_segments: usize,
     recv_limiter: WorkLimiter,
+    backing_meter: Option<BackingMeter>,
+    budget_rejected_datagrams: u64,
+    receive_backing_rejected_datagrams: u64,
+    owned_event_rejected_datagrams: u64,
+}
+
+struct PreparedRecvBuffer {
+    buf: Box<[u8]>,
+    reservation: Option<BackingBudgetReservation>,
+    max_receive_segments: usize,
+    catalog: Catalog,
+    response_scratch: Option<proto::ResponseScratch>,
 }
 
 impl RecvState {
+    fn prepare_buffer(
+        config: &EndpointConfig,
+        socket: &dyn AsyncUdpSocket,
+        meter: Option<&BackingMeter>,
+        client_only: bool,
+    ) -> io::Result<PreparedRecvBuffer> {
+        let max_receive_segments = socket.max_receive_segments();
+        let slot_len = (config.get_max_udp_payload_size().min(64 * 1024) as usize)
+            .checked_mul(max_receive_segments)
+            .filter(|len| *len > 0)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "receive slot layout"))?;
+        let total = slot_len
+            .checked_mul(BATCH_SIZE)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "receive batch layout"))?;
+        let native = client_only && meter.is_some_and(|meter| meter.budget_limit().is_some());
+        let response_layout = if native {
+            proto::ResponseScratch::layout_bytes(slot_len)?
+        } else {
+            0
+        };
+        if let Some(limit) = meter.and_then(BackingMeter::budget_limit) {
+            let one_datagram = BytesMut::metered_copy_layout_for_len(slot_len)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "receive copy layout"))?;
+            if total
+                .checked_add(one_datagram)
+                .and_then(|needed| needed.checked_add(response_layout))
+                .is_none_or(|needed| needed > limit)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "receive budget cannot hold batch and one legal datagram",
+                ));
+            }
+        }
+        let reservation = meter
+            .map(|meter| meter.reserve_cold_layout(total))
+            .transpose()
+            .map_err(|error| io::Error::other(format!("receive buffer admission {error:?}")))?
+            .flatten();
+        let buf = if reservation.is_some() {
+            let layout = Layout::array::<u8>(total).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "receive buffer layout")
+            })?;
+            let raw = unsafe { alloc_zeroed(layout) };
+            if raw.is_null() {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "receive buffer allocation",
+                ));
+            }
+            // SAFETY: raw was allocated zeroed with exactly the [u8; total]
+            // layout, which Box<[u8]> uses to deallocate after the driver drops.
+            unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(raw, total)) }
+        } else {
+            vec![0; total].into()
+        };
+        let catalog = Catalog::prepare(meter)?;
+        let response_scratch = if native {
+            meter
+                .map(|meter| proto::ResponseScratch::prepare(slot_len, meter))
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(PreparedRecvBuffer {
+            catalog,
+            buf,
+            reservation,
+            max_receive_segments,
+            response_scratch,
+        })
+    }
+
     fn new(
         sender: mpsc::UnboundedSender<(ConnectionHandle, ConnectionToEndpointEvent)>,
-        max_receive_segments: usize,
-        endpoint: &proto::Endpoint,
+        backing_meter: Option<BackingMeter>,
+        prepared: PreparedRecvBuffer,
     ) -> Self {
-        let recv_buf = vec![
-            0;
-            endpoint.config().get_max_udp_payload_size().min(64 * 1024) as usize
-                * max_receive_segments
-                * BATCH_SIZE
-        ];
+        let terminal_ready = Arc::new(budgeted_events::TerminalReady::default());
+        let terminal_wait = Box::pin(terminal_ready.notify.clone().notified_owned());
         Self {
             connections: ConnectionSet {
-                senders: FxHashMap::default(),
+                catalog: prepared.catalog,
+                terminal_ready,
+                terminal_wait,
                 sender,
                 close: None,
             },
             incoming: VecDeque::new(),
-            recv_buf: recv_buf.into(),
+            recv_buf: prepared.buf,
+            recv_buf_reservation: prepared.reservation,
+            response_scratch: prepared.response_scratch,
+            max_receive_segments: prepared.max_receive_segments,
             recv_limiter: WorkLimiter::new(RECV_TIME_BOUND),
+            backing_meter,
+            budget_rejected_datagrams: 0,
+            receive_backing_rejected_datagrams: 0,
+            owned_event_rejected_datagrams: 0,
         }
     }
 
@@ -987,6 +1422,9 @@ impl RecvState {
         now: Instant,
         current_socket_rx_rebind_generation: Option<u64>,
     ) -> Result<PollProgress, io::Error> {
+        // Covers decode/signing and the synchronous socket callback, including
+        // the default configuration without a logical pacing reservation.
+        let _response_panic = fanout::RootPanic(&self.backing_meter);
         let mut metas = [RecvMeta::default(); BATCH_SIZE];
         let mut iovs: [IoSliceMut; BATCH_SIZE] = {
             let mut bufs = self
@@ -1004,19 +1442,93 @@ impl RecvState {
                 Poll::Ready(Ok(msgs)) => {
                     self.recv_limiter.record_work(msgs);
                     for (meta, buf) in metas.iter().zip(iovs.iter()).take(msgs) {
-                        let mut data: BytesMut = buf[0..meta.len].into();
+                        if meta.len == 0 {
+                            continue;
+                        }
+                        let mut data = if let Some(meter) = &self.backing_meter {
+                            match BytesMut::try_copy_from_slice_metered(&buf[..meta.len], meter) {
+                                Ok(data) => data,
+                                Err(MeteredCopyError::BudgetFull) => {
+                                    // This UDP datagram has not entered Proto or Root custody.
+                                    // QUIC may retransmit stream frames; DATAGRAM loss is counted.
+                                    let segments = meta.len.div_ceil(meta.stride.max(1));
+                                    let rejected = u64::try_from(segments).unwrap_or(u64::MAX);
+                                    self.budget_rejected_datagrams =
+                                        self.budget_rejected_datagrams.saturating_add(rejected);
+                                    self.receive_backing_rejected_datagrams = self
+                                        .receive_backing_rejected_datagrams
+                                        .saturating_add(rejected);
+                                    continue;
+                                }
+                                Err(error) => {
+                                    return Err(io::Error::other(format!(
+                                        "receive backing admission {error:?}"
+                                    )));
+                                }
+                            }
+                        } else {
+                            BytesMut::from(&buf[..meta.len])
+                        };
                         while !data.is_empty() {
                             let buf = data.split_to(meta.stride.min(data.len()));
+                            if let Some(meter) = &self.backing_meter {
+                                if !buf.charge_shared_backing(meter) {
+                                    return Err(io::Error::other("receive backing charge failed"));
+                                }
+                            }
                             let mut response_buffer = Vec::new();
-                            match endpoint.handle(
+                            let mut queue_full = false;
+                            let mut missing_sender = false;
+                            let senders = &self.connections.catalog;
+                            let response = if endpoint.native_registration() {
+                                proto::ResponseBuffer::from(
+                                    self.response_scratch.as_mut().ok_or_else(|| {
+                                        io::Error::other("native response authority unavailable")
+                                    })?,
+                                )
+                            } else {
+                                proto::ResponseBuffer::from(&mut response_buffer)
+                            };
+                            let admitted = endpoint.handle_with_admission(
                                 now,
                                 meta.addr,
                                 meta.dst_ip,
                                 meta.ecn.map(proto_ecn),
                                 buf,
-                                &mut response_buffer,
-                            ) {
-                                Some(DatagramEvent::NewConnection(incoming)) => {
+                                response,
+                                |handle| match senders.get(&handle) {
+                                    Some(sender) => match sender.reserve_proto() {
+                                        Ok(permit) => Some(permit),
+                                        Err(proto::owned_events::ReserveError::Full) => {
+                                            queue_full = true;
+                                            None
+                                        }
+                                        Err(proto::owned_events::ReserveError::Closed) => {
+                                            missing_sender = true;
+                                            None
+                                        }
+                                    },
+                                    None => {
+                                        missing_sender = true;
+                                        None
+                                    }
+                                },
+                            );
+                            if queue_full {
+                                self.budget_rejected_datagrams =
+                                    self.budget_rejected_datagrams.saturating_add(1);
+                                self.owned_event_rejected_datagrams =
+                                    self.owned_event_rejected_datagrams.saturating_add(1);
+                            }
+                            if missing_sender {
+                                if let Some(meter) = self.backing_meter.as_ref() {
+                                    meter.quarantine();
+                                }
+                            }
+                            match admitted {
+                                Some(proto::AdmittedDatagram::Other(
+                                    DatagramEvent::NewConnection(incoming),
+                                )) => {
                                     if self.connections.close.is_none() {
                                         self.incoming.push_back(incoming);
                                     } else {
@@ -1025,19 +1537,45 @@ impl RecvState {
                                         respond(transmit, &response_buffer, socket, endpoint, now);
                                     }
                                 }
-                                Some(DatagramEvent::ConnectionEvent(handle, event)) => {
-                                    // Ignoring errors from dropped connections that haven't yet been cleaned up
-                                    let _ =
-                                        self.connections.senders.get_mut(&handle).unwrap().send(
-                                            ConnectionEvent::Proto {
-                                                event,
-                                                current_socket_rx_rebind_generation,
-                                            },
-                                        );
+                                Some(proto::AdmittedDatagram::Connection(
+                                    handle,
+                                    event,
+                                    permit,
+                                )) => {
+                                    let sent = self.connections.catalog.get(&handle).is_some_and(
+                                        |sender| {
+                                            sender
+                                                .send_proto(
+                                                    permit,
+                                                    ConnectionEvent::Proto {
+                                                        event,
+                                                        current_socket_rx_rebind_generation,
+                                                    },
+                                                )
+                                                .is_ok()
+                                        },
+                                    );
+                                    if !sent {
+                                        if let Some(meter) = self.backing_meter.as_ref() {
+                                            meter.quarantine();
+                                        }
+                                    }
                                 }
-                                Some(DatagramEvent::Response(transmit)) => {
-                                    respond(transmit, &response_buffer, socket, endpoint, now);
+                                Some(proto::AdmittedDatagram::Other(DatagramEvent::Response(
+                                    transmit,
+                                ))) => {
+                                    let bytes = if endpoint.native_registration() {
+                                        self.response_scratch
+                                            .as_ref()
+                                            .map_or(&[][..], proto::ResponseScratch::as_slice)
+                                    } else {
+                                        &response_buffer
+                                    };
+                                    respond(transmit, bytes, socket, endpoint, now);
                                 }
+                                Some(proto::AdmittedDatagram::Other(
+                                    DatagramEvent::ConnectionEvent(..),
+                                )) => unreachable!("admitted connection has its own variant"),
                                 None => {}
                             }
                         }

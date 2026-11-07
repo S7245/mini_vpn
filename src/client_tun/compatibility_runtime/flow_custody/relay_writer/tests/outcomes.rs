@@ -105,7 +105,7 @@ fn discard(outcome: &mut WriterOutcome, budget: usize) -> Poll<WriterDiscardRece
 }
 
 async fn finish(commands: Vec<RelayCommand>, writer: Writer) -> WriterOutcome {
-    let (tx, rx) = mpsc::channel(8);
+    let (tx, rx) = crate::client_tun::uplink::channel(8);
     for command in commands {
         tx.try_send(command).unwrap();
     }
@@ -252,8 +252,8 @@ async fn successful_finish_retains_coalesced_current_and_post_finish_queue() {
 
 #[tokio::test]
 async fn outstanding_permit_stays_pending_until_actual_late_delivery_is_disposed() {
-    let (tx, rx) = mpsc::channel(2);
-    let permit = tx.clone().reserve_owned().await.unwrap();
+    let (tx, rx) = crate::client_tun::uplink::channel(2);
+    let permit = tx.legacy_sender_for_test().expect("original Legacy Tokio permit").clone().reserve_owned().await.unwrap();
     tx.try_send(RelayCommand::Finish).unwrap();
     let (signals, _signals_rx) = mpsc::channel(8);
     let (_stop, stop_rx) = tokio::sync::oneshot::channel();
@@ -280,7 +280,7 @@ async fn outstanding_permit_stays_pending_until_actual_late_delivery_is_disposed
 #[tokio::test]
 async fn stop_during_actual_pending_write_preserves_current_and_shutdown_error() {
     let probe = Arc::new(Probe::default());
-    let (tx, rx) = mpsc::channel(2);
+    let (tx, rx) = crate::client_tun::uplink::channel(2);
     tx.try_send(RelayCommand::Data(vec![1; 9])).unwrap();
     let (signals, _signals_rx) = mpsc::channel(8);
     let (stop, stop_rx) = tokio::sync::oneshot::channel();
@@ -384,7 +384,7 @@ async fn finish_shutdown_timeout_is_retained() {
 #[tokio::test]
 async fn legacy_io_and_receiver_drop_before_joinhandle_is_consumed() {
     let probe = Arc::new(Probe::default());
-    let (tx, rx) = mpsc::channel(4);
+    let (tx, rx) = crate::client_tun::uplink::channel(4);
     tx.try_send(RelayCommand::Finish).unwrap();
     tx.try_send(RelayCommand::Data(vec![1; 4])).unwrap();
     let (signals, _signals_rx) = mpsc::channel(8);
@@ -480,7 +480,7 @@ async fn receiver_close_waker_panic_keeps_source_and_sticky_entity_custody() {
             panic!("sender wake panic");
         }
     }
-    let (tx, rx) = mpsc::channel(2);
+    let (tx, rx) = crate::client_tun::uplink::channel(2);
     tx.try_send(RelayCommand::Data(vec![1; 3])).unwrap();
     let (signals, _signals_rx) = mpsc::channel(8);
     let (_stop, stop_rx) = tokio::sync::oneshot::channel();
@@ -497,7 +497,7 @@ async fn receiver_close_waker_panic_keeps_source_and_sticky_entity_custody() {
     )
     .await;
     tx.try_send(RelayCommand::Data(vec![2; 4])).unwrap();
-    let mut waiting = std::pin::pin!(tx.reserve_many(2));
+    let mut waiting = std::pin::pin!(tx.legacy_sender_for_test().expect("original Legacy Tokio waiter").reserve_many(2));
     let waker = Waker::from(Arc::new(PanicWake));
     assert!(
         waiting
@@ -579,7 +579,7 @@ async fn io_drop_panic_keeps_prior_errno_and_root_owned_buffers() {
 #[tokio::test]
 async fn legacy_panic_resumes_after_receiver_and_io_are_dropped() {
     let probe = Arc::new(Probe::default());
-    let (tx, rx) = mpsc::channel(2);
+    let (tx, rx) = crate::client_tun::uplink::channel(2);
     tx.try_send(RelayCommand::Data(vec![1; 2])).unwrap();
     let (signals, _signals_rx) = mpsc::channel(8);
     let (_stop, stop_rx) = tokio::sync::oneshot::channel();

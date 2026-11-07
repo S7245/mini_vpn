@@ -63,6 +63,14 @@ mod tracking {
                 purpose,
             }
         }
+        /// Recover only for an owner which explicitly quarantines poisoned state.
+        pub(crate) fn lock_recover(&self, purpose: &'static str) -> (MutexGuard<'_, T>, bool) {
+            let (guard, poisoned) = match self.inner.lock() {
+                Ok(guard) => (guard, false),
+                Err(error) => (error.into_inner(), true),
+            };
+            (MutexGuard { guard, start_time: Instant::now(), purpose }, poisoned)
+        }
     }
 
     pub(crate) struct MutexGuard<'a, T> {
@@ -73,6 +81,9 @@ mod tracking {
 
     impl<T> Drop for MutexGuard<'_, T> {
         fn drop(&mut self) {
+            // Diagnostics must never allocate or invoke a subscriber while the
+            // actual State guard is preserving an original panic payload.
+            if std::thread::panicking() { return; }
             if self.guard.last_lock_owner.len() == MAX_LOCK_OWNERS {
                 self.guard.last_lock_owner.pop_back();
             }
@@ -110,7 +121,7 @@ mod tracking {
 }
 
 #[cfg(feature = "lock_tracking")]
-pub(crate) use tracking::Mutex;
+pub(crate) use tracking::{Mutex, MutexGuard};
 
 #[cfg(not(feature = "lock_tracking"))]
 mod non_tracking {
@@ -138,6 +149,14 @@ mod non_tracking {
                 guard: self.inner.lock().unwrap(),
             }
         }
+        /// Recovery does not clear physical poison; the State owner fails closed.
+        pub(crate) fn lock_recover(&self, _purpose: &'static str) -> (MutexGuard<'_, T>, bool) {
+            let (guard, poisoned) = match self.inner.lock() {
+                Ok(guard) => (guard, false),
+                Err(error) => (error.into_inner(), true),
+            };
+            (MutexGuard { guard }, poisoned)
+        }
     }
 
     pub(crate) struct MutexGuard<'a, T> {
@@ -160,4 +179,4 @@ mod non_tracking {
 }
 
 #[cfg(not(feature = "lock_tracking"))]
-pub(crate) use non_tracking::Mutex;
+pub(crate) use non_tracking::{Mutex, MutexGuard};

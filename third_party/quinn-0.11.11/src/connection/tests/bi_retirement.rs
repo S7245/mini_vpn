@@ -18,7 +18,6 @@ fn send_retired(connection: &Connection, id: StreamId) -> bool {
         .0
         .state
         .lock("test send-side inventory")
-        .inner
         .send_stream(id)
         .stopped()
         .is_err()

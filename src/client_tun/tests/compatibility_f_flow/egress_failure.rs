@@ -119,6 +119,9 @@ impl TunIo for FaultDevice {
     fn rx_take(&mut self) -> Option<bytes::BytesMut> {
         self.inner.rx_take()
     }
+    fn rx_take_packet(&mut self) -> Option<crate::device::RxPacket> {
+        self.inner.rx_take_packet()
+    }
     fn stage_rx_for_iface(&mut self) -> bool {
         let selected = self.probe.fired.load(Ordering::SeqCst) > 0
             && self.inner.rx_peek().is_some_and(|bytes| {
@@ -160,7 +163,7 @@ impl TunIo for FaultDevice {
     fn queued_tx_bytes(&self) -> usize {
         self.inner.queued_tx_bytes()
     }
-    fn take_flushed_tcp_packets(&mut self) -> Vec<crate::device::TunFlushedTcpPacket> {
+    fn take_flushed_tcp_packets(&mut self) -> crate::device::FlushedTcpBatch<'_> {
         self.inner.take_flushed_tcp_packets()
     }
     fn inject_ip_packet(&mut self, pkt: &[u8]) {

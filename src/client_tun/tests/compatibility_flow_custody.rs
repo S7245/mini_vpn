@@ -107,8 +107,8 @@ async fn thin_relay_outer_supervision_preserves_dispatch_then_close() {
         payload: Some(payload.clone()),
         writer_shutdown: Arc::clone(&writer_shutdown),
     });
-    let (uplink_tx, uplink_rx) = mpsc::channel::<RelayCommand>(1);
-    let (back_tx, mut back_rx) = mpsc::channel(4);
+    let (uplink_tx, uplink_rx) = crate::client_tun::uplink::channel(1);
+    let (back_tx, mut back_rx) = crate::client_tun::relay_channel::channel(4);
     let (_credit_tx, credit_rx) = watch::channel(RelayReadCredit {
         paused: false,
         max_batch_bytes: 65_536,

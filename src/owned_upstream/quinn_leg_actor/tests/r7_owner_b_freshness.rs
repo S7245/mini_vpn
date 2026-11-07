@@ -30,70 +30,8 @@ use crate::resumable::{
     Record, STANDBY_CONTROL_V1, SessionId, SwitchHintCause,
 };
 use std::time::Duration;
-
-async fn make_exact_owner_slot_fresh(
-    slot: &mut OwnerStandbySlot,
-    server_b: &mut super::StartedQuinnLegActor,
-    client_b: &mut super::StartedQuinnLegActor,
-    registered_b: &ClientRegisteredStandby,
-    probe_sequence: ProbeSequence,
-    arrived_at: SimTime,
-    fresh_for: Duration,
-) {
-    assert_eq!(
-        slot.drive_exact_probe(
-            probe_sequence,
-            server_b.queue.as_mut().expect("owner B owns its sole FIFO"),
-        )
-        .expect("exact owner B probe enters its FIFO"),
-        OwnerStandbyProbeDrive::Enqueued { probe_sequence },
-    );
-    tokio::time::timeout(TEST_TIMEOUT, async {
-        loop {
-            match server_b
-                .try_flush(SimTime::ZERO)
-                .expect("owner B probe flush remains live")
-            {
-                QuinnLegActorFlushDisposition::Submitted => break,
-                QuinnLegActorFlushDisposition::OrderedDeliveryPending
-                | QuinnLegActorFlushDisposition::Idle => tokio::task::yield_now().await,
-            }
-        }
-    })
-    .await
-    .expect("owner B probe submission is bounded");
-    let inbound = tokio::time::timeout(TEST_TIMEOUT, client_b.recv_classified(STANDBY_CONTROL_V1))
-        .await
-        .expect("client B probe receive is bounded")
-        .expect("client B remains live")
-        .expect("client B receives the exact probe");
-    let pending_ack = match registered_b
-        .exact_leg_probe_responder()
-        .classify(take_actor_inbound(inbound))
-    {
-        ExactLegProbeResponse::Pending(pending) => pending,
-        ExactLegProbeResponse::Unhandled(_) => panic!("exact owner B probe lost provenance"),
-    };
-    pending_ack
-        .enqueue(client_b.queue.as_mut().expect("client B owns its FIFO"))
-        .expect("client B enqueues the exact ACK");
-    assert_eq!(
-        client_b
-            .try_flush(SimTime::ZERO)
-            .expect("client B ACK flush remains live"),
-        QuinnLegActorFlushDisposition::Submitted,
-    );
-    let inbound = tokio::time::timeout(TEST_TIMEOUT, server_b.recv_classified(STANDBY_CONTROL_V1))
-        .await
-        .expect("owner B ACK receive is bounded")
-        .expect("owner B remains live")
-        .expect("owner B receives the exact ACK");
-    slot.observe_exact_probe_ack(take_actor_inbound(inbound), arrived_at, fresh_for)
-        .expect("exact probe ACK mints slot-owned freshness");
-    wait_actor_ordered_delivery(client_b).await;
-    wait_actor_ordered_delivery(server_b).await;
-}
-
+mod probe_shutdown;
+use probe_shutdown::make_exact_owner_slot_fresh;
 /// Physical counterpart used by the owner-controller tracer. The ACK arrival
 /// timestamp is taken from the actor envelope under the same first-failure
 /// transaction that moves the exact probe ACK into the slot.
@@ -470,6 +408,8 @@ async fn owner_registered_b_becomes_fresh_only_after_its_exact_physical_probe_ac
     assert_eq!(fresh.fresh_until(), SimTime::from_nanos(250));
     assert!(standby_slot.probe_is_fresh_at(SimTime::from_nanos(250)));
     assert!(!standby_slot.probe_is_fresh_at(SimTime::from_nanos(251)));
+    let expired = standby_slot.expire_probe_freshness_at(SimTime::from_nanos(251));
+    assert_eq!(expired, Some(sequence));
     wait_actor_ordered_delivery(&mut client_b).await;
     make_exact_owner_slot_fresh(
         &mut standby_slot,
@@ -481,7 +421,6 @@ async fn owner_registered_b_becomes_fresh_only_after_its_exact_physical_probe_ac
         Duration::from_nanos(200),
     )
     .await;
-
     let (client_joined, server_a_joined, client_b_joined, server_b_joined) =
         tokio::time::timeout(TEST_TIMEOUT, async {
             tokio::join!(
@@ -536,6 +475,13 @@ async fn owner_switch_hint_adapter_preserves_wrong_and_queues_only_on_exact_phys
         mut standby_slot,
     } = real_registered_standby_fixture(2, 1).await;
     wait_actor_ordered_delivery(&mut server_b).await;
+    probe_shutdown::establish_hint_freshness(
+        &mut standby_slot,
+        &mut server_b,
+        &mut client_b,
+        &registered_b,
+    )
+    .await;
     let hint_binding = standby_slot
         .take_exact_hint_binding(server_b.queue.as_ref().expect("owner B owns its sole FIFO"))
         .expect("delivered exact registration exposes one owner hint binding");
@@ -1216,6 +1162,7 @@ async fn owner_b_composition_uses_actor_arrival_and_refreshes_only_after_expiry(
         },
     );
 
+    probe_shutdown::drain_second_probe(&mut owner_b, &mut client_b, &registered_b).await;
     wait_actor_ordered_delivery(&mut client_b).await;
     let (client_joined, server_a_joined, client_b_joined, owner_b_joined) =
         tokio::time::timeout(TEST_TIMEOUT, async {
@@ -1256,7 +1203,6 @@ async fn owner_b_composition_uses_actor_arrival_and_refreshes_only_after_expiry(
         .expect("owner B composition listener cleanup is bounded")
         .expect("owner B composition releases both actor slots");
 }
-
 #[tokio::test(flavor = "current_thread")]
 async fn owner_b_composition_rejects_ack_that_physically_arrives_after_probe_deadline() {
     let RealRegisteredStandbyFixture {
@@ -1384,7 +1330,7 @@ async fn owner_b_composition_rejects_ack_that_physically_arrives_after_probe_dea
             probe_sequence: ProbeSequence::new(2).unwrap(),
         },
     );
-
+    probe_shutdown::drain_second_probe(&mut owner_b, &mut client_b, &registered_b).await;
     wait_actor_ordered_delivery(&mut client_b).await;
     let (client_joined, server_a_joined, client_b_joined, owner_b_joined) =
         tokio::time::timeout(TEST_TIMEOUT, async {
@@ -1533,7 +1479,7 @@ async fn owner_b_composition_expires_no_ack_probe_through_actor_timer_gate() {
             probe_sequence: ProbeSequence::new(2).unwrap(),
         },
     );
-
+    probe_shutdown::drain_second_probe(&mut owner_b, &mut client_b, &registered_b).await;
     wait_actor_ordered_delivery(&mut client_b).await;
     let (client_joined, server_a_joined, client_b_joined, owner_b_joined) =
         tokio::time::timeout(TEST_TIMEOUT, async {

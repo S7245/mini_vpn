@@ -40,70 +40,14 @@ use tokio::sync::{Notify, mpsc};
 
 // ============================ 内存包管道 ============================
 
-/// 单向 IP 包管道（一端 push，另一端 pop + await）。内部 `Arc` 共享，可廉价 clone。
-#[derive(Clone, Default)]
-pub struct PacketLink {
-    queue: Arc<Mutex<VecDeque<BytesMut>>>,
-    notify: Arc<Notify>,
-    capacity_packets: Option<usize>,
-    dropped_packets: Arc<AtomicU64>,
-    high_water_packets: Arc<AtomicU64>,
-}
-
-impl PacketLink {
-    fn new() -> Self {
-        Self::default()
-    }
-    pub(crate) fn bounded(capacity_packets: usize) -> Self {
-        Self {
-            capacity_packets: Some(capacity_packets.max(1)),
-            ..Self::default()
-        }
-    }
-    pub(crate) fn push(&self, pkt: BytesMut) -> bool {
-        let mut queue = self.queue.lock().unwrap();
-        if self
-            .capacity_packets
-            .is_some_and(|capacity| queue.len() >= capacity)
-        {
-            self.dropped_packets.fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
-        queue.push_back(pkt);
-        self.high_water_packets
-            .fetch_max(queue.len() as u64, Ordering::Relaxed);
-        drop(queue);
-        self.notify.notify_one();
-        true
-    }
-    fn pop(&self) -> Option<BytesMut> {
-        self.queue.lock().unwrap().pop_front()
-    }
-    pub(crate) fn dropped_packets(&self) -> u64 {
-        self.dropped_packets.load(Ordering::Relaxed)
-    }
-    pub(crate) fn high_water_packets(&self) -> u64 {
-        self.high_water_packets.load(Ordering::Relaxed)
-    }
-}
-
-impl IngressPacketSource for PacketLink {
-    async fn read_packet(&mut self, slot: &mut PumpPacket) -> std::io::Result<SourceRead> {
-        loop {
-            if let Some(packet) = self.pop() {
-                slot.adopt(packet);
-                return Ok(SourceRead::Packet);
-            }
-            self.notify.notified().await;
-        }
-    }
-}
+mod packet_link;
+pub use packet_link::PacketLink;
 
 // ============================ 回环 Rx/Tx token（裸 IP，无 PI 头）============================
 
 /// 裸收货单：把回环管道里的一个 IP 包递给 smoltcp。
 pub struct RawRxToken {
-    buffer: BytesMut,
+    buffer: crate::device::RxPacket,
 }
 impl RxToken for RawRxToken {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(mut self, f: F) -> R {
@@ -163,261 +107,10 @@ fn busy_spin(d: Duration) {
     }
 }
 
-// ============================ SUT 侧回环设备（impl TunIo）============================
-
-/// 被测主循环（SUT）用的内存回环 TUN 设备：结构镜像 `VirtualTunDevice`
-/// （单槽 rx_buffer + tx_queue），只是数据来自 [`PacketLink`] 而非真 utun。
-pub struct LoopbackTunDevice {
-    rx_buffer: Option<BytesMut>,
-    iface_rx_queue: VecDeque<BytesMut>,
-    tx_queue: VecDeque<BytesMut>,
-    flushed_tcp_packets: Vec<TunFlushedTcpPacket>,
-    inbound: Option<PacketLink>,  // 发生器 → SUT
-    outbound: Option<PacketLink>, // SUT → 发生器
-    ingress_pump: Option<TunIngressPump>,
-    stopping: bool,
-    shutdown_failure: Option<std::io::ErrorKind>,
-    /// 刀12：每次 `flush_tx` 注入的合成 on-loop CPU 成本（busy-spin）。默认 ZERO。
-    /// `flush_tx` 在主循环 poll 段内（enter_poll/leave_poll 括起）→ 该 burn 计入 poll_time / loop-active，
-    /// 用于验证 profiler 能侦测「主循环被 on-loop CPU 拖满」的饱和信号（T4 spike）。
-    cpu_burn_per_flush: Duration,
-    suppress_wait_after_tcp_payload_flush: bool,
-    wait_suppressed: bool,
-    max_tcp_payload_packets_per_flush: Arc<AtomicU64>,
-    mtu: usize,
-}
-
-impl LoopbackTunDevice {
-    pub(crate) fn new(inbound: PacketLink, outbound: PacketLink) -> Self {
-        Self::with_options(inbound, outbound, Duration::ZERO, false)
-    }
-
-    /// 带合成 on-loop CPU 成本的回环设备（T4：multi_thread 饱和 spike 用）。
-    fn with_burn(inbound: PacketLink, outbound: PacketLink, cpu_burn_per_flush: Duration) -> Self {
-        Self::with_options(inbound, outbound, cpu_burn_per_flush, false)
-    }
-
-    fn with_suppressed_wait_after_tcp_payload_flush(
-        inbound: PacketLink,
-        outbound: PacketLink,
-    ) -> Self {
-        Self::with_options(inbound, outbound, Duration::ZERO, true)
-    }
-
-    fn with_options(
-        inbound: PacketLink,
-        outbound: PacketLink,
-        cpu_burn_per_flush: Duration,
-        suppress_wait_after_tcp_payload_flush: bool,
-    ) -> Self {
-        Self {
-            rx_buffer: None,
-            iface_rx_queue: VecDeque::new(),
-            tx_queue: VecDeque::new(),
-            flushed_tcp_packets: Vec::new(),
-            inbound: Some(inbound),
-            outbound: Some(outbound),
-            stopping: false,
-            shutdown_failure: None,
-            ingress_pump: None,
-            cpu_burn_per_flush,
-            suppress_wait_after_tcp_payload_flush,
-            wait_suppressed: false,
-            max_tcp_payload_packets_per_flush: Arc::new(AtomicU64::new(0)),
-            mtu: 1500,
-        }
-    }
-
-    fn with_tcp_payload_flush_counter(mut self, counter: Arc<AtomicU64>) -> Self {
-        self.max_tcp_payload_packets_per_flush = counter;
-        self
-    }
-
-    #[cfg(test)]
-    fn with_mtu(mut self, mtu: usize) -> Self {
-        self.mtu = mtu;
-        self
-    }
-    #[cfg(test)]
-    pub(crate) fn with_ingress_pump(mut self, capacity_packets: usize) -> Self {
-        if !self.stopping && self.ingress_pump.is_none() {
-            if let Some(inbound) = &self.inbound {
-                self.ingress_pump = Some(TunIngressPump::spawn_source(
-                    inbound.clone(),
-                    capacity_packets,
-                ));
-            }
-        }
-        self
-    }
-}
-impl Drop for LoopbackTunDevice {
-    fn drop(&mut self) {
-        self.request_stop();
-    }
-}
-impl TunIo for LoopbackTunDevice {
-    fn request_stop(&mut self) {
-        self.stopping = true;
-        if let Some(pump) = &self.ingress_pump {
-            pump.request_stop();
-        }
-    }
-    fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<DeviceShutdown> {
-        self.request_stop();
-        let result = if let Some(pump) = &mut self.ingress_pump {
-            std::task::ready!(pump.poll_shutdown(cx))
-        } else {
-            DeviceShutdown::from_status(self.shutdown_failure)
-        };
-        self.shutdown_failure = result.io_kind();
-        self.ingress_pump.take();
-        self.inbound.take();
-        self.outbound.take();
-        self.rx_buffer.take();
-        drop(std::mem::take(&mut self.iface_rx_queue));
-        drop(std::mem::take(&mut self.tx_queue));
-        drop(std::mem::take(&mut self.flushed_tcp_packets));
-        Poll::Ready(result)
-    }
-    async fn wait_for_rx(&mut self) -> std::io::Result<()> {
-        if self.stopping {
-            return Err(device_closed());
-        }
-        if self.rx_buffer.is_some() {
-            return Ok(());
-        }
-        if self.wait_suppressed {
-            return std::future::pending::<std::io::Result<()>>().await;
-        }
-        if let Some(pump) = &mut self.ingress_pump {
-            self.rx_buffer = Some(pump.recv().await.ok_or_else(device_closed)??);
-            return Ok(());
-        }
-        let inbound = self.inbound.as_ref().ok_or_else(device_closed)?;
-        loop {
-            if let Some(pkt) = inbound.pop() {
-                self.rx_buffer = Some(pkt);
-                return Ok(());
-            }
-            // notify_one 在无 waiter 时保留 1 个 permit，不丢唤醒（pop→None 与 notified 之间的竞态安全）。
-            inbound.notify.notified().await;
-        }
-    }
-    fn try_recv_rx(&mut self) -> std::io::Result<bool> {
-        if self.stopping {
-            return Err(device_closed());
-        }
-        if self.rx_buffer.is_some() {
-            return Ok(true);
-        }
-        self.rx_buffer = if let Some(pump) = &mut self.ingress_pump {
-            match pump.try_recv() {
-                Ok(packet) => Some(packet?),
-                Err(mpsc::error::TryRecvError::Empty) => None,
-                Err(mpsc::error::TryRecvError::Disconnected) => return Err(device_closed()),
-            }
-        } else {
-            self.inbound.as_ref().and_then(PacketLink::pop)
-        };
-        Ok(self.rx_buffer.is_some())
-    }
-    fn rx_peek(&self) -> Option<&[u8]> {
-        if self.stopping {
-            return None;
-        }
-        self.rx_buffer.as_deref()
-    }
-    fn rx_take(&mut self) -> Option<BytesMut> {
-        if self.stopping {
-            return None;
-        }
-        self.rx_buffer.take()
-    }
-    fn can_stage_single_iface_rx(&self) -> bool {
-        self.iface_rx_queue.is_empty()
-    }
-    fn stage_rx_for_iface(&mut self) -> bool {
-        if self.stopping {
-            return false;
-        }
-        let Some(packet) = self.rx_buffer.take() else {
-            return false;
-        };
-        self.iface_rx_queue.push_back(packet);
-        true
-    }
-    async fn flush_tx(&mut self) -> std::io::Result<()> {
-        if self.stopping {
-            return Err(device_closed());
-        }
-        let outbound = self.outbound.as_ref().ok_or_else(device_closed)?;
-        busy_spin(self.cpu_burn_per_flush); // 刀12：合成 on-loop CPU（默认 ZERO 即 no-op）。
-        let mut tcp_payload_packets = 0u64;
-        while let Some(pkt) = self.tx_queue.pop_front() {
-            if let Some(packet) = summarize_flushed_ip_tcp_packet(&pkt) {
-                tcp_payload_packets = tcp_payload_packets.saturating_add(1);
-                if self.suppress_wait_after_tcp_payload_flush && packet.payload_bytes > 0 {
-                    self.wait_suppressed = true;
-                }
-                self.flushed_tcp_packets.push(packet);
-            }
-            outbound.push(pkt);
-        }
-        self.max_tcp_payload_packets_per_flush
-            .fetch_max(tcp_payload_packets, Ordering::Relaxed);
-        Ok(())
-    }
-    fn queued_tx_bytes(&self) -> usize {
-        self.tx_queue.iter().map(BytesMut::len).sum()
-    }
-    fn take_flushed_tcp_packets(&mut self) -> Vec<TunFlushedTcpPacket> {
-        std::mem::take(&mut self.flushed_tcp_packets)
-    }
-    fn tun_ingress_pump_snapshot(&self) -> TunIngressPumpSnapshot {
-        self.ingress_pump
-            .as_ref()
-            .map(TunIngressPump::snapshot)
-            .unwrap_or_default()
-    }
-    fn inject_ip_packet(&mut self, pkt: &[u8]) {
-        if self.stopping {
-            return;
-        }
-        self.tx_queue.push_back(BytesMut::from(pkt));
-    }
-}
-
-impl Device for LoopbackTunDevice {
-    type RxToken<'a> = RawRxToken;
-    type TxToken<'a> = QueueTxToken<'a>;
-    fn capabilities(&self) -> DeviceCapabilities {
-        loopback_caps_with_mtu(self.mtu)
-    }
-    fn receive(&mut self, _t: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if self.stopping {
-            return None;
-        }
-        self.iface_rx_queue.pop_front().map(|buffer| {
-            (
-                RawRxToken { buffer },
-                QueueTxToken {
-                    queue: &mut self.tx_queue,
-                },
-            )
-        })
-    }
-    fn transmit(&mut self, _t: SmolInstant) -> Option<Self::TxToken<'_>> {
-        if self.stopping {
-            return None;
-        }
-        Some(QueueTxToken {
-            queue: &mut self.tx_queue,
-        })
-    }
-}
-
-// ============================ 发生器侧设备（同步驱动）============================
+mod loopback;
+#[cfg(test)]
+pub(crate) use loopback::{LoopbackReceiveWatch, PartialFlushProbe};
+pub use loopback::LoopbackTunDevice;
 
 /// 流量发生器（第二 smoltcp 栈）用的设备：`receive` 直接从入站管道弹包、`transmit` 立即 push 出站。
 struct GeneratorDevice {
@@ -480,7 +173,7 @@ impl Device for GeneratorDevice {
                 *remaining = remaining.saturating_sub(1);
             }
             (
-                RawRxToken { buffer },
+                RawRxToken { buffer: buffer.into() },
                 LinkTxToken {
                     outbound: self.outbound.clone(),
                 },
@@ -844,20 +537,20 @@ impl ProxyUpstream for MockUpstream {
                 let _ = far_writer.shutdown().await;
             });
             let (reader, writer) = tokio::io::split(near);
-            return Ok(OpenedTcpRelay::NativeByteOwned(NativeTcpRelayStream {
-                reader: Box::new(HarnessNativeReader::new(reader)),
-                writer: Box::new(writer),
-            }));
+            return Ok(OpenedTcpRelay::NativeByteOwned(NativeTcpRelayStream::new(
+                Box::new(HarnessNativeReader::new(reader)),
+                Box::new(writer),
+            )));
         }
         let stream = self.open_tcp(target).await?;
         if !self.native_byte_owned {
             return Ok(OpenedTcpRelay::Generic(stream));
         }
         let (reader, writer) = tokio::io::split(stream);
-        Ok(OpenedTcpRelay::NativeByteOwned(NativeTcpRelayStream {
-            reader: Box::new(HarnessNativeReader::new(reader)),
-            writer: Box::new(writer),
-        }))
+        Ok(OpenedTcpRelay::NativeByteOwned(NativeTcpRelayStream::new(
+            Box::new(HarnessNativeReader::new(reader)),
+            Box::new(writer),
+        )))
     }
 
     fn open_is_cheap(&self) -> bool {
@@ -2647,16 +2340,16 @@ mod tests {
         let trigger = Arc::new(FailAfterWriteTrigger::default());
         let written_bytes = Arc::new(AtomicU64::new(0));
         let upstream = Arc::new(OneShotFailingD16Upstream {
-            relay: Mutex::new(Some(NativeTcpRelayStream {
-                reader: Box::new(FailAfterWriteReader {
+            relay: Mutex::new(Some(NativeTcpRelayStream::new(
+                Box::new(FailAfterWriteReader {
                     trigger: Arc::clone(&trigger),
                     failed: false,
                 }),
-                writer: Box::new(FailAfterWriteWriter {
+                Box::new(FailAfterWriteWriter {
                     trigger,
                     written_bytes: Arc::clone(&written_bytes),
                 }),
-            })),
+            ))),
         });
         let sut_device = LoopbackTunDevice::new(gen_to_sut.clone(), sut_to_gen.clone());
         let config = TunRuntimeConfig::h10d16_gate_a_for_test();
@@ -2782,10 +2475,10 @@ mod tests {
             .unwrap();
         let (send, recv) = connection.open_bi().await.unwrap();
         let upstream = Arc::new(OneShotRealQuinnD16Upstream {
-            relay: Mutex::new(Some(NativeTcpRelayStream {
-                reader: crate::tuic::d16_native_ordered_reader_for_test(recv, connection.clone()),
-                writer: Box::new(send),
-            })),
+            relay: Mutex::new(Some(NativeTcpRelayStream::new(
+                crate::tuic::d16_native_ordered_reader_for_test(recv, connection.clone()),
+                Box::new(send),
+            ))),
         });
 
         let gen_to_sut = PacketLink::bounded(RING_CAPACITY_PACKETS);
@@ -3007,10 +2700,10 @@ mod tests {
             .unwrap();
         let (send, recv) = connection.open_bi().await.unwrap();
         let upstream = Arc::new(OneShotRealQuinnD16Upstream {
-            relay: Mutex::new(Some(NativeTcpRelayStream {
-                reader: crate::tuic::d16_native_ordered_reader_for_test(recv, connection.clone()),
-                writer: Box::new(send),
-            })),
+            relay: Mutex::new(Some(NativeTcpRelayStream::new(
+                crate::tuic::d16_native_ordered_reader_for_test(recv, connection.clone()),
+                Box::new(send),
+            ))),
         });
 
         let gen_to_sut = PacketLink::bounded(RING_CAPACITY_PACKETS);

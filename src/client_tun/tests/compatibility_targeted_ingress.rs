@@ -123,6 +123,9 @@ impl TunIo for WireDevice {
     fn rx_take(&mut self) -> Option<bytes::BytesMut> {
         self.0.rx_take()
     }
+    fn rx_take_packet(&mut self) -> Option<crate::device::RxPacket> {
+        self.0.rx_take_packet()
+    }
     fn can_stage_single_iface_rx(&self) -> bool {
         self.1.coverage.fetch_add(1, Ordering::SeqCst);
         self.0.can_stage_single_iface_rx()
@@ -160,7 +163,7 @@ impl TunIo for WireDevice {
     fn queued_tx_bytes(&self) -> usize {
         self.0.queued_tx_bytes()
     }
-    fn take_flushed_tcp_packets(&mut self) -> Vec<TunFlushedTcpPacket> {
+    fn take_flushed_tcp_packets(&mut self) -> crate::device::FlushedTcpBatch<'_> {
         self.0.take_flushed_tcp_packets()
     }
     fn inject_ip_packet(&mut self, packet: &[u8]) {

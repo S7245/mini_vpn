@@ -1,3 +1,7 @@
+mod construction;
+mod state_lock;
+use state_lock::StateLock;
+pub(crate) use construction::ConnectionStart;
 use std::{
     any::Any,
     fmt,
@@ -20,6 +24,7 @@ use tokio::sync::{futures::Notified, mpsc, oneshot, Notify};
 use tracing::{debug_span, Instrument, Span};
 
 use crate::{
+    endpoint::budgeted_events::{EndpointEventSender, ForwardReceiver},
     mutex::Mutex,
     recv_stream::RecvStream,
     runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPoller},
@@ -84,7 +89,7 @@ impl ConnectionDrain {
         // already exited after an endpoint or socket I/O error. Forward the
         // exact Drained event while holding the same connection-state lock so
         // the endpoint-release acknowledgement is minted at most once.
-        conn.forward_endpoint_events();
+        let _ = conn.forward_endpoint_events();
         conn.wake();
     }
 
@@ -130,47 +135,6 @@ where
 }
 
 impl Connecting {
-    pub(crate) fn new(
-        handle: ConnectionHandle,
-        conn: proto::Connection,
-        endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, ConnectionToEndpointEvent)>,
-        conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
-        socket: Arc<dyn AsyncUdpSocket>,
-        runtime: Arc<dyn Runtime>,
-    ) -> Self {
-        let (on_handshake_data_send, on_handshake_data_recv) = oneshot::channel();
-        let (on_connected_send, on_connected_recv) = oneshot::channel();
-        let (endpoint_released_send, endpoint_released_recv) = oneshot::channel();
-        let (driver_released_send, driver_released_recv) = oneshot::channel();
-        let conn = ConnectionRef::new(
-            handle,
-            conn,
-            endpoint_events,
-            conn_events,
-            on_handshake_data_send,
-            on_connected_send,
-            endpoint_released_send,
-            socket,
-            runtime.clone(),
-        );
-
-        let driver = ConnectionDriver(conn.clone());
-        runtime.spawn(Box::pin(
-            drive_connection_and_report_release(driver, move || {
-                let _ = driver_released_send.send(());
-            })
-            .instrument(Span::current()),
-        ));
-
-        Self {
-            conn: Some(conn),
-            endpoint_released: Some(endpoint_released_recv),
-            driver_released: Some(driver_released_recv),
-            connected: on_connected_recv,
-            handshake_data_ready: Some(on_handshake_data_recv),
-        }
-    }
-
     /// Obtain a restricted cleanup handle for this exact connection attempt.
     ///
     /// The handle can await this exact connection's endpoint-map removal and
@@ -355,11 +319,24 @@ impl Future for ZeroRttAccepted {
 #[derive(Debug)]
 struct ConnectionDriver(ConnectionRef);
 
+fn endpoint_settlement_lost() -> ConnectionError {
+    ConnectionError::TransportError(proto::TransportError {
+        code: proto::TransportErrorCode::INTERNAL_ERROR,
+        frame: None,
+        reason: "endpoint control settlement unavailable".to_string(),
+    })
+}
+
 impl Future for ConnectionDriver {
     type Output = Result<(), io::Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let conn = &mut *self.0.state.lock("poll");
+        if conn.poisoned {
+            let failure = conn.endpoint_settlement_failure();
+            conn.terminate(failure, &self.0.shared);
+            return Poll::Ready(Err(io::Error::other("connection state poisoned")));
+        }
 
         let span = debug_span!("drive", id = conn.handle.0);
         let _guard = span.enter();
@@ -373,7 +350,12 @@ impl Future for ConnectionDriver {
         // If a timer expires, there might be more to transmit. When we transmit something, we
         // might need to reset a timer. Hence, we must loop until neither happens.
         keep_going |= conn.drive_timer(cx);
-        conn.forward_endpoint_events();
+        if conn.forward_endpoint_events().is_err() {
+            conn.abandon_and_detach_endpoint_pacing();
+            let failure = conn.endpoint_settlement_failure();
+            conn.terminate(failure, &self.0.shared);
+            return Poll::Ready(Ok(()));
+        }
         conn.forward_app_events(&self.0.shared);
 
         if !conn.inner.is_drained() {
@@ -430,6 +412,8 @@ pub enum SuccessorServiceTurnError {
     },
     #[error("successor service turn completion channel closed")]
     CompletionChannelClosed,
+    #[error("successor service turn event admission refused: {0:?}")]
+    Admission(bytes::MeteredCopyError),
 }
 
 impl Connection {
@@ -459,6 +443,7 @@ impl Connection {
             conn.inner
                 .start_successor_service_turn()
                 .map_err(|error| match error {
+                    proto::SuccessorServiceTurnStartError::Admission(error) => SuccessorServiceTurnError::Admission(error),
                     proto::SuccessorServiceTurnStartError::Busy => SuccessorServiceTurnError::Busy,
                     proto::SuccessorServiceTurnStartError::NotEstablished => {
                         SuccessorServiceTurnError::NotEstablished
@@ -705,6 +690,7 @@ impl Connection {
                 UnsupportedByPeer => SendDatagramError::UnsupportedByPeer,
                 Disabled => SendDatagramError::Disabled,
                 TooLarge => SendDatagramError::TooLarge,
+                Admission { data, error } => SendDatagramError::Admission { data, error },
             }),
         }
     }
@@ -885,11 +871,9 @@ impl Connection {
     ///
     /// This primarily exists for testing purposes.
     pub fn force_key_update(&self) {
-        self.0
-            .state
-            .lock("force_key_update")
-            .inner
-            .force_key_update()
+        let mut conn = self.0.state.lock("force_key_update");
+        if conn.error.is_some() { return; }
+        conn.inner.force_key_update();
     }
 
     /// Derive keying material from this connection's TLS session secrets.
@@ -906,12 +890,11 @@ impl Connection {
         label: &[u8],
         context: &[u8],
     ) -> Result<(), proto::crypto::ExportKeyingMaterialError> {
-        self.0
-            .state
-            .lock("export_keying_material")
-            .inner
-            .crypto_session()
-            .export_keying_material(output, label, context)
+        let conn = self.0.state.lock("export_keying_material");
+        if conn.error.is_some() {
+            return Err(proto::crypto::ExportKeyingMaterialError);
+        }
+        conn.inner.crypto_session().export_keying_material(output, label, context)
     }
 
     /// Modify the number of remotely initiated unidirectional streams that may be concurrently open
@@ -920,6 +903,7 @@ impl Connection {
     /// `count`s increase both minimum and worst-case memory consumption.
     pub fn set_max_concurrent_uni_streams(&self, count: VarInt) {
         let mut conn = self.0.state.lock("set_max_concurrent_uni_streams");
+        if conn.error.is_some() { return; }
         conn.inner.set_max_concurrent_streams(Dir::Uni, count);
         // May need to send MAX_STREAMS to make progress
         conn.wake();
@@ -928,6 +912,7 @@ impl Connection {
     /// See [`proto::TransportConfig::send_window()`]
     pub fn set_send_window(&self, send_window: u64) {
         let mut conn = self.0.state.lock("set_send_window");
+        if conn.error.is_some() { return; }
         conn.inner.set_send_window(send_window);
         conn.wake();
     }
@@ -935,6 +920,7 @@ impl Connection {
     /// See [`proto::TransportConfig::receive_window()`]
     pub fn set_receive_window(&self, receive_window: VarInt) {
         let mut conn = self.0.state.lock("set_receive_window");
+        if conn.error.is_some() { return; }
         conn.inner.set_receive_window(receive_window);
         conn.wake();
     }
@@ -945,6 +931,7 @@ impl Connection {
     /// `count`s increase both minimum and worst-case memory consumption.
     pub fn set_max_concurrent_bi_streams(&self, count: VarInt) {
         let mut conn = self.0.state.lock("set_max_concurrent_bi_streams");
+        if conn.error.is_some() { return; }
         conn.inner.set_max_concurrent_streams(Dir::Bi, count);
         // May need to send MAX_STREAMS to make progress
         conn.wake();
@@ -1163,6 +1150,7 @@ impl Future for SendDatagram<'_> {
                 UnsupportedByPeer => SendDatagramError::UnsupportedByPeer,
                 Disabled => SendDatagramError::Disabled,
                 TooLarge => SendDatagramError::TooLarge,
+                Admission { data, error } => SendDatagramError::Admission { data, error },
             })),
         }
     }
@@ -1172,50 +1160,6 @@ impl Future for SendDatagram<'_> {
 pub(crate) struct ConnectionRef(Arc<ConnectionInner>);
 
 impl ConnectionRef {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        handle: ConnectionHandle,
-        conn: proto::Connection,
-        endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, ConnectionToEndpointEvent)>,
-        conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
-        on_handshake_data: oneshot::Sender<()>,
-        on_connected: oneshot::Sender<bool>,
-        endpoint_released: oneshot::Sender<()>,
-        socket: Arc<dyn AsyncUdpSocket>,
-        runtime: Arc<dyn Runtime>,
-    ) -> Self {
-        Self(Arc::new(ConnectionInner {
-            state: Mutex::new(State {
-                inner: conn,
-                driver: None,
-                handle,
-                on_handshake_data: Some(on_handshake_data),
-                on_connected: Some(on_connected),
-                successor_service_turn: None,
-                connected: false,
-                timer: None,
-                timer_deadline: None,
-                conn_events,
-                endpoint_events,
-                endpoint_released: Some(endpoint_released),
-                current_socket_rx_rebind_generation: 0,
-                blocked_writers: FxHashMap::default(),
-                blocked_readers: FxHashMap::default(),
-                stopped: FxHashMap::default(),
-                error: None,
-                io_poller: socket.clone().create_io_poller(),
-                socket,
-                runtime,
-                send_buffer: Vec::new(),
-                buffered_transmit: None,
-            }),
-            shared: Shared::default(),
-            #[cfg(test)]
-            retirement_barrier: Mutex::new(None),
-            retirement_sentinel: ConnectionRetirementSentinel(Arc::new(AtomicBool::new(false))),
-        }))
-    }
-
     fn stable_id(&self) -> usize {
         &*self.0 as *const _ as usize
     }
@@ -1236,7 +1180,7 @@ impl Drop for ConnectionRef {
 
         let conn = &mut *self.state.lock("drop");
 
-        if !conn.inner.is_closed() {
+        if conn.published && !conn.poisoned && !conn.inner.is_closed() {
             // If the driver is alive, it's just it and us, so we'd better shut it down. If it's
             // not, we can't do any harm. If there were any streams being opened, then either
             // the connection will be closed for an unrelated reason or a fresh reference will
@@ -1255,7 +1199,7 @@ impl std::ops::Deref for ConnectionRef {
 
 #[derive(Debug)]
 pub(crate) struct ConnectionInner {
-    pub(crate) state: Mutex<State>,
+    pub(crate) state: StateLock,
     pub(crate) shared: Shared,
     #[cfg(test)]
     retirement_barrier: Mutex<Option<retirement_tests::DestructionBarrier>>,
@@ -1294,7 +1238,7 @@ impl SendStreamRetirement {
         };
         let retired = {
             let mut state = connection.state.lock("SendStreamRetirement::is_retired");
-            state.inner.send_stream(self.stream).stopped().is_err()
+            state.send_stream(self.stream).stopped().is_err()
         };
         // This bare Arc never participates in ConnectionRef's public-handle ref_count.
         drop(connection);
@@ -1348,6 +1292,8 @@ pub(crate) struct Shared {
 }
 
 pub(crate) struct State {
+    published: bool,
+    poisoned: bool,
     pub(crate) inner: proto::Connection,
     driver: Option<Waker>,
     handle: ConnectionHandle,
@@ -1358,8 +1304,9 @@ pub(crate) struct State {
     connected: bool,
     timer: Option<Pin<Box<dyn AsyncTimer>>>,
     timer_deadline: Option<Instant>,
-    conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
-    endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, ConnectionToEndpointEvent)>,
+    conn_events: ForwardReceiver,
+    held_proto_event: Option<proto::ConnectionEvent>,
+    endpoint_events: EndpointEventSender,
     endpoint_released: Option<oneshot::Sender<()>>,
     current_socket_rx_rebind_generation: u64,
     pub(crate) blocked_writers: FxHashMap<StreamId, Waker>,
@@ -1376,6 +1323,17 @@ pub(crate) struct State {
 }
 
 impl State {
+    // Each short-lived protocol view uses this host's clock under its State lock.
+    pub(crate) fn send_stream(&mut self, id: StreamId) -> proto::SendStream<'_> {
+        let now = self.runtime.now();
+        self.inner.send_stream(id, now)
+    }
+
+    pub(crate) fn recv_stream(&mut self, id: StreamId) -> proto::RecvStream<'_> {
+        let now = self.runtime.now();
+        self.inner.recv_stream(id, now)
+    }
+
     fn drive_transmit(&mut self, cx: &mut Context) -> io::Result<bool> {
         let now = self.runtime.now();
         let mut transmits = 0;
@@ -1487,21 +1445,48 @@ impl State {
         self.inner.endpoint_pacing_detach(now);
     }
 
-    fn forward_endpoint_events(&mut self) {
+    fn endpoint_settlement_failure(&self) -> ConnectionError {
+        self.error
+            .clone()
+            .or_else(|| self.inner.retained_error())
+            .unwrap_or_else(endpoint_settlement_lost)
+    }
+
+    fn forward_endpoint_events(&mut self) -> Result<(), ()> {
+        if self.inner.event_inventory_quarantined() {
+            return Err(());
+        }
         while let Some(event) = self.inner.poll_endpoint_events() {
+            if self.endpoint_events.is_native() && !event.is_drained() {
+                self.endpoint_events.send_protocol(self.handle, event, &mut self.inner)?;
+                if self.inner.event_inventory_quarantined() {
+                    return Err(());
+                }
+                continue;
+            }
             let endpoint_released = event
                 .is_drained()
                 .then(|| self.endpoint_released.take())
                 .flatten();
             // If the endpoint driver is gone, noop.
-            let _ = self.endpoint_events.send((
+            if let Some(reply) = self.endpoint_events.send((
                 self.handle,
                 ConnectionToEndpointEvent::Proto {
                     event,
                     endpoint_released,
                 },
-            ));
+            ))? {
+                if let Err(reply) = self.inner.handle_event_with_admission(reply, |_| Some(())) {
+                    self.held_proto_event = Some(reply);
+                    self.inner.quarantine_event_inventory();
+                    return Err(());
+                }
+                if self.inner.event_inventory_quarantined() {
+                    return Err(());
+                }
+            }
         }
+        Ok(())
     }
 
     /// If this returns `Err`, the endpoint is dead, so the driver should exit immediately.
@@ -1510,12 +1495,26 @@ impl State {
         shared: &Shared,
         cx: &mut Context,
     ) -> Result<(), ConnectionError> {
+        if self.endpoint_events.is_synchronous() {
+            self.forward_endpoint_events()
+                .map_err(|_| self.endpoint_settlement_failure())?;
+        }
         loop {
             match self.conn_events.poll_recv(cx) {
                 Poll::Ready(Some(ConnectionEvent::Rebind(socket))) => {
+                    let now = self.runtime.now();
+                    if !self.inner.try_local_address_changed(now) {
+                        if self.inner.is_closed() && !self.inner.event_inventory_quarantined() {
+                            // Known local refusal (or an already closing Conn)
+                            // still needs its original Close/timer/Drained path.
+                            // Only lost authority takes the immediate exit.
+                            self.settle_local_failure(shared);
+                            continue;
+                        }
+                        return Err(self.endpoint_settlement_failure());
+                    }
                     self.socket = socket;
                     self.io_poller = self.socket.clone().create_io_poller();
-                    self.inner.local_address_changed();
                 }
                 Poll::Ready(Some(ConnectionEvent::Proto {
                     event,
@@ -1527,7 +1526,28 @@ impl State {
                         });
                     let authenticated_before =
                         candidate_generation.map(|_| self.inner.authenticated_packets());
-                    self.inner.handle_event(event);
+                    if let Err(event) = self.inner.handle_event_with_admission(event, |_| Some(()))
+                    {
+                        // This event already belongs to Quinn. It is not an A1
+                        // drop candidate. Settle old events before one retry.
+                        self.forward_endpoint_events()
+                            .map_err(|_| self.endpoint_settlement_failure())?;
+                        if let Err(event) =
+                            self.inner.handle_event_with_admission(event, |_| Some(()))
+                        {
+                            self.held_proto_event = Some(event);
+                            self.inner.quarantine_event_inventory();
+                            return Err(ConnectionError::TransportError(proto::TransportError {
+                                code: proto::TransportErrorCode::INTERNAL_ERROR,
+                                frame: None,
+                                reason: "protocol event inventory unavailable after settlement"
+                                    .to_string(),
+                            }));
+                        }
+                    }
+                    if self.inner.event_inventory_quarantined() {
+                        return Err(self.endpoint_settlement_failure());
+                    }
                     let generation = authenticated_before.and_then(|authenticated_before| {
                         authenticated_current_socket_generation(
                             authenticated_before,
@@ -1539,10 +1559,15 @@ impl State {
                     if let Some(generation) = generation {
                         self.current_socket_rx_rebind_generation =
                             self.current_socket_rx_rebind_generation.max(generation);
-                        let _ = self.endpoint_events.send((
-                            self.handle,
-                            ConnectionToEndpointEvent::AuthenticatedCurrentSocketRx(generation),
-                        ));
+                        self.endpoint_events
+                            .send((
+                                self.handle,
+                                ConnectionToEndpointEvent::AuthenticatedCurrentSocketRx(
+                                    self.inner.registration_key(),
+                                    generation,
+                                ),
+                            ))
+                            .map_err(|_| self.endpoint_settlement_failure())?;
                     }
                 }
                 Poll::Ready(Some(ConnectionEvent::Close { reason, error_code })) => {
@@ -1558,6 +1583,12 @@ impl State {
                 Poll::Pending => {
                     return Ok(());
                 }
+            }
+            // Budgeted control settlement ends this Proto operation before
+            // another datagram/rebind/close can add a second event burst.
+            if self.endpoint_events.is_synchronous() {
+                self.forward_endpoint_events()
+                    .map_err(|_| self.endpoint_settlement_failure())?;
             }
         }
     }
@@ -1663,6 +1694,17 @@ impl State {
         true
     }
 
+    /// Settle a local protocol failure under the same State lock before returning
+    /// to the application. The protocol already started its original Close timer.
+    pub(crate) fn settle_local_failure(&mut self, shared: &Shared) {
+        if self.inner.is_closed() {
+            if let Some(reason) = self.inner.retained_error() {
+                self.terminate(reason, shared);
+                self.wake();
+            }
+        }
+    }
+
     /// Wake up a blocked `Driver` task to process I/O
     pub(crate) fn wake(&mut self) {
         if let Some(x) = self.driver.take() {
@@ -1672,7 +1714,7 @@ impl State {
 
     /// Used to wake up all blocked futures when the connection becomes closed for any reason
     fn terminate(&mut self, reason: ConnectionError, shared: &Shared) {
-        self.error = Some(reason.clone());
+        let reason = self.error.get_or_insert(reason).clone();
         if let Some(sender) = self.successor_service_turn.take() {
             let _ = sender.send(Err(reason.clone()));
         }
@@ -1695,6 +1737,10 @@ impl State {
     }
 
     fn close(&mut self, error_code: VarInt, reason: Bytes, shared: &Shared) {
+        if self.poisoned {
+            self.terminate(self.endpoint_settlement_failure(), shared);
+            return;
+        }
         self.inner.close(self.runtime.now(), error_code, reason);
         self.terminate(ConnectionError::LocallyClosed, shared);
         self.wake();
@@ -1846,17 +1892,34 @@ mod rebind_authentication_tests {
 
 impl Drop for State {
     fn drop(&mut self) {
+        if self.poisoned || std::thread::panicking() {
+            self.inner.quarantine_event_inventory();
+            // Unknown interrupted state has neither a genuine Drained nor ACK.
+            // Physical fields drop normally; no protocol/runtime callback runs.
+            self.endpoint_released.take();
+            return;
+        }
+        if !self.published {
+            self.endpoint_released.take();
+            return;
+        }
         self.abandon_and_detach_endpoint_pacing();
         if let Some(endpoint_released) = self.endpoint_released.take() {
             // Ensure the endpoint can tidy up, and make exact removal observable
             // even when the ordinary drained event was not forwarded.
-            let _ = self.endpoint_events.send((
-                self.handle,
-                ConnectionToEndpointEvent::Proto {
-                    event: proto::EndpointEvent::drained(),
-                    endpoint_released: Some(endpoint_released),
-                },
-            ));
+            if let Some(event) = self.inner.take_drained_event() {
+                let _ = self.endpoint_events.send((
+                    self.handle,
+                    ConnectionToEndpointEvent::Proto {
+                        event,
+                        endpoint_released: Some(endpoint_released),
+                    },
+                ));
+            } else if let Some(meter) = self.inner.receive_backing_meter() {
+                // A missing real terminal witness cannot be fabricated from a
+                // bare reusable slot, even during final State destruction.
+                meter.quarantine();
+            }
         }
     }
 }
@@ -1892,18 +1955,16 @@ fn wake_all_notify(wakers: &mut FxHashMap<StreamId, Arc<Notify>>) {
 /// Errors that can arise when sending a datagram
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
 pub enum SendDatagramError {
-    /// The peer does not support receiving datagram frames
     #[error("datagrams not supported by peer")]
     UnsupportedByPeer,
     /// Datagram support is disabled locally
     #[error("datagram support disabled")]
     Disabled,
-    /// The datagram is larger than the connection can currently accommodate
-    ///
-    /// Indicates that the path MTU minus overhead or the limit advertised by the peer has been
-    /// exceeded.
+    /// Exceeds the current path MTU or peer limit.
     #[error("datagram too large")]
     TooLarge,
+    #[error("datagram physical admission refused: {error:?}")]
+    Admission { data: Bytes, error: bytes::MeteredCopyError },
     /// The connection was lost
     #[error("connection lost")]
     ConnectionLost(#[from] ConnectionError),
@@ -1924,6 +1985,7 @@ const MAX_TRANSMIT_SEGMENTS: usize = 10;
 
 #[cfg(test)]
 mod endpoint_pacing_driver_tests {
+    use crate::endpoint::budgeted_events::ForwardReceiver;
     use std::{
         collections::VecDeque,
         io::{self, IoSliceMut},
@@ -2155,8 +2217,11 @@ mod endpoint_pacing_driver_tests {
         let io_poller = socket.clone().create_io_poller();
         let runtime = Arc::new(TestRuntime::new(now));
         let (_conn_events_tx, conn_events) = tokio::sync::mpsc::unbounded_channel();
+        let conn_events = ForwardReceiver::Legacy(conn_events);
         let (endpoint_events, _endpoint_events_rx) = tokio::sync::mpsc::unbounded_channel();
         let state = State {
+            poisoned: false,
+            published: true,
             inner: connection,
             driver: None,
             handle,
@@ -2166,7 +2231,8 @@ mod endpoint_pacing_driver_tests {
             timer: None,
             timer_deadline: None,
             conn_events,
-            endpoint_events,
+            held_proto_event: None,
+            endpoint_events: endpoint_events.into(),
             endpoint_released: None,
             current_socket_rx_rebind_generation: 0,
             blocked_writers: Default::default(),

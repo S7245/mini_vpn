@@ -53,9 +53,35 @@ pub(super) async fn handle_dns_hijack<D: TunIo>(
         // **不计数**（避免与下方 forge None 的 dns_dropped 双计；防御性早返不该污染指标）。
         return;
     };
-    if let Some(reply) = forge_dns_reply(&udp, fake_pool, now_secs) {
+    let mut name = [0; 253];
+    let Some(q) = dns::parse_query_into(udp.payload, &mut name) else {
+        metrics.inc_dns_dropped();
+        return;
+    };
+    let Some(max_len) = dns::response_capacity(&q)
+        .and_then(|n| n.checked_add(28))
+        .filter(|&n| n <= u16::MAX as usize)
+    else {
+        metrics.inc_dns_dropped();
+        return;
+    };
+    let injected = device.inject_ip_packet_with(max_len, |packet| {
+        let answer = if q.qtype == dns::QTYPE_A {
+            fake_pool
+                .alloc(&q.qname, now_secs)
+                .map_or(Answer::ServFail, |ip| Answer::A(ip, 5))
+        } else {
+            Answer::NoData
+        };
+        crate::udp_relay::write_udp_ip_packet(
+            packet,
+            (udp.dst_ip, 53),
+            (udp.src_ip, udp.src_port),
+            |body| dns::write_response_into(&q, answer, body),
+        )
+    });
+    if injected.is_ok() {
         metrics.inc_dns_forged();
-        device.inject_ip_packet(&reply);
         if let Err(e) = device.flush_tx().await {
             println!("DNS 劫持回包 flush 失败: {e}");
         }

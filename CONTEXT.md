@@ -234,3 +234,9 @@ _Avoid_: conflating it with `MetricsSink` (timing vs counters/gauges); "live gau
 
 - "upstream" was proposed for the final destination, but the codebase already uses **Upstream** for the proxy server — resolved: final destination is **Target**, proxy server stays **Upstream**.
 - smoltcp's `local_endpoint()` sounds like "this machine's address" but on the TUN path it is the **Target** (the SYN's destination address) — it is NOT the local machine's address.
+
+**Endpoint registration Authority**:
+The Endpoint owner of one QUIC connection registration: its Meta, local CID and
+reset-token routes, physical slot and registration identity. Real retirement
+removes only that registration; a reused slot does not inherit an old event's
+authority. Transport/Service retirement remains a separate ownership proof.

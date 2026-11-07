@@ -338,7 +338,7 @@ async fn d16_rearm_detaches_old_epoch_queue_and_ignores_late_wake() {
 }
 #[test]
 fn reaper_restores_listening_state_and_releases_fake_ip() {
-    let (tx, _rx) = mpsc::channel(1);
+    let (tx, _rx) = crate::client_tun::uplink::channel(1);
     let mut sockets = SocketSet::new(vec![]);
     let mut ctxs = HashMap::new();
     let mut registry = ListenerRegistry::new(1);
@@ -374,9 +374,9 @@ fn reaper_restores_listening_state_and_releases_fake_ip() {
         owned_terminal_wait_since_secs: None,
         local_fin_pending_since_secs: Some(3),
         local_fin_last_remote_progress_secs: Some(4),
-        downlink_pending: Vec::new(),
-        downlink_pending_permits: VecDeque::new(),
-        downlink_inflight_permits: VecDeque::new(),
+        downlink_pending: Default::default(),
+        downlink_pending_permits: Default::default(),
+        downlink_inflight_permits: Default::default(),
         downlink_delay_permit_release_until_egress: false,
         pending_relay_close: None,
         pending_relay_close_since_secs: None,

@@ -29,52 +29,100 @@ pub enum Answer {
 /// 解析一个标准 DNS 查询。仅接受单 question、question 段无压缩指针的查询；
 /// 任何越界 / 多 question / 压缩指针 / 非法 UTF-8 一律返回 None（绝不 panic）。
 pub fn parse_query(data: &[u8]) -> Option<DnsQuery> {
-    if data.len() < 12 {
-        return None;
-    }
-    let id = u16::from_be_bytes([data[0], data[1]]);
-    let flags = u16::from_be_bytes([data[2], data[3]]);
-    let rd = flags & 0x0100 != 0;
-    let qdcount = u16::from_be_bytes([data[4], data[5]]);
-    if qdcount != 1 {
-        return None;
-    }
+    let mut name = [0; 253];
+    let query = parse_query_into(data, &mut name)?;
+    Some(DnsQuery {
+        id: query.id,
+        qname: query.qname.to_owned(),
+        qtype: query.qtype,
+        rd: query.rd,
+        question: query.question.to_vec(),
+    })
+}
 
-    // 从 offset 12 读 QNAME（label 序列，0x00 结尾）。
-    let mut pos = 12usize;
-    let mut labels: Vec<String> = Vec::new();
+/// Borrowed wire question and caller-owned bounded DNS name; no heap allocation
+/// is needed before the Device has admitted reply capacity.
+pub(crate) struct QueryView<'a> {
+    pub id: u16,
+    pub qname: &'a str,
+    pub qtype: u16,
+    rd: bool,
+    question: &'a [u8],
+}
+pub(crate) fn parse_query_into<'a>(
+    data: &'a [u8],
+    name: &'a mut [u8; 253],
+) -> Option<QueryView<'a>> {
+    if data.len() < 12 || data[4..6] != [0, 1] {
+        return None;
+    }
+    let mut pos = 12;
+    let mut written = 0usize;
     loop {
         let len = *data.get(pos)? as usize;
+        pos += 1;
         if len == 0 {
-            pos += 1;
             break;
         }
-        if len & 0xC0 != 0 {
-            // 压缩指针 / 保留位：question 段不应出现，拒绝。
+        if len & 0xc0 != 0 {
             return None;
         }
-        pos += 1;
         let label = data.get(pos..pos + len)?;
-        labels.push(std::str::from_utf8(label).ok()?.to_string());
+        std::str::from_utf8(label).ok()?;
+        if written != 0 {
+            *name.get_mut(written)? = b'.';
+            written += 1;
+        }
+        let end = written.checked_add(len)?;
+        name.get_mut(written..end)?.copy_from_slice(label);
+        written = end;
         pos += len;
     }
     let qtype = u16::from_be_bytes([*data.get(pos)?, *data.get(pos + 1)?]);
-    // QCLASS 占 pos+2..pos+4；question 段到此结束。
-    let question = data.get(12..pos + 4)?.to_vec();
-
-    Some(DnsQuery {
-        id,
-        qname: labels.join("."),
+    Some(QueryView {
+        id: u16::from_be_bytes([data[0], data[1]]),
+        qname: std::str::from_utf8(&name[..written]).ok()?,
         qtype,
-        rd,
-        question,
+        rd: u16::from_be_bytes([data[2], data[3]]) & 0x0100 != 0,
+        question: data.get(12..pos + 4)?,
     })
 }
 
 /// 构造对查询的响应。A 带一条记录；NoData/ServFail 无答案，RCODE 分别为 0/2。
 pub fn build_response(q: &DnsQuery, answer: Answer) -> Vec<u8> {
     let mut v = Vec::with_capacity(q.question.len() + 28);
-    v.extend_from_slice(&q.id.to_be_bytes());
+    // Vec writes cannot refuse capacity once allocated by this legacy helper.
+    let view = QueryView {
+        id: q.id,
+        qname: &q.qname,
+        qtype: q.qtype,
+        rd: q.rd,
+        question: &q.question,
+    };
+    let _ = write_response(&view, answer, &mut v);
+    v
+}
+
+/// Maximum reply size, before selecting an answer or changing fake-IP state.
+pub(crate) fn response_capacity(q: &QueryView<'_>) -> Option<usize> {
+    q.question.len().checked_add(28)
+}
+pub(crate) fn write_response_into(
+    q: &QueryView<'_>,
+    answer: Answer,
+    out: &mut [u8],
+) -> std::io::Result<usize> {
+    let capacity = out.len();
+    let mut cursor = out;
+    write_response(q, answer, &mut cursor)?;
+    Ok(capacity - cursor.len())
+}
+fn write_response(
+    q: &QueryView<'_>,
+    answer: Answer,
+    mut v: impl std::io::Write,
+) -> std::io::Result<()> {
+    v.write_all(&q.id.to_be_bytes())?;
     // flags: QR=1, Opcode=0, AA=0, TC=0, RD=回带, RA=0。
     let rd_bit = if q.rd { 0x0100 } else { 0 };
     let rcode = if matches!(answer, Answer::ServFail) {
@@ -83,26 +131,26 @@ pub fn build_response(q: &DnsQuery, answer: Answer) -> Vec<u8> {
         0
     };
     let flags: u16 = 0x8000 | rd_bit | rcode;
-    v.extend_from_slice(&flags.to_be_bytes());
-    v.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    v.write_all(&flags.to_be_bytes())?;
+    v.write_all(&1u16.to_be_bytes())?; // QDCOUNT
     let ancount: u16 = match answer {
         Answer::A(..) => 1,
         Answer::NoData | Answer::ServFail => 0,
     };
-    v.extend_from_slice(&ancount.to_be_bytes()); // ANCOUNT
-    v.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
-    v.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
-    v.extend_from_slice(&q.question); // 回显 question
+    v.write_all(&ancount.to_be_bytes())?; // ANCOUNT
+    v.write_all(&0u16.to_be_bytes())?; // NSCOUNT
+    v.write_all(&0u16.to_be_bytes())?; // ARCOUNT
+    v.write_all(&q.question)?; // 回显 question
 
     if let Answer::A(ip, ttl) = answer {
-        v.extend_from_slice(&[0xC0, 0x0C]); // NAME: 指针回指 offset 12 的 qname
-        v.extend_from_slice(&QTYPE_A.to_be_bytes()); // TYPE A
-        v.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
-        v.extend_from_slice(&ttl.to_be_bytes()); // TTL
-        v.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
-        v.extend_from_slice(&ip.octets()); // RDATA
+        v.write_all(&[0xC0, 0x0C])?; // NAME: 指针回指 offset 12 的 qname
+        v.write_all(&QTYPE_A.to_be_bytes())?; // TYPE A
+        v.write_all(&1u16.to_be_bytes())?; // CLASS IN
+        v.write_all(&ttl.to_be_bytes())?; // TTL
+        v.write_all(&4u16.to_be_bytes())?; // RDLENGTH
+        v.write_all(&ip.octets())?; // RDATA
     }
-    v
+    Ok(())
 }
 
 #[cfg(test)]

@@ -16,6 +16,10 @@ use super::super::super::{
 #[cfg(all(test, feature = "harness"))]
 use super::super::tests as runtime_tests;
 use super::super::{SessionControl, SessionStop};
+mod release;
+mod slot_table;
+pub(in crate::client_tun::compatibility_runtime) use slot_table::SlotTable;
+pub(in crate::client_tun::compatibility_runtime) mod custody;
 use crate::owned_upstream::OwnedUpstream;
 use crate::shared::errors::{FailureOrigin, FailurePhase, FailureResource, RetainedFailure};
 use crate::upstream::RelayFamilyPolicy;
@@ -26,7 +30,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use tokio::sync::mpsc;
-
 pub(in crate::client_tun) enum HandshakeNotice {
     Legacy(HandshakeDone),
     Custodied(usize),
@@ -71,7 +74,7 @@ pub(in crate::client_tun::compatibility_runtime) struct OpenOutcome {
 
 pub(in crate::client_tun::compatibility_runtime) struct OpenCustody {
     pub(super) flow: Option<FlowAccounting>,
-    pub(in crate::client_tun::compatibility_runtime) slots: Vec<Option<OpenSlot>>,
+    pub(in crate::client_tun::compatibility_runtime) slots: SlotTable,
     pub(in crate::client_tun::compatibility_runtime) live: usize,
     pub(in crate::client_tun::compatibility_runtime) cursor: usize,
     #[cfg(test)]
@@ -85,7 +88,7 @@ impl Default for OpenCustody {
     fn default() -> Self {
         Self {
             flow: None,
-            slots: std::iter::repeat_with(|| None).take(128).collect(),
+            slots: SlotTable::with_len(128),
             live: 0,
             cursor: 0,
             #[cfg(test)]
@@ -107,6 +110,11 @@ pub(in crate::client_tun) struct OpenDispatch {
 }
 
 impl OpenDispatch {
+    #[cfg(all(test, feature = "harness"))]
+    pub(in crate::client_tun) fn test_egress_bridge(&self) -> Option<&Arc<RelayEventTestBridge>> {
+        self.relay_event_test_bridge.as_ref()
+    }
+
     pub(in crate::client_tun) fn with_relay_policy(
         mut self,
         policy: Arc<RelayFamilyPolicy>,
@@ -145,7 +153,7 @@ impl OpenDispatch {
     #[cfg(all(test, feature = "harness"))]
     pub(in crate::client_tun) fn install_relay_event_test_bridge(
         &self,
-        global_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
+        global_tx: &crate::client_tun::relay_channel::Sender<(SocketHandle, RelayEvent)>,
     ) {
         if let Some(bridge) = &self.relay_event_test_bridge {
             bridge.install_sender(global_tx.downgrade());
@@ -156,6 +164,16 @@ impl OpenDispatch {
     pub(in crate::client_tun) fn observe_relay_event_test(&self, snapshot: RelayEventTestSnapshot) {
         if let Some(bridge) = &self.relay_event_test_bridge {
             bridge.observe(snapshot);
+        }
+    }
+
+    #[cfg(all(test, feature = "harness"))]
+    pub(in crate::client_tun) fn fault_selected_relay(
+        &self,
+        selected: &mut Option<(SocketHandle, RelayEvent)>,
+    ) {
+        if let Some(bridge) = &self.relay_event_test_bridge {
+            bridge.fault_selected(selected);
         }
     }
 
@@ -218,12 +236,16 @@ impl OpenDispatch {
                 return None;
             }
             if let Some(index) = free {
-                opens.slots[index] = Some(OpenSlot {
+                // `index` is a free row of this locked table; Err is unreachable.
+                if opens.slots.put(index, OpenSlot {
                     handle,
                     epoch: ctx.conn_epoch.wrapping_add(1),
                     deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(20),
                     phase: OpenPhase::Reserved,
-                });
+                }).is_err() {
+                    owner.ledger().quarantined = true;
+                    return None;
+                }
                 opens.live += 1;
                 owner.open_started.store(true, Ordering::Relaxed);
             }
@@ -266,19 +288,11 @@ impl OpenDispatch {
         if let Some(owner) = &self.owner {
             let mut opens = owner.opens();
             let Some((index, slot)) =
-                opens
-                    .slots
-                    .iter_mut()
-                    .enumerate()
-                    .find_map(|(index, slot)| {
-                        slot.as_mut()
-                            .filter(|slot| {
-                                slot.handle == handle
-                                    && slot.epoch == epoch
-                                    && matches!(slot.phase, OpenPhase::Reserved)
-                            })
-                            .map(|slot| (index, slot))
-                    })
+                opens.slots.occupied_mut().find(|(_, slot)| {
+                    slot.handle == handle
+                        && slot.epoch == epoch
+                        && matches!(slot.phase, OpenPhase::Reserved)
+                })
             else {
                 owner.ledger().quarantined = true;
                 owner.request_stop();
@@ -345,7 +359,7 @@ impl OpenDispatch {
                             % 128;
                         opens.cursor = (index + 1) % 128;
                         visited |= 1u128 << index;
-                        if let Some(slot) = &mut opens.slots[index] {
+                        if let Some(slot) = opens.slots.get_mut(index) {
                             if let Some(outcome) = poll_open_slot(slot, index, cx) {
                                 owner.announced[index / 64]
                                     .fetch_and(!(1u64 << (index % 64)), Ordering::Release);
@@ -408,7 +422,7 @@ impl OpenDispatch {
                 if let Some(OpenSlot {
                     phase: OpenPhase::AwaitingDisposition(outcome),
                     ..
-                }) = opens.slots[index].take()
+                }) = opens.slots.take(index)
                 {
                     opens.live -= 1;
                     owner.record_open(outcome);
@@ -585,132 +599,7 @@ impl std::task::Wake for OpenJoinWake {
     }
 }
 
-impl SessionControl {
-    pub(in crate::client_tun::compatibility_runtime) fn opens(
-        &self,
-    ) -> std::sync::MutexGuard<'_, OpenCustody> {
-        self.opens
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    pub(in crate::client_tun::compatibility_runtime) fn take_control(&self) -> bool {
-        self.control_remaining
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok()
-    }
-
-    pub(in crate::client_tun::compatibility_runtime) fn record_open(
-        &self,
-        mut outcome: OpenOutcome,
-    ) {
-        if let Some(failure) = outcome.failure.take() {
-            self.record(failure);
-        }
-        let mut ledger = self.ledger();
-        ledger.additional_failures = ledger
-            .additional_failures
-            .saturating_add(outcome.additional);
-    }
-
-    pub(in crate::client_tun::compatibility_runtime) async fn settle_opens(&self) {
-        if self.flow_mode() {
-            let opens = self.opens();
-            if opens.live != 0
-                || !opens.audit_flows()
-                || opens
-                    .flow
-                    .as_ref()
-                    .is_some_and(|a| a.identity_fault.is_some())
-            {
-                self.ledger().quarantined = true;
-            }
-            return;
-        }
-        {
-            let opens = self.opens();
-            let mut actual = 0;
-            let mut workers = [0u64; 2];
-            for (index, slot) in opens.slots.iter().enumerate() {
-                actual += usize::from(slot.is_some());
-                if matches!(
-                    slot.as_ref().map(|slot| &slot.phase),
-                    Some(OpenPhase::Worker(_))
-                ) {
-                    workers[index / 64] |= 1u64 << (index % 64);
-                }
-            }
-            let orphan = self
-                .announced
-                .iter()
-                .zip(workers)
-                .any(|(announced, workers)| announced.load(Ordering::Acquire) & !workers != 0);
-            if actual != opens.live || orphan {
-                self.ledger().quarantined = true;
-            }
-            if actual == 0 {
-                return;
-            }
-        }
-        let mut cursor = 0;
-        let mut pending = false;
-        let signal = Arc::new(OpenJoinWake::default());
-        let child_waker = std::task::Waker::from(Arc::clone(&signal));
-        std::future::poll_fn(|cx| {
-            signal.register(cx.waker());
-            if cursor == 0 {
-                // Earlier notifications are covered by this complete bounded scan.
-                signal.retry.store(false, Ordering::Release);
-            }
-            let mut child_cx = std::task::Context::from_waker(&child_waker);
-            let mut opens = self.opens();
-            for index in cursor..cursor + 32 {
-                let Some(slot) = &mut opens.slots[index] else {
-                    continue;
-                };
-                if matches!(slot.phase, OpenPhase::Worker(_)) {
-                    let Some(outcome) = poll_open_slot(slot, index, &mut child_cx) else {
-                        pending = true;
-                        continue;
-                    };
-                    slot.phase = OpenPhase::Retained(outcome);
-                    self.announced[index / 64]
-                        .fetch_and(!(1u64 << (index % 64)), Ordering::Release);
-                }
-                if matches!(&slot.phase, OpenPhase::Retained(outcome) if outcome.opened.is_some()) {
-                    self.ledger().quarantined = true;
-                    continue;
-                }
-                let outcome = opens.slots[index].take().and_then(|slot| match slot.phase {
-                    OpenPhase::Retained(outcome) | OpenPhase::AwaitingDisposition(outcome) => {
-                        Some(outcome)
-                    }
-                    _ => None,
-                });
-                opens.live = opens.live.saturating_sub(1);
-                if let Some(outcome) = outcome {
-                    self.record_open(outcome);
-                }
-            }
-            cursor = (cursor + 32) % 128;
-            if cursor == 0 {
-                if !pending {
-                    return Poll::Ready(());
-                }
-                pending = false;
-                if signal.retry.load(Ordering::Acquire) {
-                    cx.waker().wake_by_ref();
-                }
-            } else {
-                cx.waker().wake_by_ref();
-            }
-            Poll::Pending
-        })
-        .await;
-    }
-}
+mod settlement;
 
 // F control transactions share the original slot table. W and F overlap in one
 // row during open/publication, so their counts are audited independently.
@@ -720,6 +609,17 @@ use crate::upstream::{TcpOpenAttempt, TcpOpenCancel, TcpOpenPhase, TcpOpenReques
 
 pub(super) const FLOW_LIMIT: usize = 4096;
 const OPEN_LIMIT: usize = 128;
+pub(super) const FLOW_SLOT_LIMIT: usize = FLOW_LIMIT + OPEN_LIMIT;
+/// Configured Root geometry for the §5.3 instance bound (D25): F, F + W slots,
+/// one boxed row, one slot, and the fixed occupancy index (D66). Each Root
+/// slot Vec is preallocated at F + W.
+pub(in crate::client_tun::compatibility_runtime) const ROOT_GEOMETRY: (usize, usize, usize, usize, usize) = (
+    FLOW_LIMIT,
+    FLOW_SLOT_LIMIT,
+    std::mem::size_of::<FlowTransaction>(),
+    std::mem::size_of::<Option<OpenSlot>>(),
+    slot_table::INDEX_BYTES,
+);
 const ESCROW_LIMIT: usize = OPEN_LIMIT * MAX_UPLINK_BUFFER;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -745,7 +645,7 @@ pub(super) enum FlowStage {
 pub(in crate::client_tun::compatibility_runtime) struct FlowTransaction {
     pub(super) id: FlowIdentity,
     pub(super) stage: FlowStage,
-    pub(super) escrow: Vec<u8>,
+    pub(super) escrow: crate::client_tun::uplink::Payload,
     pub(super) escrow_bytes: usize,
     pub(super) fake_ip: Option<crate::fake_ip::FakeIpLeaseReceipt>,
     pub(super) fake_ip_failure: Option<(std::net::Ipv4Addr, crate::fake_ip::CheckedFakeIpError)>,
@@ -755,14 +655,17 @@ pub(in crate::client_tun::compatibility_runtime) struct FlowTransaction {
     pub(super) physical: bool,
     pub(super) published: bool,
     pub(super) producer_stopped: bool,
+    pub(super) cold_retained: Option<super::rearm::physical_flow::cold::RetainedCarrier>,
+    pub(super) preparing: bool,
+    release_escrow: bool,
     pub(super) attempt: Option<Box<dyn TcpOpenAttempt<OpenedOwnedTcp>>>,
-    rejection: Option<FlowRejection>,
+    pub(super) rejection: Option<FlowRejection>,
     pub(super) carrier: Option<OpenedOwnedTcp>,
     pub(super) roles: Option<FlowRoles>,
     pub(super) close_reason: (&'static str, &'static str),
     pub(super) stop_deadline: Option<std::time::Instant>,
     pub(super) panic: Option<Box<dyn std::any::Any + Send>>,
-    upstream: Arc<dyn OwnedUpstream>,
+    upstream: Option<Arc<dyn OwnedUpstream>>,
     target: crate::shared::TargetAddr,
     open_deadline: std::time::Instant,
     waited: bool,
@@ -788,12 +691,15 @@ pub(super) enum AdmissionIdentityFault {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FlowRejection {
+    ReportedNativeUplink(bytes::MeteredCopyError),
     Unavailable(crate::upstream::TcpOpenUnavailable),
     Deadline,
 }
 
 #[derive(Default)]
 pub(super) struct FlowAccounting {
+    #[cfg(test)]
+    pub(super) cold_probe: Option<Arc<super::rearm::physical_flow::tests::cold::Probe>>,
     #[cfg(test)]
     receipt_gate: Option<tests::receipt_gate::ReceiptGate>,
     #[cfg(test)]
@@ -804,6 +710,20 @@ pub(super) struct FlowAccounting {
     pub(super) held_lane: Option<FlowIdentity>,
     #[cfg(test)]
     pub(super) lane_observation: Option<(FlowIdentity, bool, usize)>,
+    #[cfg(test)]
+    pub(super) active_close_probe: Option<FlowIdentity>,
+    #[cfg(test)]
+    pub(super) active_close_observation: Option<(bool, usize, usize, usize, usize, Option<usize>)>,
+    #[cfg(test)]
+    pub(super) last_d16_disposition: Option<(usize, usize, usize)>,
+    #[cfg(test)]
+    pub(super) ordered_watch: Option<FlowIdentity>,
+    // One overwritten physical snapshot: id/epoch/pending/caps/inflight/socket/d16/reset.
+    #[cfg(test)]
+    pub(super) ordered_physical: Option<(
+        (FlowIdentity, u64, usize, usize, usize, usize, bool, bool),
+        crate::client_tun::downlink_custody::OrderedCustodySnapshot,
+    )>,
     #[cfg(test)]
     factory_started: u64,
     #[cfg(test)]
@@ -824,6 +744,8 @@ pub(super) struct FlowAccounting {
     pub(super) released: u64,
     pub(super) joined: u64,
     last_data_disposition: Option<(usize, usize, usize, usize, usize)>,
+    #[cfg(all(test, feature = "harness"))]
+    last_permit_reset: Option<super::rearm::physical_flow::PermitResetObservation>,
     // A settled provider can still own the original error. Retain only the first,
     // after its physical resource view is proved empty; this is not a flow ledger.
     pub(super) first_provider_failure: Option<Box<dyn TcpOpenAttempt<OpenedOwnedTcp>>>,
@@ -832,9 +754,7 @@ pub(super) struct FlowAccounting {
 impl OpenCustody {
     pub(in crate::client_tun::compatibility_runtime) fn with_flows() -> Self {
         Self {
-            slots: std::iter::repeat_with(|| None)
-                .take(FLOW_LIMIT + OPEN_LIMIT)
-                .collect(),
+            slots: SlotTable::with_len(FLOW_SLOT_LIMIT),
             flow: Some(FlowAccounting::default()),
             ..Self::default()
         }
@@ -858,8 +778,11 @@ impl OpenCustody {
                 || flow.id.epoch != slot.epoch
                 || flow.id.generation == 0
                 || flow.id.generation > accounting.generation
+                || (flow.upstream.is_none() && !flow.preparing)
                 || flow.reserved > MAX_UPLINK_BUFFER
-                || flow.escrow.len() != flow.escrow_bytes
+                || if flow.release_escrow {
+                    !flow.preparing || flow.upstream.is_some() || !flow.escrow.is_empty()
+                } else { flow.escrow.len() != flow.escrow_bytes }
                 || flow.escrow.len() > flow.reserved
             {
                 return false;
@@ -871,12 +794,12 @@ impl OpenCustody {
                 return false;
             };
             bytes = sum;
-            let Some(sum) = escrow.checked_add(flow.escrow.len()) else {
+            let Some(sum) = escrow.checked_add(flow.escrow_bytes) else {
                 return false;
             };
             escrow = sum;
         }
-        self.slots.len() == FLOW_LIMIT + OPEN_LIMIT
+        self.slots.len() == FLOW_SLOT_LIMIT
             && live == self.live
             && w == accounting.w
             && f == accounting.f
@@ -888,7 +811,7 @@ impl OpenCustody {
     }
 
     pub(super) fn flow_mut(&mut self, id: FlowIdentity) -> Option<&mut FlowTransaction> {
-        match &mut self.slots.get_mut(id.index)?.as_mut()?.phase {
+        match &mut self.slots.get_mut(id.index)?.phase {
             OpenPhase::Flow(flow) if flow.id == id => Some(flow),
             _ => None,
         }
@@ -896,6 +819,12 @@ impl OpenCustody {
 }
 
 impl FlowTransaction {
+    pub(super) fn retain_unwind(&mut self, payload: Box<dyn std::any::Any + Send>) {
+        if self.panic.is_none() { self.panic = Some(payload); }
+        else if let Some(roles) = &mut self.roles { roles.retain_control_unwind(payload); }
+        else { std::mem::forget(payload); } // No provider/actor callback can restart this poisoned row.
+        self.stage = FlowStage::Quarantined;
+    }
     pub(super) fn close(&mut self, reason: (&'static str, &'static str)) {
         if self.stop_deadline.is_some() {
             return;
@@ -909,10 +838,12 @@ impl FlowTransaction {
     }
 
     pub(super) fn drive(&mut self, cx: &mut std::task::Context<'_>) {
+        if self.panic.is_some() { return; } // Only the original fatal JOIN boundary may proceed.
         let now = tokio::time::Instant::now().into_std();
         if self.stop_deadline.is_some_and(|deadline| now >= deadline) {
             self.stage = FlowStage::Quarantined;
         }
+        if self.preparing || self.cold_retained.is_some() || self.roles.as_ref().is_some_and(FlowRoles::disposition_in_flight) { return; }
         if let Some(roles) = &mut self.roles {
             if self.stage == FlowStage::Quarantined {
                 roles.stop();
@@ -953,7 +884,7 @@ impl FlowTransaction {
         if self.stage == FlowStage::Closing && self.producer_stopped {
             if let Some(roles) = &mut self.roles {
                 roles.stop();
-                if !roles.settled() {
+                if !roles.data_disposed() {
                     return;
                 }
             }
@@ -1064,7 +995,7 @@ impl OpenDispatch {
         let flow = FlowTransaction {
             id,
             stage: FlowStage::Receiving,
-            escrow: Vec::new(),
+            escrow: Vec::new().into(),
             escrow_bytes: 0,
             fake_ip: None,
             fake_ip_failure: None,
@@ -1074,6 +1005,9 @@ impl OpenDispatch {
             physical: false,
             published: false,
             producer_stopped: false,
+            cold_retained: None,
+            preparing: false,
+            release_escrow: false,
             attempt: None,
             rejection: None,
             carrier: None,
@@ -1081,7 +1015,7 @@ impl OpenDispatch {
             close_reason: ("root", "opening"),
             stop_deadline: None,
             panic: None,
-            upstream,
+            upstream: Some(upstream),
             target,
             open_deadline: deadline,
             waited: false,
@@ -1092,14 +1026,57 @@ impl OpenDispatch {
             missing_start_gate: None,
             physical_check: None,
         };
-        opens.slots[index] = Some(OpenSlot {
+        // `index` is a free row of this locked table; Err is unreachable and
+        // would retain (never destroy) the uncertain row under sticky Q.
+        if let Err(row) = opens.slots.put(index, OpenSlot {
             handle,
             epoch,
             deadline: deadline.into(),
             phase: OpenPhase::Flow(Box::new(flow)),
-        });
+        }) {
+            std::mem::forget(row);
+            owner.ledger().quarantined = true;
+            return None;
+        }
         opens.live += 1;
         Some(id)
+    }
+
+    /// Inverse of the original prephysical Receiving reservation only. No
+    /// producer/provider or physical slot has been published; generation is
+    /// deliberately monotonic. The removed original Box drops outside opens.
+    pub(super) fn rollback_unreceived(&self, id: FlowIdentity) -> bool {
+        let Some(owner) = &self.owner else { return false; };
+        let mut opens = owner.opens();
+        let valid = opens.audit_flows() && opens.flow_mut(id).is_some_and(|flow| {
+            flow.stage == FlowStage::Receiving && flow.w_held && !flow.f_held
+                && !flow.physical && !flow.published && !flow.producer_stopped
+                && !flow.preparing && flow.cold_retained.is_none()
+                && flow.escrow.is_empty() && flow.escrow_bytes == 0
+                && flow.reserved == MAX_UPLINK_BUFFER && flow.fake_ip.is_none()
+                && flow.fake_ip_failure.is_none() && flow.attempt.is_none()
+                && flow.rejection.is_none() && flow.carrier.is_none() && flow.roles.is_none()
+                && flow.stop_deadline.is_none() && flow.panic.is_none()
+                && !flow.waited && !flow.provider_cancelled && flow.physical_check.is_none()
+        }) && opens.live > 0 && opens.flow.as_ref().is_some_and(|a| {
+            a.w > 0 && a.bytes >= MAX_UPLINK_BUFFER
+        });
+        if !valid {
+            drop(opens);
+            owner.quarantine_quiet();
+            return false;
+        }
+        let removed = opens.slots.take(id.index);
+        opens.live -= 1;
+        if let Some(accounting) = &mut opens.flow {
+            accounting.w -= 1;
+            accounting.bytes -= MAX_UPLINK_BUFFER;
+        }
+        let valid = opens.audit_flows();
+        drop(opens);
+        if !valid { owner.quarantine_quiet(); std::mem::forget(removed); return false; }
+        drop(removed);
+        true
     }
 
     pub(in crate::client_tun) fn request_flow_close(
@@ -1107,6 +1084,8 @@ impl OpenDispatch {
         handle: SocketHandle,
         epoch: u64,
         physical: Option<FlowIdentity>,
+        d16_reason: Option<(&'static str, &'static str)>,
+        terminal_ctx: Option<(&mut SocketCtx, (&'static str, &'static str))>,
     ) -> bool {
         let Some(owner) = &self.owner else {
             return false;
@@ -1115,7 +1094,7 @@ impl OpenDispatch {
         if opens.flow.is_none() {
             return false;
         }
-        for slot in opens.slots.iter_mut().flatten() {
+        for (_, slot) in opens.slots.occupied_mut() {
             if slot.handle == handle {
                 if slot.epoch != epoch
                     || physical.is_some_and(
@@ -1123,9 +1102,47 @@ impl OpenDispatch {
                     )
                 {
                     owner.ledger().quarantined = true;
+                    return true;
                 }
                 if let OpenPhase::Flow(flow) = &mut slot.phase {
-                    flow.close(("local", "close_requested"));
+                    if flow.roles.as_ref().is_some_and(FlowRoles::is_d16) {
+                        if let Some((ctx, _cause)) = terminal_ctx {
+                            if ctx
+                                .flow_mirror
+                                .as_ref()
+                                .and_then(|mirror| mirror.d16_terminal_preclear_inflight())
+                                .is_none()
+                            {
+                                let prepared = flow.roles.as_ref().is_some_and(|roles| {
+                                    ctx.flow_mirror.as_ref().is_some_and(|mirror| {
+                                        mirror.can_preclear_d16_terminal(ctx, roles)
+                                    })
+                                }) && ctx.preflight_downlink_clear();
+                                if !prepared {
+                                    flow.stage = FlowStage::Quarantined;
+                                    owner.ledger().quarantined = true;
+                                    return true;
+                                }
+                                let inflight = ctx.downlink_inflight_permit_bytes();
+                                let disposed = ctx.discard_ordered_for_reset();
+                                if !disposed
+                                    || !ctx.flow_mirror.as_mut().is_some_and(|mirror| {
+                                        mirror.note_d16_terminal_preclear(inflight)
+                                    })
+                                {
+                                    flow.stage = FlowStage::Quarantined;
+                                    owner.ledger().quarantined = true;
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    let reason = if flow.roles.as_ref().is_some_and(FlowRoles::is_d16) {
+                        d16_reason.unwrap_or(("local", "close_requested"))
+                    } else {
+                        ("local", "close_requested")
+                    };
+                    flow.close(reason);
                 }
                 return true;
             }
@@ -1148,10 +1165,21 @@ impl OpenDispatch {
         let stopping = owner.stop.stopping.load(Ordering::Acquire);
         let mut wrapped = false;
         for _ in 0..32 {
+            // D61/D62 R-a: visit occupied rows only; an empty row spends no
+            // control. R-b: passing the table end ends this pass with Pending
+            // and no self-wake; the original loop's 5ms timer starts the next.
+            if wrapped {
+                break;
+            }
+            let Some(index) = opens.slots.next_occupied(opens.cursor) else {
+                opens.cursor = 0;
+                wrapped = true;
+                break;
+            };
             if !owner.take_control() {
+                opens.cursor = index;
                 return Poll::Ready(Some(OpenEvent::Yield));
             }
-            let index = opens.cursor;
             opens.cursor = (index + 1) % opens.slots.len();
             wrapped |= opens.cursor == 0;
             // Split disjoint fields; no transaction is removed from root custody.
@@ -1160,7 +1188,7 @@ impl OpenDispatch {
                 flow: accounting,
                 ..
             } = &mut *opens;
-            let (Some(slot), Some(accounting)) = (&mut slots[index], accounting) else {
+            let (Some(slot), Some(accounting)) = (slots.get_mut(index), accounting) else {
                 continue;
             };
             let OpenPhase::Flow(flow) = &mut slot.phase else {
@@ -1173,6 +1201,12 @@ impl OpenDispatch {
             }
             if stopping && flow.stage != FlowStage::Rearming {
                 flow.close(("root", "session_stop"));
+            }
+            if flow.preparing {
+                if flow.stop_deadline.is_some_and(|deadline| tokio::time::Instant::now().into_std() >= deadline) {
+                    flow.stage = FlowStage::Quarantined;
+                }
+                continue;
             }
             if flow.stage == FlowStage::Waiting
                 && tokio::time::Instant::now().into_std() >= flow.open_deadline
@@ -1191,12 +1225,19 @@ impl OpenDispatch {
                 accounting.f += 1;
                 flow.f_held = true;
                 flow.stage = FlowStage::Opening;
+                let Some(upstream) = flow.upstream.as_ref().cloned() else {
+                    flow.stage = FlowStage::Quarantined;
+                    drop(opens);
+                    owner.quarantine_quiet();
+                    opens = owner.opens(); opens.cursor = index;
+                    continue;
+                };
                 match catch_unwind(AssertUnwindSafe(|| {
                     #[cfg(test)]
                     {
                         accounting.factory_started += 1;
                     }
-                    flow.upstream.clone().staged_tcp_open(TcpOpenRequest {
+                    upstream.staged_tcp_open(TcpOpenRequest {
                         target: flow.target.clone(),
                         deadline: flow.open_deadline,
                     })
@@ -1207,8 +1248,12 @@ impl OpenDispatch {
                         flow.close(("remote_open", "staged_open_unavailable"));
                     }
                     Err(panic) => {
-                        flow.panic = Some(panic);
-                        flow.stage = FlowStage::Quarantined;
+                        flow.retain_unwind(panic);
+                        let id = flow.id;
+                        drop(opens);
+                        owner.note_flow_unwind(id);
+                        opens = owner.opens(); opens.cursor = index;
+                        continue; // Original Q event selection; the poisoned provider is never re-entered.
                     }
                 }
             }
@@ -1242,11 +1287,48 @@ impl OpenDispatch {
                     }
                 }
             })) {
-                flow.panic = Some(panic);
-                flow.stage = FlowStage::Quarantined;
+                flow.retain_unwind(panic);
+                let id = flow.id;
+                drop(opens);
+                owner.note_flow_unwind(id);
+                opens = owner.opens(); opens.cursor = index;
+                continue;
             }
             if continue_next_turn {
                 opens.cursor = index;
+                return Poll::Ready(Some(OpenEvent::Yield));
+            }
+            if let Some(roles) = &mut flow.roles {
+                if roles.all_original_roles_joined() {
+                    if let Some(disposal) = roles.take_original_disposal(owner, flow.id) {
+                        drop(opens);
+                        if disposal.dispose(owner, cx) {
+                            opens = owner.opens(); opens.cursor = index;
+                            continue; // Actual progress spends the same bounded original control turn.
+                        }
+                        return Poll::Ready(Some(OpenEvent::Yield));
+                    }
+                }
+            }
+            if let Some(disposal) = flow.roles.as_mut().and_then(|roles|
+                roles.take_native_disposal(owner, flow.id, flow.producer_stopped, flow.stop_deadline)) {
+                let stock_wait = disposal.is_stock_retirement();
+                let id = flow.id;
+                drop(opens);
+                if disposal.dispose(owner, cx) {
+                    opens = owner.opens(); opens.cursor = index;
+                    continue;
+                }
+                if stock_wait {
+                    opens = owner.opens();
+                    let Some(flow) = opens.flow_mut(id) else { return Poll::Pending; };
+                    let now = tokio::time::Instant::now();
+                    // A waiting inventory cannot prevent Main from releasing
+                    // its actual loan. Reuse the original physical-control timer.
+                    if flow.physical_check.is_some_and(|(stage, next)| stage == flow.stage && now < next) { continue; }
+                    flow.physical_check = Some((flow.stage, now + std::time::Duration::from_millis(5)));
+                    return Poll::Ready(Some(OpenEvent::Flow(id)));
+                }
                 return Poll::Ready(Some(OpenEvent::Yield));
             }
             if flow.stage == FlowStage::Quarantined {
@@ -1277,118 +1359,32 @@ impl OpenDispatch {
         Poll::Pending
     }
 
-    pub(super) fn release_flow(&self, receipt: super::rearm::FlowPhysicalReceipt) -> bool {
-        let id = receipt.identity();
-        let Some(owner) = &self.owner else {
-            return false;
-        };
-        let mut opens = owner.opens();
-        #[cfg(test)]
-        let Some(receipt) = tests::receipt_gate::intercept(&mut opens, receipt) else {
-            return false;
-        };
-        if !opens.audit_flows() {
-            if let Some(flow) = opens.flow_mut(id) {
-                flow.stage = FlowStage::Quarantined;
-            }
-            owner.ledger().quarantined = true;
-            return false;
-        }
-        let Some(flow) = opens.flow_mut(id) else {
-            owner.ledger().quarantined = true;
-            return false;
-        };
-        if !receipt.matches_flow(flow)
-            || flow.stage != FlowStage::Rearming
-            || !flow.producer_stopped
-            || !flow.physical
-            || flow.carrier.is_some()
-            || flow.roles.as_ref().is_some_and(|roles| !roles.settled())
-        {
-            flow.stage = FlowStage::Quarantined;
-            owner.ledger().quarantined = true;
-            return false;
-        }
-        if let Some(roles) = &mut flow.roles {
-            while let Some(error) = roles.take_error() {
-                owner.record(RetainedFailure::from_io(
-                    open_origin(id.index, id.epoch, FailurePhase::TcpOpen),
-                    error,
-                ));
-            }
-        }
-        let rejection = flow.rejection;
-        if let Some(rejection) = rejection {
-            let kind = match rejection {
-                FlowRejection::Unavailable(crate::upstream::TcpOpenUnavailable::Unsupported) => {
-                    std::io::ErrorKind::Unsupported
-                }
-                FlowRejection::Unavailable(crate::upstream::TcpOpenUnavailable::InvalidTarget) => {
-                    std::io::ErrorKind::InvalidInput
-                }
-                FlowRejection::Deadline => std::io::ErrorKind::TimedOut,
-            };
-            owner.record(RetainedFailure::from_io(
-                open_origin(id.index, id.epoch, FailurePhase::TcpOpen),
-                kind.into(),
-            ));
-        } else if flow
-            .attempt
-            .as_ref()
-            .is_some_and(|attempt| attempt.failure().is_some())
-        {
-            // The original source stays in the settled attempt below. This record
-            // exposes failed settlement to the session without fabricating success.
-            owner.record(RetainedFailure::from_io(
-                open_origin(id.index, id.epoch, FailurePhase::TcpOpen),
-                std::io::ErrorKind::Other.into(),
-            ));
-        }
-        let discarded_escrow = flow.escrow_bytes;
-        flow.escrow = Vec::new();
-        flow.escrow_bytes = 0;
-        let (w, f, bytes, published, joined) = (
-            flow.w_held,
-            flow.f_held,
-            flow.reserved,
-            flow.published,
-            flow.roles.as_ref().map_or(0, FlowRoles::join_count),
-        );
-        let failed_attempt = if flow
-            .attempt
-            .as_ref()
-            .is_some_and(|attempt| attempt.failure().is_some())
-        {
-            flow.attempt.take()
-        } else {
-            None
-        };
-        let Some(accounting) = &mut opens.flow else {
-            return false;
-        };
-        if accounting.first_rejection.is_none() {
-            accounting.first_rejection = rejection;
-        }
-        accounting.w -= usize::from(w);
-        accounting.f -= usize::from(f);
-        accounting.bytes -= bytes;
-        accounting.escrow_bytes -= discarded_escrow;
-        accounting.last_data_disposition = Some(receipt.data_disposition());
-        accounting.released += 1;
-        accounting.joined += joined as u64;
-        if published {
-            accounting.retry = (accounting.retry + 1).min(OPEN_LIMIT);
-        }
-        if accounting.first_provider_failure.is_none() {
-            accounting.first_provider_failure = failed_attempt;
-        }
-        opens.slots[id.index] = None;
-        opens.live -= 1;
-        true
-    }
+
 }
 
 impl SessionControl {
+    // One cold owner entry publishes the original flow-scoped opaque fault.
+    // Retained payload custody remains at the original call site; quiet/Q and
+    // the earliest stop deadline are published through the complete Session API.
+    pub(in crate::client_tun::compatibility_runtime::flow_custody) fn note_flow_unwind(
+        &self,
+        id: FlowIdentity,
+    ) {
+        // Every caller has retained the original Box and released opens before
+        // entering this complete quiet/Q publication boundary.
+        let failure = RetainedFailure::opaque_panic(open_origin(
+            id.index,
+            id.epoch,
+            FailurePhase::TcpOpen,
+        ));
+        if self.app_meter.as_ref().is_some_and(|meter| meter.budget_limit().is_some()) {
+            crate::shared::errors::QuietFailureSink::record_quiet(self, failure);
+        } else {
+            self.record(failure);
+            self.ledger().quarantined = true;
+        }
+    }
+
     pub(in crate::client_tun::compatibility_runtime) fn flow_mode(&self) -> bool {
         self.opens().flow.is_some()
     }

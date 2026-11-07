@@ -84,3 +84,36 @@ async fn datagram_upstream_captures_sent_datagrams() {
     assert_eq!(sent[0], vec![1, 2, 3]);
     assert_eq!(sent[1], vec![4, 5]);
 }
+
+#[test]
+fn generic_tuic_projection_preserves_every_other_policy_value() {
+    for bits in 0..2048u16 {
+        let flag = |n: u32| {
+            if bits & (1 << n) != 0 {
+                Some("1")
+            } else {
+                None
+            }
+        };
+        let original = RelayFamilyPolicy::from_sources(RelayFamilyPolicySources {
+            ordered_egress_permit: flag(0),
+            permit: flag(1),
+            continuous: flag(2),
+            thin: flag(3),
+            native_egress_permit: flag(4),
+            native_read_floor: flag(5),
+            tuic_unordered_reassembly: flag(6),
+            tuic_ordered_chunk: flag(7),
+            tuic_native_chunk: flag(8),
+            tuic_native_ordered: flag(9),
+            d16_byte_owned: flag(10),
+        });
+        let projected = original.generic_tuic_transport();
+        assert_eq!(projected.generic_engine(), original.generic_engine());
+        assert_eq!(projected.native_engine(), original.native_engine());
+        assert_eq!(projected.native_read_floor(), original.native_read_floor());
+        assert_eq!(projected.tuic_generic_mode(), original.tuic_generic_mode());
+        assert_eq!(projected.tuic_native_override(), TuicNativeOverride::None);
+        assert_eq!(original.d16_byte_owned(), bits & 1024 != 0);
+    }
+}

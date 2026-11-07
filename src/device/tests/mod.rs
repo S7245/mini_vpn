@@ -8,7 +8,16 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, ReadBuf};
 
+mod cut;
 mod lifecycle;
+#[cfg(feature = "harness")]
+mod cold_factory;
+#[cfg(feature = "harness")]
+mod capacity;
+#[cfg(feature = "harness")]
+mod rx_pressure;
+mod pump_panics;
+mod pump_native;
 
 fn frame_tx_test_packet(packet: Vec<u8>) -> Vec<u8> {
     #[cfg(target_os = "macos")]

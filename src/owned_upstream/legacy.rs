@@ -1,8 +1,12 @@
 use super::{OpenedOwnedTcp, OwnedUpstream, UdpUplink};
 use crate::shared::{ClientError, TargetAddr};
+#[cfg(test)]
 use crate::tuic::encode_packet;
 use crate::upstream::{DatagramUpstream, ProxyUpstream};
 use std::sync::Arc;
+#[cfg(test)]
+#[path = "legacy/tests/provider.rs"]
+mod provider_probe;
 
 /// Exact compatibility adapter for the pre-Knife16 upstreams.
 ///
@@ -45,6 +49,8 @@ impl crate::upstream::TcpOpenAttempt<OpenedOwnedTcp> for LegacyTcpOpen {
         self.inner.settle(cx, now, deadline);
     }
     fn failure(&self) -> Option<&ClientError> {
+        #[cfg(test)]
+        provider_probe::observe(false);
         self.inner.failure()
     }
 }
@@ -72,9 +78,11 @@ where
 
     async fn send_udp(&self, uplink: UdpUplink<'_>) {
         let (association, target, payload) = uplink.into_parts();
-        self.inner
-            .send_udp(encode_packet(association.get(), target, payload))
-            .await;
+        #[cfg(test)]
+        let probe = udp_budget_probe::enter(self.inner.udp_drops_up());
+        self.inner.send_udp_packet(association.get(), target, payload).await;
+        #[cfg(test)]
+        if let Some(probe) = probe { probe.complete(self.inner.udp_drops_up()); }
     }
 
     fn open_is_cheap(&self) -> bool {
@@ -137,10 +145,10 @@ mod tests {
         async fn open_tcp_relay(&self, target: &TargetAddr) -> Result<OpenedTcpRelay, ClientError> {
             self.open_tcp_relay_calls.fetch_add(1, Ordering::SeqCst);
             self.targets.lock().unwrap().push(target.clone());
-            Ok(OpenedTcpRelay::NativeByteOwned(NativeTcpRelayStream {
-                reader: Box::new(PendingNativeReader),
-                writer: Box::new(tokio::io::sink()),
-            }))
+            Ok(OpenedTcpRelay::NativeByteOwned(NativeTcpRelayStream::new(
+                Box::new(PendingNativeReader),
+                Box::new(tokio::io::sink()),
+            )))
         }
 
         fn open_is_cheap(&self) -> bool {
@@ -208,3 +216,7 @@ mod tests {
         assert_eq!(adapter.udp_stream_fallbacks(), 13);
     }
 }
+
+#[cfg(test)]
+#[path = "legacy/tests/udp_budget_probe.rs"]
+mod udp_budget_probe;

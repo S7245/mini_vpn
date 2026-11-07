@@ -18,7 +18,7 @@ async fn local_egress_service_stops_on_no_work_hard_pause_and_no_progress() {
     let mut socket_ctxs = HashMap::new();
     let mut dirty = HashSet::new();
     let (handshake_done_tx, _handshake_done_rx) = OpenDispatch::channel(1, None);
-    let (global_tx, _global_rx) = mpsc::channel(1);
+    let (global_tx, _global_rx) = crate::client_tun::relay_channel::channel(1);
     let (owned_action_tx, _owned_action_rx) = mpsc::channel(1);
     let mut sink = NoopSink;
     let cfg = DownlinkBackpressureConfig {
@@ -222,7 +222,7 @@ async fn d16_drain_only_keeps_poll_and_flush_progress() {
     let mut socket_ctxs = HashMap::from([(handle, ctx)]);
     let mut dirty = HashSet::from([handle]);
     let (handshake_done_tx, _handshake_done_rx) = OpenDispatch::channel(1, None);
-    let (global_tx, _global_rx) = mpsc::channel(1);
+    let (global_tx, _global_rx) = crate::client_tun::relay_channel::channel(1);
     let (owned_action_tx, _owned_action_rx) = mpsc::channel(1);
     let mut sink = NoopSink;
     let cfg = DownlinkBackpressureConfig {
@@ -291,3 +291,7 @@ async fn d16_drain_only_keeps_poll_and_flush_progress() {
     assert!(line.contains("d16_egress_phase_transitions=1"), "{line}");
     assert!(line.contains("d16_drain_only_cycles=1"), "{line}");
 }
+
+mod ordered_flush;
+
+pub(super) use ordered_flush::matching_flow_only;

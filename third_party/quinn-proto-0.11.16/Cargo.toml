@@ -76,6 +76,7 @@ rustls-ring = [
     "rustls?/ring",
     "ring",
 ]
+sent-history-observe = []
 
 [lib]
 name = "quinn_proto"

@@ -1,8 +1,8 @@
 use std::{
-    future::{Future, poll_fn},
+    future::{poll_fn, Future},
     io,
     pin::Pin,
-    task::{Context, Poll, ready},
+    task::{ready, Context, Poll},
 };
 
 use bytes::Bytes;
@@ -10,7 +10,7 @@ use proto::{Chunk, Chunks, ClosedStream, ConnectionError, ReadableError, StreamI
 use thiserror::Error;
 use tokio::io::ReadBuf;
 
-use crate::{VarInt, connection::ConnectionRef};
+use crate::{connection::ConnectionRef, VarInt};
 
 /// A stream that can only be used to receive data
 ///
@@ -72,7 +72,7 @@ impl RecvStreamProgress {
         if self.is_0rtt && conn.check_0rtt().is_err() {
             return Err(ClosedStream::default());
         }
-        conn.inner.recv_stream(self.stream).progress()
+        conn.recv_stream(self.stream).progress()
     }
 
     /// Get the identity of the sampled stream.
@@ -82,6 +82,18 @@ impl RecvStreamProgress {
 }
 
 impl RecvStream {
+    #[cfg(test)]
+    pub(crate) fn all_data_read_for_test(&self) -> bool { self.all_data_read }
+
+    /// Capture the authority of this stream's receive backing once at source construction.
+    #[doc(hidden)]
+    pub fn receive_backing_meter(&self) -> Option<bytes::BackingMeter> {
+        self.conn
+            .state
+            .lock("RecvStream::receive_backing_meter")
+            .inner
+            .receive_backing_meter()
+    }
     pub(crate) fn new(conn: ConnectionRef, stream: StreamId, is_0rtt: bool) -> Self {
         Self {
             conn,
@@ -226,6 +238,27 @@ impl RecvStream {
         })
     }
 
+    /// Poll an unordered chunk only when its offset equals `expected_offset`.
+    ///
+    /// The offset gate and extraction run under the same connection lock. A
+    /// mismatch consumes no bytes and registers the original readable waker.
+    /// RESET, connection errors, EOF and read credits keep their normal order.
+    /// Zero length consumes no bytes, with the same readiness as `read_chunk`.
+    /// This operation is cancel-safe and never switches to ordered reads.
+    pub fn poll_read_chunk_at(
+        &mut self,
+        cx: &mut Context,
+        expected_offset: u64,
+        max_length: usize,
+    ) -> Poll<Result<Option<Chunk>, ReadError>> {
+        self.poll_read_generic(cx, false, |chunks| {
+            match chunks.next_at(expected_offset, max_length) {
+                Ok(Some(chunk)) => ReadStatus::Readable(chunk),
+                res => (None, res.err()).into(),
+            }
+        })
+    }
+
     /// Read the next segments of data
     ///
     /// Fills `bufs` with the segments of data beginning immediately after the
@@ -301,8 +334,10 @@ impl RecvStream {
         if self.is_0rtt && conn.check_0rtt().is_err() {
             return Ok(());
         }
-        conn.inner.recv_stream(self.stream).stop(error_code)?;
+        let result = conn.recv_stream(self.stream).stop(error_code);
+        conn.settle_local_failure(&self.conn.shared);
         conn.wake();
+        result?;
         self.all_data_read = true;
         // Clean up shared state that might be left over from a cancalled read
         // operation, so `drop` doesn't have to
@@ -352,7 +387,12 @@ impl RecvStream {
                 return Poll::Ready(Ok(Some(code)));
             }
 
-            match conn.inner.recv_stream(self.stream).received_reset() {
+            let result = conn.recv_stream(self.stream).received_reset();
+            conn.settle_local_failure(&self.conn.shared);
+            if let Some(error) = &conn.error {
+                return Poll::Ready(Err(error.clone().into()));
+            }
+            match result {
                 Err(_) => Poll::Ready(Ok(None)),
                 Ok(Some(error_code)) => {
                     // Stream state has just now been freed, so the connection may need to issue new
@@ -397,6 +437,10 @@ impl RecvStream {
         }
 
         let mut conn = self.conn.state.lock("RecvStream::poll_read");
+        // This actual poll supersedes a previous pending borrow's registration.
+        // The same lock covers re-evaluation and registering the current waker
+        // on Blocked, so Ready/EOF/error cannot retain a stale waiting task.
+        conn.blocked_readers.remove(&self.stream);
         if self.is_0rtt {
             conn.check_0rtt().map_err(|()| ReadError::ZeroRttRejected)?;
         }
@@ -406,13 +450,35 @@ impl RecvStream {
         let status = match self.reset {
             Some(code) => ReadStatus::Failed(None, Reset(code)),
             None => {
-                let mut recv = conn.inner.recv_stream(self.stream);
-                let mut chunks = recv.read(ordered)?;
-                let status = read_fn(&mut chunks);
-                if chunks.finalize().should_transmit() {
-                    conn.wake();
+                let attempt = {
+                    let mut recv = conn.recv_stream(self.stream);
+                    let prepared = match recv.read(ordered) {
+                        Ok(mut chunks) => {
+                            let status = read_fn(&mut chunks);
+                            Ok((status, chunks.finalize().should_transmit()))
+                        }
+                        Err(error) => Err(error),
+                    };
+                    prepared
+                };
+                conn.settle_local_failure(&self.conn.shared);
+                match attempt {
+                    Ok((status, transmit)) => {
+                        if transmit {
+                            conn.wake();
+                        }
+                        status
+                    }
+                    Err(error) => {
+                        if matches!(error, ReadableError::BackingAuthorityLost) {
+                            conn.wake();
+                            if let Some(first) = &conn.error {
+                                return Poll::Ready(Err(ReadError::ConnectionLost(first.clone())));
+                            }
+                        }
+                        return Poll::Ready(Err(error.into()));
+                    }
                 }
-                status
             }
         };
 
@@ -431,6 +497,13 @@ impl RecvStream {
                     conn.blocked_readers.insert(self.stream, cx.waker().clone());
                     Poll::Pending
                 }
+            },
+            ReadStatus::Failed(read, BackingAuthorityLost) => match read {
+                Some(value) => Poll::Ready(Ok(Some(value))),
+                None => Poll::Ready(Err(match &conn.error {
+                    Some(first) => ReadError::ConnectionLost(first.clone()),
+                    None => ReadError::BackingAuthorityLost,
+                })),
             },
             ReadStatus::Failed(read, Reset(error_code)) => match read {
                 None => {
@@ -542,30 +615,27 @@ impl tokio::io::AsyncRead for RecvStream {
 
 impl Drop for RecvStream {
     fn drop(&mut self) {
-        if self.all_data_read {
-            debug_assert!(
-                !self
-                    .conn
-                    .state
-                    .lock("RecvStream:drop")
-                    .blocked_readers
-                    .contains_key(&self.stream),
-                "Stream {} should not have a blocked reader when all data read is true",
-                &self.stream
-            );
+        let mut conn = self.conn.state.lock("RecvStream::drop");
+        let retired = conn.recv_stream(self.stream).retire_closed();
+        if retired != Ok(false) {
+            conn.settle_local_failure(&self.conn.shared);
+            conn.blocked_readers.remove(&self.stream);
             return;
         }
-        let mut conn = self.conn.state.lock("RecvStream::drop");
-
+        if self.all_data_read {
+            debug_assert!(!conn.blocked_readers.contains_key(&self.stream),
+                "Stream {} should not have a blocked reader when all data read is true", &self.stream);
+            return;
+        }
         // clean up any previously registered wakers
         conn.blocked_readers.remove(&self.stream);
-
         if conn.error.is_some() || (self.is_0rtt && conn.check_0rtt().is_err()) {
             return;
         }
 
         // Ignore ClosedStream errors
-        let _ = conn.inner.recv_stream(self.stream).stop(0u32.into());
+        let _ = conn.recv_stream(self.stream).stop(0u32.into());
+        conn.settle_local_failure(&self.conn.shared);
         conn.wake();
     }
 }
@@ -590,6 +660,9 @@ pub enum ReadError {
     /// stream which cannot be recovered, making further ordered reads impossible.
     #[error("ordered read after unordered read")]
     IllegalOrderedRead,
+    /// The buffered receive backing lost its registered Node authority.
+    #[error("receive backing authority lost")]
+    BackingAuthorityLost,
     /// This was a 0-RTT stream and the server rejected it
     ///
     /// Can only occur on clients for 0-RTT streams, which can be opened using
@@ -605,6 +678,7 @@ impl From<ReadableError> for ReadError {
         match e {
             ReadableError::ClosedStream => Self::ClosedStream,
             ReadableError::IllegalOrderedRead => Self::IllegalOrderedRead,
+            ReadableError::BackingAuthorityLost => Self::BackingAuthorityLost,
         }
     }
 }
@@ -625,6 +699,7 @@ impl From<ReadError> for io::Error {
             Reset { .. } | ZeroRttRejected => io::ErrorKind::ConnectionReset,
             ConnectionLost(_) | ClosedStream => io::ErrorKind::NotConnected,
             IllegalOrderedRead => io::ErrorKind::InvalidInput,
+            BackingAuthorityLost => io::ErrorKind::InvalidData,
         };
         Self::new(kind, x)
     }

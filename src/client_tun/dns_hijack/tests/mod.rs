@@ -37,3 +37,35 @@ fn exhausted_pool_returns_servfail_without_changing_an_active_target() {
     assert_eq!(pool.resolve(active).as_deref(), Some("active.example"));
     assert_eq!(pool.alloc("active.example", 1), Ok(active));
 }
+
+#[tokio::test]
+async fn real_dns_full_slot_rejects_before_fake_ip_mutation_and_preserves_original_packet() {
+    let (budget, _, mut device) = crate::device::VirtualTunDevice::test_native_egress_only_shell();
+    device
+        .inject_ip_packet_with(60, |out| {
+            out.fill(7);
+            Ok(60)
+        })
+        .unwrap();
+    let charged = budget.used();
+    let queued = device.queued_tx_bytes();
+    let mut pool = FakeIpPool::new();
+    let before = pool.usage();
+    let query = [
+        0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 3, b'n', b'e', b'w', 0, 0, 1, 0, 1,
+    ];
+    let packet = build_udp_ip_packet(
+        (Ipv4Addr::new(10, 0, 0, 2), 50000),
+        (Ipv4Addr::new(8, 8, 8, 8), 53),
+        &query,
+    )
+    .unwrap();
+    handle_dns_hijack(&packet, &mut pool, &mut device, 0, &Metrics::default()).await;
+    assert_eq!(pool.usage(), before);
+    assert_eq!(budget.used(), charged);
+    assert_eq!(device.queued_tx_bytes(), queued);
+    assert!(!budget.quarantined());
+    std::future::poll_fn(|cx| device.poll_shutdown(cx)).await;
+    drop(device);
+    assert_eq!(budget.used(), 0);
+}
