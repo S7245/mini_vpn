@@ -26,3 +26,4 @@ A 出口已于 2026-11-04 按用户批准改为 A1–A4，见 [A 出口修订](d
 - 2026-11-07 D98：C7 以 D11 记录关闭（用户接受）。下一 C9（父会话开）。
 - 2026-11-07 D99：C9 独立只读审查完成，C1–C7 无 FAIL（[审查](docs/current/n1-c-review-20261107.md)）；C6 necessary-only，C7 D11 记录非 PASS。
 - 2026-11-07 D100：F1 门加无 feature production check、F4 文档同步；全门 n1-d100-gate-20261107；bd18abb 以来整个 N1 dirty 树单一本地提交（用户"Commit whole tree"，无 push）。仍待：C4（Node 写轴授权）、C8（外部授权）、C-B、B8（D57）、F2/F3（下次触碰 full_* 夹具）；push 未授权。日志 D101+。
+- 2026-11-07 D101–D103：C4 已闭（Node 写轴仅 C4 授权；4 tracer + 变异 RED；全门 n1-c4-gate-20261107 joint 696/696；生产语义不变，未提交）。仍待：C8、C-B、B8（D57）、F2/F3；commit/push 未授权。日志 D104+。

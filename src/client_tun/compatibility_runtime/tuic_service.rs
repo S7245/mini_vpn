@@ -129,6 +129,11 @@ struct Control {
     abort_stats_at_rebuild: AtomicBool,
     #[cfg(test)]
     node_fault_settled: AtomicBool,
+    /// C4: one `NodeHost::C4_*` fault around the controlled-rebuild drain.
+    #[cfg(test)]
+    rebuild_node_fault: std::sync::atomic::AtomicU8,
+    #[cfg(test)]
+    held_node_data: Mutex<Option<Arc<dyn std::any::Any + Send + Sync>>>,
     #[cfg(test)]
     health_state: Mutex<Option<std::sync::Weak<crate::failover::FailoverState>>>,
     #[cfg(test)]
@@ -451,6 +456,10 @@ fn control_with_budget(
         abort_stats_at_rebuild: AtomicBool::new(false),
         #[cfg(test)]
         node_fault_settled: AtomicBool::new(false),
+        #[cfg(test)]
+        rebuild_node_fault: std::sync::atomic::AtomicU8::new(0),
+        #[cfg(test)]
+        held_node_data: Mutex::new(None),
         #[cfg(test)]
         health_state: Mutex::new(None),
         #[cfg(test)]

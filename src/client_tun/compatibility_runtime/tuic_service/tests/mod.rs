@@ -40,6 +40,7 @@ mod native_rebuild_loaded_cut;
 mod native_rebuild_high_rtt;
 mod native_rebuild_lossy;
 mod native_rebuild_loaded_expiry;
+mod native_rebuild_node_disposition;
 mod native_park_wakeup;
 mod native_eof_lane_order;
 mod native_physical_reprobe;

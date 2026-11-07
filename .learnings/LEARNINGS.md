@@ -1,3 +1,7 @@
+## 2026-11-07 变异要打在被评审假设上，而非最近的代码行；多重见证会让"局部"变异失去判别力
+
+C4（D103）：M1 让 cleanup 放弃仍被共享的 DATA Arc，tracer 仍绿——被持有的 Arc 同时钉住下游物理见证（连接/endpoint drain），drain 照样不结算。改用评审原假设 M1p（Pending 误报为 Settled）才 RED，且由 `cleanup.is_none()` 双向检查拦下。冻结预测时把"经何机制 RED"也写下：M3 RED 走的是分类而非后继，说明 Failed 与 Unsettled 两道守卫重叠。
+
 ## 2026-11-06 修一个 seam 时按其“类”覆盖全部同源终态，别只修观察到的那个原因
 
 D72 只给 remote_eof 加了 lane 次序守卫；同一信号路径的 remote_read_failed（RESET）有同样的越序，表现为另一测试的结算超时（D75）。探针本身改变时序（单跑 0/5），需在更高负载的 focused 集里抓失败。修复前先列出同一发送点（send_relay_reader_close）的所有原因。

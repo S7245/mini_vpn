@@ -434,11 +434,22 @@ where
             );
             if cut.is_some() && !saved.stop.stopping.load(Ordering::Acquire) {
                 if let Some(host) = &mut node {
+                    #[cfg(test)]
+                    let c4 = saved.rebuild_node_fault.load(Ordering::Acquire);
+                    #[cfg(test)]
+                    if c4 == NodeHost::C4_HOLD_DATA {
+                        let data = host.c4_hold_data_for_service_test();
+                        *saved.held_node_data.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(data);
+                    }
                     match host.begin_controlled_rebuild() {
                         Ok(()) => {
                             #[cfg(test)]
                             if saved.abort_stats_at_rebuild.load(Ordering::Acquire) {
                                 host.cancel_original_stats_for_service_test();
+                            }
+                            #[cfg(test)]
+                            if c4 == NodeHost::C4_KNOWN_FAILURE {
+                                host.record_known_failure_for_probe_test();
                             }
                             #[cfg(test)]
                             println!(
@@ -453,6 +464,8 @@ where
                                 Arc::as_ptr(&owner) as usize,
                                 tokio::time::Instant::now()
                             );
+                            #[cfg(test)]
+                            host.c4_after_drain_for_service_test(c4);
                             if matches!(state, NodeShutdown::Incomplete | NodeShutdown::Quarantined)
                             {
                                 #[cfg(test)]
@@ -464,6 +477,11 @@ where
                                 std::future::pending::<()>().await;
                             }
                             let disposition = host.controlled_rebuild_disposition();
+                            #[cfg(test)]
+                            if c4 == NodeHost::C4_UNJOINED_TASK && disposition.is_quarantined() {
+                                host.assert_c4_custody_contradiction_for_test();
+                                saved.node_fault_settled.store(true, Ordering::Release);
+                            }
                             if disposition.is_quarantined() {
                                 saved.publish(Phase::Quarantined);
                                 std::future::pending::<()>().await;

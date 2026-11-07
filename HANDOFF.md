@@ -272,3 +272,8 @@ C7 已闭（D98，用户接受 D11 记录，非 PASS）；证据 D96–D97，全
 ## 新会话交接（2026-11-07，D99–D100：C9 无 FAIL，F1/F4 已修，A–C 已本地提交）
 
 C9 独立只读审查（D99，[审查](docs/current/n1-c-review-20261107.md)）：C1–C7 无 FAIL；C6 necessary-only；C7 D11 记录非 PASS。D100：门 runner 加 production-plain 组（无 feature `cargo check --offline --lib`；runner `/private/tmp/claude-501/-Users-liushan-Documents-Personal-Languages-Rust-mini-vpn-recovered-20260918-jIMbzz/4a52bef9-4cdf-4ed3-95bf-22b157914faa/scratchpad/d100g/gate.sh`）；计划 C-I8=1024·1472/RTT、C3/C9 行、STATUS 重复项已同步；全门 `n1-d100-gate-20261107/gate-*`。bd18abb 以来整个 N1 dirty 树（D19 前基础 + A–C D19–D100）已单一本地 commit（用户"Commit whole tree"；未 push）。仍待：C4、C8、C-B、B8（D57）、F2/F3；push 未授权。日志 D101+。
+
+## 新会话交接（2026-11-07，D101–D103：C4 已闭，未提交）
+
+C4（B-review F1/F2）：cfg(test) seam `src/tuic/node/tests/service_faults.rs`（`NodeHost::C4_*`）+ Service `tuic_service.rs`/`tuic_service/rebuild.rs` cfg(test) 字段与 4 处 hook + 新叶 `tuic_service/tests/native_rebuild_node_disposition.rs`（已入联合门）。生产 node.rs、node/rebuild.rs sha 不变。证据：DECISIONS D102（冻结预测）、D103（结果/变异/全门），raw `/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n1-c4-20261107/`、`n1-c4-gate-20261107/gate-*`；runner 副本 `/private/tmp/claude-501/-Users-liushan-Documents-Personal-Languages-Rust-mini-vpn-recovered-20260918-jIMbzz/72bd0648-fb12-44cc-9640-45b4ff3798cf/scratchpad/c4g/gate.sh`（joint 696 项）。
+下一：用户决定是否提交 C4；C8 外部、C-B、B8（D57）仍待授权/决策。禁止同前；日志 D104+。
