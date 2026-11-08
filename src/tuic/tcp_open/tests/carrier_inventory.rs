@@ -184,7 +184,7 @@ async fn actual_ur_nonzero_inventory_survives_read_half_drop_until_last_half_and
         Some("00000000-0000-0000-0000-000000000000"),
         Some("local-test-only"),
         Some("localhost"),
-        Some("certs/dev/ca-cert.pem"),
+        Some(crate::tuic::tcp_fixture::test_ca_path().as_str()),
         Some("h3"),
     )
     .unwrap()

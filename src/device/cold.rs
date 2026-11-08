@@ -112,7 +112,7 @@ impl Drop for PreparedDevice {
 
 impl VirtualTunDevice {
     /// Cold admission precedes the OS factory. Bind is the sole pump start.
-    /// The public CLI remains separately gated until complete Native acceptance.
+    /// The public CLI hard factory calls this with the real OS TUN source (D105).
     pub fn native_with_factory(
         slots: usize,
         mtu: usize,

@@ -1670,17 +1670,17 @@ async fn d16_direct_ordered_reader_keeps_one_pending_read_future() {
 
 #[tokio::test]
 async fn d16_real_quinn_reader_wakes_after_delayed_ordered_payload() {
-    let cert_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("certs/dev");
-    let mut server_cert_reader =
-        std::io::BufReader::new(std::fs::File::open(cert_dir.join("server-cert.pem")).unwrap());
-    let server_certs = rustls_pemfile::certs(&mut server_cert_reader)
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    let mut server_key_reader =
-        std::io::BufReader::new(std::fs::File::open(cert_dir.join("server-key.pem")).unwrap());
-    let server_key = rustls_pemfile::private_key(&mut server_key_reader)
-        .unwrap()
-        .unwrap();
+    // D111: in-memory test identity replaces the former disk reads of
+    // certs/dev/server-cert.pem and certs/dev/server-key.pem. Same server
+    // shape as before: single-cert chain, no ALPN, quinn default transport,
+    // bound to 127.0.0.1:0. The identity is generated once per test binary
+    // and is never written to disk (see `tcp_fixture::test_identity`).
+    //
+    // This test keeps its own inline endpoint construction (rather than
+    // calling `d16_quinn_test_endpoints`) exactly as before; only the
+    // certificate/key source changes.
+    let (server_certs, server_key) =
+        crate::tuic::tcp_fixture::test_server_identity();
     let server_config = quinn::ServerConfig::with_single_cert(server_certs, server_key).unwrap();
     let server_endpoint = quinn::Endpoint::server(
         server_config,
@@ -1689,12 +1689,12 @@ async fn d16_real_quinn_reader_wakes_after_delayed_ordered_payload() {
     .unwrap();
     let server_addr = server_endpoint.local_addr().unwrap();
 
-    let mut ca_reader =
-        std::io::BufReader::new(std::fs::File::open(cert_dir.join("ca-cert.pem")).unwrap());
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut ca_reader) {
-        roots.add(cert.unwrap()).unwrap();
-    }
+    // D111: client roots = the in-memory issuing CA (was a disk read of
+    // certs/dev/ca-cert.pem); the client still trusts that CA only, and the
+    // server leaf is signed by it, so verification follows the same
+    // CA -> leaf path with server name "localhost" as the old dev pair. No CA
+    // file is needed because the root store is built directly in memory.
+    let roots = crate::tuic::tcp_fixture::test_roots();
     let mut client_endpoint =
         quinn::Endpoint::client("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap()).unwrap();
     client_endpoint.set_default_client_config(

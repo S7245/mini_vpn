@@ -45,6 +45,7 @@ mod native_park_wakeup;
 mod native_eof_lane_order;
 mod native_physical_reprobe;
 mod native_uplink_span;
+mod native_public_recovery;
 mod path;
 mod prepublish_rejection;
 mod shutdown_census;

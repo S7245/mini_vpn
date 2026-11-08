@@ -134,8 +134,8 @@ N0 完成需同时满足：可恢复检查点可读；契约取舍获批准；�
 | N0-B / P | 冻结目标、owner、预算、首片；新旧承诺不能混用 | N0-A | 第13节D1–D4/D5-B批准；结果同一N1执行卡与F1-R1证据 | AcceptedLocal：最终独立Approve0/0/0 |
 | N0-C / P | 基线与最小交接；确保可以恢复执行而不是靠聊天记忆 | N0-B | 结果中542次通过/2历史失败、交接与独立审查 | AcceptedLocal：N0完成；N1仍须单独授权 |
 | N1-M / P（条件项） | 仅在现有 Seam 不足时做必要行为保持 Move | N0-C | 同一 characterization 前后 GREEN、growth/provenance 通过 | M0/M1/M2均独立AcceptedLocal0/0/0；1636次执行通过，仅接受纯Move，见N1记录 |
-| N1-R / V | 所选节点局部重连及受控会话重建，恢复新 TCP/同四元组 UDP | 接入丢包修复、所用 Generic 资源树闭合；不等待全部 family/S1 | 第8节与分层修订§6真实恢复、代际、错误/清理及公开调用证据 | 未实现；按唯一 F1 清单推进 |
-| N1-L / V | 本轮资源的压力、取消、退出与错误回收 | 与每个 N1-R 切片同时闭合 | 完整处置矩阵、真实join、无残留工作/虚假零、独立closure | Generic局部证据已接受，接入SynBurst仍RED；当前结果与余项见唯一F1清单，整体N1未接受 |
+| N1-R / V | 所选节点局部重连及受控会话重建，恢复新 TCP/同四元组 UDP | 接入丢包修复、所用 Generic 资源树闭合；不等待全部 family/S1 | 第8节与分层修订§6真实恢复、代际、错误/清理及公开调用证据 | 本地 loopback 已实现（2026-11-07 D104–D106，D108 补证）：公开 Service 生命周期 hard Native 主连接失效→同 session 局部恢复、新 TCP+同四元组 UDP（同 assoc）、旧代迟到分片确已送达后跨代隔离（变异 RED）、精确结算；证据 `tuic_service/tests/native_public_recovery.rs`、DECISIONS D106/D108。**N1 已接受（本地 loopback 范围，2026-11-07 D125，独立终审）**；真实 TUN/SIGHUP 运行、O2 标定未覆盖（N5/C8 外部门） |
+| N1-L / V | 本轮资源的压力、取消、退出与错误回收 | 与每个 N1-R 切片同时闭合 | 完整处置矩阵、真实join、无残留工作/虚假零、独立closure | Generic局部证据已接受；N1 公开入口本地处置闭合（D104–D108：O3 天花板拒绝、O-C4b 有界 drain 判定 Incomplete 且单次记录、CLI 报告 Incomplete/Quarantined、SIGHUP 仅 hard Native、关闭时 flow/连接/任务库存归零）。接入丢包修复（SynBurst）已证：D111 内存测试身份、D116–D117 RX 公平性 b1+b2，SynBurst 5/5、接入 drops 0、已入 capacity-serial 门组；D122–D123 A/B 判 loaded_reset 为既有负载 flake（用户 D124 接受）。**N1 已接受（本地 loopback 范围，D125）**；遗留 O-N2a–d 转 N2/N4 |
 | N2 / V | 黑洞/慢速/空闲/Target 失败；防误判与所选节点重连风暴 | N1 完整接受 | 分层故障证据、基本策略深化、有界重试/公平性测试 | 未执行 |
 | N3 / D | 自动启用备用节点、运行中 TCP/UDP 自动换出口及自动回切 | 未来单独授权；届时重新审查依赖 | 未来启用时仍需双向真实往返、同四元组 UDP、迟到隔离与回切迟滞验收 | 用户于2026-10-09移出本轮；见 TODO 后续规划 |
 | N4 / L | 所选节点的本地并发、长时与循环故障组合验收；不含自动 A/B 切换 | N2 完整接受；不依赖延期 N3 | 完整本地矩阵；预算峰值/超限处置、任务收敛、DNS/TUN 公平性、同节点代际隔离与稳态质量 | 未执行；2026-10-09 用户确认修订范围 |

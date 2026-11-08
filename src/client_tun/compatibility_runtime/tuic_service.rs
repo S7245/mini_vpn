@@ -294,6 +294,20 @@ impl Handle {
         self.0.request_stop();
     }
 
+    /// Observer only: the first published phase that differs from `seen`.
+    pub async fn changed_from(&self, seen: Phase) -> Phase {
+        loop {
+            let changed = self.0.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let phase = self.phase();
+            if phase != seen {
+                return phase;
+            }
+            changed.await;
+        }
+    }
+
     /// This observer never drives the saved work and never resets its deadline.
     pub async fn observe_shutdown(&self) -> Phase {
         let mut deadline = self.0.request_stop();
@@ -661,6 +675,12 @@ fn native_budget(
     let memory = memory_bound(hard as u64, instances.total).map_err(|rejection| {
         ClientError::InvalidTarget(format!("Native memory preflight rejected: {rejection:?}"))
     })?;
+    // O3 (D105): an explicit process ceiling turns the record into a gate.
+    if let Some(ceiling) = limits.memory_ceiling.filter(|ceiling| memory > ceiling.get()) {
+        return Err(ClientError::InvalidTarget(format!(
+            "Native memory preflight rejected: hard + instances {memory}B > ceiling {ceiling}B"
+        )));
+    }
     let reserve = usize::try_from(reserve).map_err(|_| overflow())?;
     let budget = bytes::BackingBudget::with_protocol_reserve(hard, reserve)
         .ok_or_else(|| ClientError::InvalidTarget("invalid Native backing limit".into()))?;
@@ -720,6 +740,7 @@ pub(super) async fn serve<D: TunIo, F, Fut>(
     F: FnOnce(Option<bytes::BackingMeter>) -> Fut,
     Fut: Future<Output = Result<D, ClientError>>,
 {
+    let hangup = hangup_rebuild(&runtime);
     match config {
         Startup::Tuic(tuic) => {
             let config = Configuration {
@@ -733,10 +754,11 @@ pub(super) async fn serve<D: TunIo, F, Fut>(
                     runtime,
                     metrics,
                     LoopProfiler::new(),
-                ))
+                ), hangup)
                 .await;
             } else {
-                serve_with(prepare_factory(factory, config, runtime, metrics, NoopSink)).await;
+                serve_with(prepare_factory(factory, config, runtime, metrics, NoopSink), hangup)
+                    .await;
             }
         }
         Startup::Failover(tuic, reality) => {
@@ -748,24 +770,89 @@ pub(super) async fn serve<D: TunIo, F, Fut>(
                     runtime,
                     metrics,
                     LoopProfiler::new(),
-                ))
+                ), hangup)
                 .await;
             } else {
-                serve_with(prepare_factory(factory, config, runtime, metrics, NoopSink)).await;
+                serve_with(prepare_factory(factory, config, runtime, metrics, NoopSink), hangup)
+                    .await;
             }
         }
     }
 }
 
-async fn serve_with<S: TunService>(mut service: S) {
-    let handle = service.take_handle();
-    let report = tokio::select! {
-        report = service.run() => report,
-        signal = tokio::signal::ctrl_c() => {
-            if let Err(error) = signal { eprintln!("TUIC stop signal failed: {error}"); }
-            if let Some(handle) = &handle { handle.request_stop(); }
-            service.run().await
+/// D108 (review F2): only hard Native gets SIGHUP → rebuild. The legacy default
+/// never registers the handler, so its SIGHUP disposition stays the OS default.
+fn hangup_rebuild(runtime: &TunRuntimeConfig) -> bool {
+    runtime.native_limits.is_some()
+}
+
+/// D108 (review F5): surface every published Incomplete/Quarantined verdict.
+/// Observer only; it never drives or settles the Service and never returns.
+async fn report_verdicts(handle: &Handle, mut sink: impl FnMut(String)) -> std::convert::Infallible {
+    let mut seen = Phase::Starting;
+    loop {
+        seen = handle.changed_from(seen).await;
+        if matches!(seen, Phase::Incomplete | Phase::Quarantined) {
+            sink(format!(
+                "TUIC service phase {seen:?}: old Node drain not settled; still driving it"
+            ));
         }
+    }
+}
+
+/// CLI control: Ctrl-C requests stop; for hard Native, unix SIGHUP requests the
+/// one explicit same-node session rebuild (D105/D108). Signals only request; the
+/// saved driver decides. Incomplete/Quarantined verdicts are reported (D108).
+async fn serve_with<S: TunService>(mut service: S, hangup_rebuild: bool) {
+    let handle = service.take_handle();
+    #[cfg(unix)]
+    let mut hangup = hangup_rebuild
+        .then(|| tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()))
+        .and_then(|signal| {
+            signal
+                .map_err(|error| eprintln!("TUIC rebuild signal unavailable: {error}"))
+                .ok()
+        });
+    #[cfg(not(unix))]
+    let _ = hangup_rebuild;
+    let verdicts = async {
+        match handle.as_ref() {
+            Some(handle) => report_verdicts(handle, |line| eprintln!("{line}")).await,
+            None => std::future::pending().await,
+        }
+    };
+    let mut verdicts = std::pin::pin!(verdicts);
+    let rebuild = async {
+        #[cfg(unix)]
+        if let Some(hangup) = hangup.as_mut() {
+            while hangup.recv().await.is_some() {
+                let accepted = handle.as_ref().is_some_and(Handle::request_rebuild);
+                eprintln!("TUIC rebuild request (SIGHUP): accepted={accepted}");
+            }
+        }
+        std::future::pending::<()>().await
+    };
+    let report = {
+        let mut run = std::pin::pin!(service.run());
+        tokio::select! {
+            report = &mut run => Some(report),
+            never = &mut verdicts => match never {},
+            () = rebuild => None,
+            signal = tokio::signal::ctrl_c() => {
+                if let Err(error) = signal { eprintln!("TUIC stop signal failed: {error}"); }
+                None
+            }
+        }
+    };
+    if let Some(handle) = &handle {
+        handle.request_stop();
+    }
+    let report = match report {
+        Some(report) => report,
+        None => tokio::select! {
+            report = service.run() => report,
+            never = &mut verdicts => match never {},
+        },
     };
     eprintln!("TUIC service settled: {report:?}");
 }

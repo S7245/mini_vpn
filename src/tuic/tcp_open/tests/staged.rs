@@ -39,7 +39,7 @@ async fn real_authenticated_connect_reaches_owned_staged_factory_and_data() {
         Some("00000000-0000-0000-0000-000000000000"),
         Some("local-test-only"),
         Some("localhost"),
-        Some("certs/dev/ca-cert.pem"),
+        Some(crate::tuic::tcp_fixture::test_ca_path().as_str()),
         Some("h3"),
     )
     .unwrap();

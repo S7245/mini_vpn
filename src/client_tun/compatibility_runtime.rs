@@ -910,20 +910,17 @@ pub async fn start_tun_proxy() {
     let mtu = runtime_config.tun_mtu;
     let pumped = runtime_config.relay_policy.d16_byte_owned();
     let ingress_capacity = runtime_config.tun_tx_queue_len;
+    let native_slots = runtime_config.native_limits.map(|limits| limits.device_slots.get());
     let device_factory = move |meter: Option<bytes::BackingMeter>| async move {
-        // Full Native device inventory is the next A slice. Until it exists,
-        // reject before OS-device creation or the original ingress pump spawn.
-        if meter
-            .as_ref()
-            .is_some_and(|meter| meter.budget_limit().is_some())
-        {
-            return Err(crate::shared::ClientError::Io(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "Native device cold inventory is not ready",
-            )));
+        // D105 hard Native (opt-in): cold Device admission on the original
+        // meter precedes the OS TUN source; bind stays in the saved driver.
+        if let (Some(meter), Some(slots)) = (meter.as_ref(), native_slots) {
+            return VirtualTunDevice::native_with_factory(slots, mtu, pumped, meter, || {
+                create_tun_device(mtu).map_err(std::io::Error::other)
+            })
+            .map_err(crate::shared::ClientError::Io);
         }
         let raw_tun = create_tun_device(mtu)
-            .await
             .map_err(|error| crate::shared::ClientError::Io(std::io::Error::other(error)))?;
         Ok(if pumped {
             VirtualTunDevice::new_pumped(raw_tun, mtu, ingress_capacity)

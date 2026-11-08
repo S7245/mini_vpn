@@ -8638,7 +8638,7 @@ async fn handle_tuic_udp_uplink<U: OwnedUpstream>(
         .await;
 }
 
-pub async fn create_tun_device(tun_mtu: usize) -> tun::Result<tun::AsyncDevice> {
+pub fn create_tun_device(tun_mtu: usize) -> tun::Result<tun::AsyncDevice> {
     let mut config = tun::Configuration::default();
 
     config

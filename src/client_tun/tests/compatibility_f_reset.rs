@@ -492,7 +492,7 @@ async fn saved_f_real_tuic_provider_failure_retains_source_after_actual_reset_an
         Some("00000000-0000-0000-0000-000000000000"),
         Some("local-test-only"),
         Some("localhost"),
-        Some("certs/dev/ca-cert.pem"),
+        Some(crate::tuic::tcp_fixture::test_ca_path().as_str()),
         Some("h3"),
     )
     .unwrap();

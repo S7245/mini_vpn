@@ -9,6 +9,8 @@ use super::*;
 pub(super) struct NativeLimits {
     pub(super) backing_bytes: std::num::NonZeroUsize,
     pub(super) device_slots: std::num::NonZeroUsize,
+    /// O3 (D105): optional control-plane process ceiling for hard + I_cfg.
+    pub(super) memory_ceiling: Option<std::num::NonZeroU64>,
 }
 impl NativeLimits {
     fn new(bytes: usize, slots: usize) -> Result<Self, ClientError> {
@@ -25,6 +27,7 @@ impl NativeLimits {
         Ok(Self {
             backing_bytes: checked(bytes)?,
             device_slots: checked(slots)?,
+            memory_ceiling: None,
         })
     }
     fn from_sources(
@@ -145,6 +148,10 @@ impl TunRuntimeConfig {
             std::env::var_os("MINI_VPN_NATIVE_BACKING_BYTES").as_deref(),
             std::env::var_os("MINI_VPN_NATIVE_DEVICE_SLOTS").as_deref(),
         )?;
+        if let Some(raw) = std::env::var_os("MINI_VPN_NATIVE_MEMORY_CEILING_BYTES") {
+            let ceiling = raw.to_str().and_then(|value| value.parse::<u64>().ok());
+            cfg = cfg.with_native_memory_ceiling(ceiling.unwrap_or(0))?;
+        }
         cfg = cfg.with_relay_policy(policy);
         Ok(cfg)
     }
@@ -152,13 +159,27 @@ impl TunRuntimeConfig {
 
 impl TunRuntimeConfig {
     /// Explicit shared backing limit and Device slots, checked and installed as
-    /// one value. This does not authorize the still-closed public Native entry.
+    /// one value. The public CLI opts in through the same pair of env values (D105).
     pub fn with_native_limits(
         mut self,
         bytes: usize,
         device_slots: usize,
     ) -> Result<Self, ClientError> {
         self.native_limits = Some(NativeLimits::new(bytes, device_slots)?);
+        Ok(self)
+    }
+
+    /// O3 (D105): process ceiling for the Native total-memory preflight
+    /// (hard + configured instances). Requires Native limits; zero is invalid.
+    pub fn with_native_memory_ceiling(mut self, bytes: u64) -> Result<Self, ClientError> {
+        let limits = self.native_limits.as_mut().ok_or_else(|| {
+            ClientError::InvalidTarget(
+                "MINI_VPN_NATIVE_MEMORY_CEILING_BYTES requires Native backing limits".into(),
+            )
+        })?;
+        limits.memory_ceiling = Some(std::num::NonZeroU64::new(bytes).ok_or_else(|| {
+            ClientError::InvalidTarget("Native memory ceiling must be a positive integer".into())
+        })?);
         Ok(self)
     }
 }

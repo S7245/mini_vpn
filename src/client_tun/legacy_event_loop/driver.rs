@@ -693,6 +693,13 @@ where
                 // 分支 1: 物理网卡接收到了新数据包
                 res = device.wait_for_rx(), if !handshake_done_tx.flow_draining() =>{
                     metrics.loop_park_end();
+                    // D116 b2: a continuously ready device must not keep this
+                    // task from yielding. Spend one unit of tokio's per-task
+                    // coop budget (128) per RX turn; at exhaustion this self-
+                    // wakes and returns Pending once. It runs before the body
+                    // touches the installed packet, which stays owned by the
+                    // device (`has_current`), so nothing is dropped/reordered.
+                    tokio::task::consume_budget().await;
                     if res.is_ok(){
                         if handshake_done_tx.flow_draining() { continue; }
                         let relay_read_hard_pause = tun_rx_drain_diag

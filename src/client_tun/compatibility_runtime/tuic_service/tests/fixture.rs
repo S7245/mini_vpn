@@ -23,7 +23,7 @@ pub(super) fn config(address: std::net::SocketAddr) -> TuicClientConfig {
         Some("00000000-0000-0000-0000-000000000000"),
         Some("local-test-only"),
         Some("localhost"),
-        Some("certs/dev/ca-cert.pem"),
+        Some(crate::tuic::tcp_fixture::test_ca_path().as_str()),
         Some("h3"),
     )
     .unwrap();
@@ -156,6 +156,8 @@ pub(super) struct Apps {
     pub(super) second_reply: Vec<u8>,
     second_sent: bool,
     pub(super) udp_reply: Vec<u8>,
+    /// Remote endpoint of every UDP reply (never cleared by `restart`).
+    pub(super) udp_from: Vec<smoltcp::wire::IpEndpoint>,
 }
 
 impl Apps {
@@ -227,6 +229,7 @@ impl Apps {
             second_reply: vec![],
             second_sent: false,
             udp_reply: vec![],
+            udp_from: vec![],
         }
     }
 
@@ -289,8 +292,9 @@ impl Apps {
             self.sent_udp = true;
         }
         while udp.can_recv() {
-            let (b, _) = udp.recv().unwrap();
+            let (b, meta) = udp.recv().unwrap();
             self.udp_reply.extend_from_slice(b);
+            self.udp_from.push(meta.endpoint);
         }
         self.iface.poll(
             smoltcp::time::Instant::now(),

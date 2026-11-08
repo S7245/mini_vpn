@@ -1479,17 +1479,16 @@ pub(crate) fn d16_native_ordered_reader_for_test(
 
 #[cfg(test)]
 pub(crate) fn d16_quinn_test_endpoints() -> (Endpoint, Endpoint, SocketAddr) {
-    let cert_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("certs/dev");
-    let mut server_cert_reader =
-        std::io::BufReader::new(std::fs::File::open(cert_dir.join("server-cert.pem")).unwrap());
-    let server_certs = rustls_pemfile::certs(&mut server_cert_reader)
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    let mut server_key_reader =
-        std::io::BufReader::new(std::fs::File::open(cert_dir.join("server-key.pem")).unwrap());
-    let server_key = rustls_pemfile::private_key(&mut server_key_reader)
-        .unwrap()
-        .unwrap();
+    // D111: the server identity and client roots come from the in-memory
+    // test identity in `tcp_fixture` (a CA-signed "localhost" leaf generated
+    // once per test binary). No key file is read from, or written to,
+    // `certs/dev`; the TLS shape is unchanged: no ALPN, quinn default
+    // transport, single-cert server chain, client trusting the issuing CA
+    // only, both endpoints bound to 127.0.0.1:0.
+    // Only the key algorithm differs from the old dev pair: rcgen's default
+    // ECDSA P-256 instead of RSA-2048 (ring cannot generate RSA keys), which
+    // shortens the handshake certificate bytes and changes nothing else.
+    let (server_certs, server_key) = tcp_fixture::test_server_identity();
     let server_config = quinn::ServerConfig::with_single_cert(server_certs, server_key).unwrap();
     let server_endpoint = quinn::Endpoint::server(
         server_config,
@@ -1498,12 +1497,13 @@ pub(crate) fn d16_quinn_test_endpoints() -> (Endpoint, Endpoint, SocketAddr) {
     .unwrap();
     let server_addr = server_endpoint.local_addr().unwrap();
 
-    let mut ca_reader =
-        std::io::BufReader::new(std::fs::File::open(cert_dir.join("ca-cert.pem")).unwrap());
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut ca_reader) {
-        roots.add(cert.unwrap()).unwrap();
-    }
+    // Former disk sources, now unused by this helper:
+    //   certs/dev/server-cert.pem -> tcp_fixture::test_server_identity().0
+    //   certs/dev/server-key.pem  -> tcp_fixture::test_server_identity().1
+    //   certs/dev/ca-cert.pem     -> tcp_fixture::test_roots()
+    // The root store is built in memory, so no CA file is needed here; tests
+    // that configure `TuicClientConfig` by path use `test_ca_path()` instead.
+    let roots = tcp_fixture::test_roots();
     let mut client_endpoint =
         quinn::Endpoint::client("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap()).unwrap();
     client_endpoint.set_default_client_config(

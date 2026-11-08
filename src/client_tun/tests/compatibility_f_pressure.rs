@@ -28,7 +28,7 @@ async fn f_w128_credit_pressure_preserves_c129_rx_until_real_publication() {
         Some("00000000-0000-0000-0000-000000000000"),
         Some("local-test-only"),
         Some("localhost"),
-        Some("certs/dev/ca-cert.pem"),
+        Some(crate::tuic::tcp_fixture::test_ca_path().as_str()),
         Some("h3"),
     )
     .unwrap();

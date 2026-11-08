@@ -1,3 +1,7 @@
+## 2026-11-08 A/B 归因：预编译两个二进制、交替运行，树只在构建窗口内改动
+
+D122–D123：怀疑 b2 引入 joint flake 时，没有改树后反复重跑。做法是给两个 arm 各 `--no-run` 构建一次并复制 lib 测试二进制，改动只存在于 B 的构建窗口内，随后立即按 sha 还原；然后用同一组 joint 参数按 ABAB/BABA 交替运行，以抵消机器负载漂移。arm 身份用一个只在一侧 RED 的 tracer 交叉确认（rx_fairness 在 B 中 20/20 RED）。判定规则（差值 + Fisher 单侧 p）在运行前冻结；结果是 1/20 vs 0/20，p=0.5，因此判为既有 flake，并写明 n=20 的统计功效有限。另外，libtest 的 `test … FAILED` 行可能被 stderr 打断，统计失败时要用末尾的 `failures:` 列表。
+
 ## 2026-11-07 变异要打在被评审假设上，而非最近的代码行；多重见证会让"局部"变异失去判别力
 
 C4（D103）：M1 让 cleanup 放弃仍被共享的 DATA Arc，tracer 仍绿——被持有的 Arc 同时钉住下游物理见证（连接/endpoint drain），drain 照样不结算。改用评审原假设 M1p（Pending 误报为 Settled）才 RED，且由 `cleanup.is_none()` 双向检查拦下。冻结预测时把"经何机制 RED"也写下：M3 RED 走的是分类而非后继，说明 Failed 与 Unsettled 两道守卫重叠。
@@ -239,3 +243,7 @@ Current boundaries, counters and next execution are in docs/current/STATUS.md, t
 
 - 2026-11-06 C1 (D52): when predicting a serial lifecycle time, write each component's interval from the actual timer code first, then measure components separately with independent clocks (relay first-seen, peer closed(), stage prints). The first run falsified only one term ("idle settle is local"; really one peer RTT for the live stream's terminal settlement), which a single total-time assertion would have hidden. Mutation "relay delay 0, prediction kept" proves the intervals bite.
 - 2026-11-06 D51: the fork's cold sent-history quota is a PN SPAN (tombstones count), and exists only on the Native client (meter-configured) ⇒ it caps uplink rate·(RTT+max_ack_delay) ≤ 1024·P, not downlink. Check which endpoint owns a bounded structure before converting it into a throughput ceiling.
+
+- 2026-11-07 N1 (D104–D106): audit the public call chain before building "public entry wiring" — the CLI already ran the same saved Service (`serve`→`prepare_factory`→`rebuild::drive`); the real gap was one rejecting device-factory branch plus missing evidence (hard local recovery, late-event isolation). A same-generation "detector" mutation (re-send the old fragment on the new connection) is a cheap way to prove an isolation assertion is discriminating. Gate `n1-n1-gate-20261107`.
+- 2026-11-07 N1 F1: an injected "late" event is evidence only if delivery is proven before the fault — bracket it between two whole controls on the same QUIC connection and wait for the second; `Connection::close` sends nothing queued. Pair every isolation tracer with a mutation of the owning cleanup (here `Fragments::retire_generation`). Check a counter's semantics before asserting zero (`FlowObservation.retry` is credit). (D109)
+- 2026-11-07 D111–D113: a missing dev key is a fixture problem. Use an in-memory rcgen CA→leaf plus a thread-local temp CA guard; don't create persisted keys. Once SynBurst ran again it showed ingress clean (drops 0) but cleanup drain RED. Check which phase failed (scenario vs cleanup) before reusing a historical RED label.

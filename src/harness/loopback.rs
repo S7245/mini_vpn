@@ -346,6 +346,11 @@ impl TunIo for LoopbackTunDevice {
         loop {
             if let Some(pkt) = inbound.pop() {
                 self.rx.install(&mut Some(pkt.into()), 0)?;
+                // D116 b1: a ready pop spends tokio's coop budget like real
+                // tokio IO, so a backlog cannot keep this task from yielding.
+                // The packet is already installed (owned by `rx`); a Pending
+                // here leaves it `has_current`, so the retry returns it first.
+                tokio::task::consume_budget().await;
                 return Ok(());
             }
             // notify_one 在无 waiter 时保留 1 个 permit，不丢唤醒（pop→None 与 notified 之间的竞态安全）。

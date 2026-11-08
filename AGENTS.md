@@ -307,7 +307,8 @@ The authoritative current position is `docs/current/STATUS.md`. As of
 2026-08-26, the R7 same-clock arrival prerequisite and bounded value-only policy
 kernel are locally accepted as **necessary-only** on top of R6d. Physical B
 probe/hint provenance, owner/root composition, the no-oracle harness, and full
-R7a-d remain open. The public TUN entry remains on the legacy upstream; Task 4,
+R7a-d remain open. N1 (2026-11-07, D104–D106) wired opt-in hard Native into the
+public CLI Service entry (legacy binding stays default; see STATUS); Task 4,
 production owner/server, second ingress, R8-R9, UDP two-leg delivery, WAN
 throughput, and the M2 one-second acceptance remain open. Do not run macOS TUN,
 VPS, WAN, throughput, or M2 yet.

@@ -457,7 +457,9 @@ where
                                 Arc::as_ptr(&owner) as usize,
                                 tokio::time::Instant::now()
                             );
-                            let state = host.drive_shutdown().await;
+                            let limit = host.controlled_rebuild_deadline();
+                            let (state, expiry_recorded) =
+                                bounded_drain(host.drive_shutdown(), limit, &owner, &saved).await;
                             #[cfg(test)]
                             println!(
                                 "B818 ServiceStage session={} stage=node_drain_end state={state:?} now={:?}",
@@ -486,7 +488,8 @@ where
                                 saved.publish(Phase::Quarantined);
                                 std::future::pending::<()>().await;
                             }
-                            if disposition.is_expired() {
+                            // One expiry is one TimedOut record (D107 F3).
+                            if disposition.is_expired() && !expiry_recorded {
                                 if let Some(limit) = host.controlled_rebuild_deadline() {
                                     saved.expire_at(limit);
                                 }
@@ -594,6 +597,35 @@ where
             },
         };
     }
+}
+
+/// O-C4b (D105): the Service verdict on a stalled controlled old-Node drain is
+/// bounded by the Node's own rebuild deadline. Expiry stops the service (no
+/// successor), records TimedOut and publishes Incomplete; the same saved drain
+/// stays owned and driven to its real settlement, never dropped or aborted.
+/// Returns whether this verdict already recorded the expiry (D107 F3).
+async fn bounded_drain<F: Future<Output = NodeShutdown>>(
+    drain: F,
+    limit: Option<tokio::time::Instant>,
+    owner: &SessionControl,
+    saved: &Control,
+) -> (NodeShutdown, bool) {
+    let mut drain = std::pin::pin!(drain);
+    if let Some(limit) = limit {
+        tokio::select! {
+            biased;
+            state = &mut drain => return (state, false),
+            () = tokio::time::sleep_until(limit) => {}
+        }
+        saved.expire_at(limit);
+        owner.record(RetainedFailure::from_io(
+            SessionControl::origin(FailurePhase::SessionLoop),
+            std::io::Error::from(std::io::ErrorKind::TimedOut),
+        ));
+        saved.publish(Phase::Incomplete);
+        return (drain.await, true);
+    }
+    (drain.await, false)
 }
 
 fn observe_health(exit: HealthExit, owner: &SessionControl, saved: &Control, retiring: bool) {

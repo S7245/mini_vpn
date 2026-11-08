@@ -6,6 +6,89 @@ pub(crate) fn active_tcp_leases(upstream: &TuicUpstream) -> u64 {
     upstream.tcp_pool_admission.active_total()
 }
 
+/// D111 test identity: same chain shape as the former `certs/dev` pair (CA
+/// "Dev VPN CA" signs leaf CN=localhost with SANs localhost/example.com/
+/// 127.0.0.1), generated in memory once per test binary. No key is ever written.
+struct TestIdentity {
+    ca: rustls::pki_types::CertificateDer<'static>,
+    ca_pem: String,
+    leaf: rustls::pki_types::CertificateDer<'static>,
+    key: Vec<u8>,
+}
+
+fn test_identity() -> &'static TestIdentity {
+    static IDENTITY: std::sync::OnceLock<TestIdentity> = std::sync::OnceLock::new();
+    IDENTITY.get_or_init(|| {
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Dev VPN CA");
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::new(ca_params, ca_key);
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let sans = vec!["localhost".into(), "example.com".into(), "127.0.0.1".into()];
+        let mut leaf_params = rcgen::CertificateParams::new(sans).unwrap();
+        leaf_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "localhost");
+        let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
+        TestIdentity {
+            ca: ca.der().clone(),
+            ca_pem: ca.pem(),
+            leaf: leaf.der().clone(),
+            key: leaf_key.serialize_der(),
+        }
+    })
+}
+
+/// Server chain + key of the in-memory identity (replaces `server-cert.pem` +
+/// `server-key.pem`).
+pub(crate) fn test_server_identity() -> (
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+) {
+    let identity = test_identity();
+    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(identity.key.clone());
+    (vec![identity.leaf.clone()], key.into())
+}
+
+/// Client trust roots: the in-memory CA only (replaces reading `ca-cert.pem`).
+pub(crate) fn test_roots() -> rustls::RootCertStore {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(test_identity().ca.clone()).unwrap();
+    roots
+}
+
+/// Public CA PEM in a temp dir owned by the calling test thread; libtest runs
+/// each test on its own thread, so the file and dir are removed (thread-local
+/// Drop) when that test ends. Holds the public certificate only.
+pub(crate) fn test_ca_path() -> String {
+    struct CaDir(std::path::PathBuf);
+    impl Drop for CaDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0.join("ca.pem"));
+            let _ = std::fs::remove_dir(&self.0);
+        }
+    }
+    thread_local! {
+        static CA: CaDir = {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "d111-tuic-ca-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("ca.pem"), &test_identity().ca_pem).unwrap();
+            CaDir(dir)
+        };
+    }
+    CA.with(|ca| ca.0.join("ca.pem").to_string_lossy().into_owned())
+}
+
 pub(crate) struct UdpPair {
     pub(crate) server: Endpoint,
     pub(crate) client: Endpoint,
@@ -40,17 +123,7 @@ impl UdpPair {
         bi_streams: u32,
         alpn: bool,
     ) -> quinn::ServerConfig {
-        let cert_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("certs/dev");
-        let mut cert_reader =
-            std::io::BufReader::new(std::fs::File::open(cert_dir.join("server-cert.pem")).unwrap());
-        let certs = rustls_pemfile::certs(&mut cert_reader)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let mut key_reader =
-            std::io::BufReader::new(std::fs::File::open(cert_dir.join("server-key.pem")).unwrap());
-        let key = rustls_pemfile::private_key(&mut key_reader)
-            .unwrap()
-            .unwrap();
+        let (certs, key) = test_server_identity();
         let mut config = if alpn {
             let mut crypto = rustls::ServerConfig::builder()
                 .with_no_client_auth()

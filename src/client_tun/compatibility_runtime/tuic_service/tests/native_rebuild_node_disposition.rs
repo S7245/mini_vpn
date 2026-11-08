@@ -99,10 +99,19 @@ async fn hard_native_old_drain_with_retained_data_stays_incomplete() {
                 phase = handle.observe_shutdown() => phase,
             };
             assert_eq!(phase, Phase::Incomplete, "observer sees the unsettled drain");
+            // D108 (review F5): the CLI verdict reporter runs alongside.
+            let mut verdicts = Vec::new();
             tokio::select! {
                 report = &mut run => panic!("held drain completed: {report:?}"),
+                never = super::super::report_verdicts(handle, |line| verdicts.push(line)) => match never {},
                 () = tokio::time::sleep(Duration::from_secs(16)) => {}
             }
+            // O-C4b (D105): past the Node's rebuild deadline the Service
+            // verdict is Incomplete while it keeps driving the same drain.
+            assert_eq!(handle.phase(), Phase::Incomplete, "bounded stalled-drain verdict");
+            println!("C4 T1 verdicts={verdicts:?}");
+            assert_eq!(verdicts.len(), 1, "Incomplete reported exactly once: {verdicts:?}");
+            assert!(verdicts[0].contains("Incomplete"), "{verdicts:?}");
         }
         assert_eq!(rig.gate.joins.load(Ordering::Acquire), 0);
         assert!(!budget.quarantined());
@@ -128,6 +137,9 @@ async fn hard_native_old_drain_with_retained_data_stays_incomplete() {
             assert_eq!(facts.origin.phase, crate::shared::errors::FailurePhase::SessionLoop);
             assert_eq!(facts.io_kind, Some(std::io::ErrorKind::TimedOut));
             assert!(!ledger.quarantined);
+            // D107 F3: the bounded verdict and the late Expired settlement are
+            // one expiry event, recorded once.
+            assert_eq!(ledger.additional_failures, 0, "one expiry, one TimedOut record");
         }
         assert!(!budget.quarantined());
         assert_eq!(budget.used(), 0, "budget returned only after the real holder Drop");

@@ -10,6 +10,8 @@ use std::task::Context;
 mod drain;
 #[path = "compatibility_targeted_ingress/finite_tx.rs"]
 mod finite_tx;
+#[path = "compatibility_targeted_ingress/rx_fairness.rs"]
+mod rx_fairness;
 #[path = "compatibility_targeted_ingress/scheduling.rs"]
 mod scheduling;
 

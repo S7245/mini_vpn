@@ -498,3 +498,52 @@ async fn a2_preflight_boundary_is_typed_before_any_budget_factory_or_node() {
     assert_eq!(ledger.additional_failures, 0);
     assert_eq!((budget.used(), budget.quarantined()), (0, false));
 }
+
+/// O3 (D105): an explicit process ceiling gates hard + I_cfg. One byte below
+/// the computed total is a typed rejection before any budget, factory or Node;
+/// exactly the total is admitted; no ceiling keeps the record-only behaviour.
+#[tokio::test]
+async fn o3_memory_ceiling_is_typed_before_any_budget_factory_or_node() {
+    let base = runtime();
+    let memory = native_budget(base.native_limits.unwrap(), &cfg().tuic, &base, true).unwrap().1;
+    let ceiled = |ceiling| base.clone().with_native_memory_ceiling(ceiling).unwrap();
+    assert!(ceiled(memory).native_limits.unwrap().memory_ceiling.is_some());
+    let admitted = ceiled(memory);
+    assert_eq!(native_budget(admitted.native_limits.unwrap(), &cfg().tuic, &admitted, true).unwrap().1, memory);
+    let rejected = ceiled(memory - 1);
+    match native_budget(rejected.native_limits.unwrap(), &cfg().tuic, &rejected, true).err() {
+        Some(ClientError::InvalidTarget(message)) => {
+            assert!(message.starts_with("Native memory preflight rejected"), "{message}")
+        }
+        other => panic!("ceiling below hard + instances must be typed: {other:?}"),
+    }
+    assert!(base.clone().with_native_memory_ceiling(0).is_err());
+    assert!(TunRuntimeConfig::from_sources(Some("1")).unwrap().with_native_memory_ceiling(1).is_err());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let mut service = prepare_factory(
+        move |_: Option<bytes::BackingMeter>| async move {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Err::<LoopbackTunDevice, _>(ClientError::Io(std::io::Error::from_raw_os_error(17)))
+        },
+        cfg(),
+        rejected,
+        Arc::new(Metrics::default()),
+        NoopSink,
+    );
+    assert!(service.control.backing_budget.is_none() && service.control.app_meter.is_none());
+    let report = tokio::time::timeout(Duration::from_secs(1), service.run()).await.unwrap();
+    assert_eq!((report.session, report.node), (SessionDeviceState::DeviceFailedSettled, None));
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "rejected ceiling cannot reach the factory");
+}
+
+/// D108 (review F2): SIGHUP → rebuild is selected only for hard Native. The
+/// legacy default (no `MINI_VPN_NATIVE_*`) never registers the handler, so its
+/// SIGHUP disposition stays the OS default.
+#[test]
+fn hangup_rebuild_is_selected_only_for_hard_native() {
+    let legacy = TunRuntimeConfig::from_sources(Some("1")).unwrap();
+    assert!(legacy.native_limits.is_none());
+    assert!(!super::super::hangup_rebuild(&legacy), "legacy default keeps SIGHUP default");
+    assert!(super::super::hangup_rebuild(&runtime()), "hard Native requests rebuild");
+}
