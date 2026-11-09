@@ -6,6 +6,7 @@
 use super::*;
 mod maintenance;
 mod probe;
+mod waiting;
 #[cfg(test)]
 mod tests;
 pub(in crate::tuic) use maintenance::{Proof, Receipt, SubmissionFailure};
@@ -66,6 +67,13 @@ pub(super) struct State {
     pub(super) primary_predecessor: Option<Predecessor>,
     pub(super) primary_permit: Arc<AtomicBool>,
     probe_custody: Vec<Option<probe::ProbeSlot>>,
+    /// N2 Waiting side table (`waiting`), one row per slot.
+    retries: Vec<Option<waiting::Retry>>,
+    /// N2 counters: Waiting entries, re-mints, and retryable handshake
+    /// failures (counted, never recorded as Node/session failures).
+    pub(super) waits: u64,
+    pub(super) reprobes: u64,
+    pub(super) waiting_failures: u64,
     pub(super) release_failure: Option<(
         usize,
         TcpPoolTransportIdentity,
@@ -73,6 +81,11 @@ pub(super) struct State {
     )>,
 }
 impl State {
+    #[cfg(test)]
+    pub(super) fn retries_held(&self) -> (usize, usize) {
+        let held = self.retries.iter().flatten();
+        (held.clone().count(), held.filter(|retry| retry.parked()).count())
+    }
     #[cfg(test)]
     pub(super) fn completed_probe_custodies(&self) -> usize {
         self.probe_custody
@@ -138,6 +151,10 @@ impl State {
             primary_predecessor: None,
             primary_permit: Arc::new(AtomicBool::new(false)),
             probe_custody: (0..count).map(|_| None).collect(),
+            retries: (0..count).map(|_| None).collect(),
+            waits: 0,
+            reprobes: 0,
+            waiting_failures: 0,
             release_failure: None,
         }
     }
@@ -240,19 +257,40 @@ impl StartupResources {
                     ));
                 }
             }
-            expired
+            // N2 (D127, F-N2b): every clean expired closed demand stays
+            // retryable (Waiting). The active one is classified and parked by
+            // its run loop; a queued one is parked below once its custody settles.
+            let retry: Vec<bool> = expired
+                .iter()
+                .map(|(ticket, _, _)| waiting::hold(&mut state, *ticket))
+                .collect();
+            expired.into_iter().zip(retry).collect::<Vec<_>>()
         };
         let changed = !expired.is_empty();
-        for (ticket, preparation, active) in expired {
+        for ((ticket, preparation, active), retry) in expired {
             drop(preparation); // Wake only after releasing the root mutex.
-            if !active && probe::settle(self, ticket, false) == probe::Settlement::Complete {
-                if let Some(demand) = self.state().recovery.demands[ticket.index].as_mut() {
-                    if demand.ticket == ticket {
-                        demand.settled = true;
+            let mut retry = retry;
+            if !active {
+                let settled = probe::settle(self, ticket, false) == probe::Settlement::Complete;
+                if settled {
+                    if let Some(demand) = self.state().recovery.demands[ticket.index].as_mut() {
+                        if demand.ticket == ticket {
+                            demand.settled = true;
+                        }
                     }
                 }
+                if retry && settled {
+                    waiting::park(self, ticket); // Arms the backoff, or drops an invalid row.
+                    retry = self.state().recovery.retries[ticket.index].is_some();
+                } else if retry {
+                    // Unsettled custody stays terminal (D127), never parked Waiting.
+                    waiting::clear(&mut self.state().recovery, ticket.index);
+                    retry = false;
+                }
             }
-            self.record(io_err("tuic recovery", "original demand deadline expired"));
+            if !retry {
+                self.record(io_err("tuic recovery", "original demand deadline expired"));
+            }
         }
         if changed {
             self.wake_recovery();
@@ -454,6 +492,7 @@ impl TuicUpstream {
             ready_identity: None,
             receipt_issued: false,
         });
+        waiting::join_parked(&mut state, ticket); // D141: known-dead path ⇒ Waiting at mint.
         let changed = state.recovery.changed.clone();
         drop(state);
         drop(slot);
@@ -493,6 +532,7 @@ impl TuicUpstream {
             Outcome::Pending => Ok(false),
             Outcome::Ready => Ok(true),
             Outcome::Failed if ticket.kind != Kind::Closed && !demand.settled => Ok(false),
+            Outcome::Failed if waiting::holds(&state.recovery, ticket) => Err(waiting_failure()),
             Outcome::Failed => Err(recorded_failure()),
         }
     }
@@ -634,11 +674,12 @@ async fn run_inner(
         notified.as_mut().enable();
         owner.expire_demands();
         owner.reap_stats().await?;
-        let (old, primary_old, next) = {
+        let (old, primary_old, next, due) = {
             let mut state = owner.state();
             if state.stopping || state.quarantined {
                 return Err(recorded_failure());
             }
+            waiting::rearm_due(&mut state);
             let next = state
                 .recovery
                 .demands
@@ -655,7 +696,14 @@ async fn run_inner(
                 state.recovery.predecessor.is_some(),
                 state.recovery.primary_predecessor.is_some(),
                 next,
+                waiting::next_due(&state.recovery),
             )
+        };
+        let wake = async {
+            match due {
+                Some(due) => tokio::time::sleep_until(due).await,
+                None => std::future::pending().await,
+            }
         };
         if (old || primary_old) && next.is_none() {
             let deadline = owner
@@ -672,11 +720,15 @@ async fn run_inner(
                 result = finish_predecessor(&owner, true), if primary_old => result?,
                 _ = &mut notified => {},
                 _ = async { match deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => {},
+                _ = wake => {},
             }
             continue;
         }
         let Some(ticket) = next else {
-            notified.await;
+            tokio::select! {
+                _ = &mut notified => {},
+                _ = wake => {},
+            }
             continue;
         };
         let work = async {
@@ -686,11 +738,28 @@ async fn run_inner(
                 Kind::Probe(kind) => probe::recover(&owner, &data, &config, ticket, kind).await,
             }
         };
-        let result = tokio::time::timeout_at(ticket.deadline, work)
-            .await
-            .unwrap_or_else(|_| Err(io_err("tuic recovery", "original recovery budget expired")));
+        let (timed_out, result) = match tokio::time::timeout_at(ticket.deadline, work).await {
+            Ok(result) => (false, result),
+            Err(_) => (true, Err(io_err("tuic recovery", "original recovery budget expired"))),
+        };
         if let Err(error) = result {
-            owner.record_startup_result(error);
+            let retry = {
+                let mut state = owner.state();
+                let retry = waiting::retryable(&mut state, ticket, timed_out, &error);
+                if retry {
+                    state.recovery.waits = state.recovery.waits.saturating_add(1);
+                    waiting::join_queued(&mut state, ticket.index); // D141
+                } else {
+                    // A terminal re-probe drops its row (D143 F1).
+                    waiting::clear(&mut state.recovery, ticket.index);
+                }
+                retry
+            };
+            if retry {
+                owner.dispose(error); // N2: a clean expiry is Waiting, not a failure.
+            } else {
+                owner.record_startup_result(error);
+            }
             if let Some(demand) = owner.state().recovery.demands[ticket.index].as_mut() {
                 demand.outcome = Outcome::Failed;
             }
@@ -703,7 +772,14 @@ async fn run_inner(
                     maintenance::join_retired_stats(&owner).await?;
                 }
                 settle_uncommitted(&owner).await;
+                if retry {
+                    waiting::park(&owner, ticket);
+                }
             } else {
+                if retry {
+                    waiting::clear(&mut owner.state().recovery, ticket.index);
+                    owner.record(io_err("tuic recovery", "waiting custody unsettled"));
+                }
                 return Err(recorded_failure());
             }
         }
@@ -792,10 +868,12 @@ async fn recover(
             return Err(io_err("UDP generation", "invalid physical retirement"));
         }
     }
+    let budget = waiting::budget(&owner.state().recovery, ticket);
     let mut attempt = 0;
+    let mut recorded = false;
     let candidate = loop {
         if tokio::time::Instant::now() >= ticket.deadline {
-            return Err(io_err("tuic recovery", "deadline before attempt"));
+            return Err(waiting::exhausted(recorded));
         }
         attempt += 1;
         {
@@ -803,21 +881,26 @@ async fn recover(
             let demand = state.recovery.demands[ticket.index]
                 .as_mut()
                 .ok_or_else(|| io_err("tuic recovery", "demand missing"))?;
-            if demand.outcome != Outcome::Pending || demand.attempts >= 2 {
+            if demand.outcome != Outcome::Pending || demand.attempts >= budget {
                 return Err(recorded_failure());
             }
             demand.attempts += 1;
         }
-        match owner.handshake(&data.endpoint, config).await {
+        match owner.handshake_as(&data.endpoint, config, true).await {
             Ok(conn) => break conn,
             Err(error) => {
+                // A local error before the handshake work is recorded here.
+                recorded |= !is_recorded(&error);
                 owner.record_startup_result(error);
                 let stop_retry = {
                     let state = owner.state();
                     state.quarantined || state.config_rejected
                 };
-                if attempt >= 2 || stop_retry {
+                if stop_retry {
                     return Err(recorded_failure());
+                }
+                if attempt >= u64::from(budget) {
+                    return Err(waiting::exhausted(recorded));
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
@@ -1016,6 +1099,7 @@ async fn commit(
         demand.outcome = Outcome::Ready;
         demand.ready_identity = Some(successor_identity);
     }
+    waiting::clear(&mut root.recovery, ticket.index);
     drop(root);
     drop(activity);
     drop(slot);

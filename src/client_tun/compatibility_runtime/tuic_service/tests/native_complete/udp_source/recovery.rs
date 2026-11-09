@@ -119,6 +119,7 @@ async fn actual_hard_node_recovery_refusal_is_quiet_in_session_before_later_io()
         NodeHost::prepare_with_budget(cfg.clone(), Arc::new(Metrics::default()), Some(&budget));
     host.bind_udp_parent(Arc::downgrade(&parent)).unwrap();
     let observer = host.native_observer_for_test();
+    let waiting = host.native_weak_observer_for_test();
     let mut peers = Vec::new();
     let mut data = None;
     let mut source = None;
@@ -131,8 +132,10 @@ async fn actual_hard_node_recovery_refusal_is_quiet_in_session_before_later_io()
         peers[0].close(71u32.into(), b"original primary loss");
         let mut running = Box::pin(host.run()); let mut refused = false;
         let clock = std::time::Instant::now();
-        crate::client_tun::compatibility_runtime::tuic_service::tests::fixture::window(Duration::from_secs(5), async {
-            while observer.facts().0.is_none() {
+        // D127: one refused + one unanswered handshake is a clean expiry of the
+        // primary closed demand ⇒ Waiting (retryable), not a recorded failure.
+        crate::client_tun::compatibility_runtime::tuic_service::tests::fixture::window(Duration::from_secs(15), async {
+            while waiting.waiting().is_none_or(|s| s.waits == 0) {
                 tokio::select! {
                     incoming = server.accept(), if !refused => { incoming.unwrap().refuse(); refused = true; },
                     _ = source.as_mut().unwrap().recv(&clock) => {},
@@ -142,14 +145,18 @@ async fn actual_hard_node_recovery_refusal_is_quiet_in_session_before_later_io()
             }
         }).await.unwrap();
         drop(running); assert!(refused, "actual original recovery Initial must reach local endpoint");
-        let first = observer.facts().0.unwrap();
-        observed = Some((first.clone(), owner.ledger().first_failure.as_ref().map(|f| f.facts().clone())));
+        let sample = waiting.waiting().unwrap();
+        assert!(!sample.first_failure && !sample.quarantined && sample.retries_held == 1, "{sample:?}");
+        let node_first = observer.facts().0;
+        observed = Some((node_first, owner.ledger().first_failure.as_ref().map(|f| f.facts().clone())));
         owner.record(crate::shared::errors::RetainedFailure::from_io(
             SessionControl::origin(crate::shared::errors::FailurePhase::SessionLoop), std::io::Error::from_raw_os_error(6)));
         drop(source.take()); drop(data.take());
-        assert_eq!(tokio::time::timeout(Duration::from_secs(15), host.drive_shutdown()).await.unwrap(), NodeShutdown::FailedSettled);
+        let later = owner.ledger().first_failure.as_ref().map(|f| f.facts().origin.phase.clone());
+        assert_eq!(later, Some(crate::shared::errors::FailurePhase::SessionLoop), "later IO is the session first");
+        assert_eq!(tokio::time::timeout(Duration::from_secs(15), host.drive_shutdown()).await.unwrap(), NodeShutdown::RunningResourcesSettled);
     }).await;
-    drop((source, data, observer, host));
+    drop((source, data, observer, waiting, host));
     for peer in peers {
         peer.close(0u32.into(), b"test complete");
     }
@@ -162,9 +169,9 @@ async fn actual_hard_node_recovery_refusal_is_quiet_in_session_before_later_io()
     }
     let (node, session) = observed.unwrap();
     assert_eq!(
-        session,
-        Some(node),
-        "real UDP recovery failure reaches original Session before later IO"
+        (node, session),
+        (None, None),
+        "clean UDP-primary recovery expiry is Waiting: quiet in Node and Session before later IO"
     );
     assert_eq!(budget.used(), 0);
     assert!(!budget.quarantined());

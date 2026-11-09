@@ -384,6 +384,10 @@ pub(crate) enum UdpShutdownState {
 pub(crate) struct UdpShutdown(Arc<UdpRuntime>);
 
 impl UdpShutdown {
+    /// N2 (D136): the old UDP generation of a closed primary is sealed.
+    pub(in crate::tuic) fn generation_sealed(&self, epoch: u64) -> bool {
+        self.0.generation.sealed(epoch)
+    }
     pub(in crate::tuic) fn settled_for_rebuild(&self) -> bool {
         let state = self.0.state();
         !state.quarantined
@@ -564,7 +568,7 @@ async fn udp_connection(
             biased;
             _ = stopped(stop) => return Ok(None),
             _ = sender.closed() => return Ok(None),
-            result = upstream.await_aux_recovery(ticket) => result?,
+            result = upstream.await_closed_recovery(ticket) => result?,
         }
         state = slot.state.lock().await;
     }

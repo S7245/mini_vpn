@@ -3998,6 +3998,6 @@ mod udp_reassembly;
 mod udp_send;
 mod unordered;
 use unordered::TuicChunkRelayStream;
-#[cfg(test)] pub(crate) use node::NativeNodeWeakObserver;
+#[cfg(test)] pub(crate) use node::{NativeNodeWeakObserver, WaitingSample};
 #[cfg(test)]
 mod tests;

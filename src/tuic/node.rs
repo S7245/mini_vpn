@@ -628,6 +628,25 @@ impl std::error::Error for RecordedFailure {}
 pub(super) fn recorded_failure() -> ClientError {
     ClientError::Io(io::Error::other(RecordedFailure))
 }
+/// N2 (D143 F12): an observer of a Waiting closed slot fails fast, but nothing
+/// was recorded; treated like `RecordedFailure` (never recorded again).
+#[derive(Debug)]
+struct WaitingFailure;
+impl std::fmt::Display for WaitingFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("node slot waiting to re-probe; no failure recorded")
+    }
+}
+impl std::error::Error for WaitingFailure {}
+pub(super) fn waiting_failure() -> ClientError {
+    ClientError::Io(io::Error::other(WaitingFailure))
+}
+/// Errors that must never be recorded again as a Node first failure.
+fn is_recorded(error: &ClientError) -> bool {
+    matches!(error, ClientError::Io(io) if io.get_ref().is_some_and(|source| {
+        source.is::<RecordedFailure>() || source.is::<WaitingFailure>()
+    }))
+}
 
 pub(super) struct StartupResources(
     StdMutex<StartupState>,
@@ -772,8 +791,7 @@ impl StartupResources {
         self.dispose(error);
     }
     fn record_startup_result(&self, error: ClientError) {
-        let already_recorded = matches!(&error, ClientError::Io(io)
-            if io.get_ref().is_some_and(|source| source.is::<RecordedFailure>()));
+        let already_recorded = is_recorded(&error);
         let admission_q = matches!(&error, ClientError::Io(io) if io.get_ref()
             .and_then(|source| source.downcast_ref::<quinn::owned_events::AdmissionError>())
             .is_some_and(|cause| cause.0 == bytes::MeteredCopyError::Quarantined));
@@ -838,6 +856,16 @@ impl StartupResources {
         &self,
         endpoint: &Endpoint,
         cfg: &TuicClientConfig,
+    ) -> Result<Connection, ClientError> {
+        self.handshake_as(endpoint, cfg, false).await
+    }
+    /// `retryable`: an N2 closed-slot attempt whose clean failure is counted,
+    /// not recorded (config rejection, Q and stop are still recorded).
+    async fn handshake_as(
+        &self,
+        endpoint: &Endpoint,
+        cfg: &TuicClientConfig,
+        retryable: bool,
     ) -> Result<Connection, ClientError> {
         let (index, connecting) = {
             let mut state = self.state();
@@ -906,10 +934,23 @@ impl StartupResources {
         match tokio::time::timeout(Duration::from_secs(5), work).await {
             Ok(Ok(conn)) => Ok(conn),
             error => {
-                self.record(match error {
+                let error = match error {
                     Ok(Err(error)) => error,
                     _ => io_err("tuic startup handshake", "original 5s budget expired"),
-                });
+                };
+                let waiting = retryable && !self.native_quarantined() && {
+                    let mut state = self.state();
+                    let clean = !state.stopping && !state.quarantined && !state.config_rejected;
+                    if clean {
+                        state.recovery.waiting_failures = state.recovery.waiting_failures.saturating_add(1);
+                    }
+                    clean
+                };
+                if waiting {
+                    self.dispose(error);
+                } else {
+                    self.record(error);
+                }
                 self.retire(index).await?;
                 Err(recorded_failure())
             }
@@ -1257,7 +1298,7 @@ impl StartupResources {
     }
 }
 #[cfg(test)]
-pub(crate) use tests::NativeNodeWeakObserver;
+pub(crate) use tests::{NativeNodeWeakObserver, WaitingSample};
 #[cfg(test)]
 mod tests;
 

@@ -150,7 +150,9 @@ impl GenerationControl {
             let notified = self.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self.sealed(epoch) {
+            // An invalid control can never seal: end fail-closed (D134);
+            // every caller re-checks `valid()`.
+            if self.sealed(epoch) || !self.valid() {
                 return;
             }
             notified.await;

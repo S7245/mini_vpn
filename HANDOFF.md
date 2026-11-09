@@ -296,3 +296,57 @@ D114–D115 诊断（探针已回退，5 文件 sha==pre-probe，lib 测试二�
 D118–D119：探针归因完成并已回退（sha 与二进制都一致）。≥100ms 的 poll 中 RX 均为 0，剩下的是 udp_sweep（stop 阶段，108–181ms）和 timer.tick（114ms）的单次调用。下一：用户决定是否把 P1 重定为 RX 口径；之后跑 governance 与全门（scratch d117g/gate.sh，前缀 n1-d117-gate-20261107）。
 D120–D121：P1 按 RX 口径重定（用户决定）。全门 13/14 通过；joint 第 1 次 699/700，`native_chunk_loaded_reset::…preserves_source_first_and_receipt` :223 join 超时，joint2 700/700 通过。判为 NEW，已停止。下一：等批准 A/B 诊断（有无 b2，×20 joint 负载 + ×20 隔离）。b1+b2+tracer 仍在 dirty 中，未提交。
 D122–D123：A/B 诊断已完成（raw `n1-d122-ab-20261108`）。joint 负载下有 b2 1/20、无 b2 0/20（p=0.50），隔离两边 0/20，判为既有负载 flake，不归因 b2。树与二进制已 sha 校验，和 D116 一致；没有代码改动。下一：等用户决定是否按 joint2 700/700 + A/B 计全门通过（之后才能宣告 N1，并开 N2）；:223 load-sensitivity 另列后续项。b1+b2+tracer 仍在 dirty 中，未提交。
+
+## 新会话交接（N2，2026-11-08，D126）
+Knife: compatibility recovery N2（仅本机 loopback）。已接受位置：N1 ACCEPTED（D125，commit 974367b 已推送）。本会话：D126 设计出口与冻结验收 N2-A1..A7，加上测试探针（`native_failure_probe.rs` 新叶、`native_rebuild_high_rtt.rs` 中的 `Tap::outage`/`Seen.initial`、`tests/mod.rs` 一行）；生产代码未改，未提交。raw：`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n2-d126-probe-20261108/`（含 guard.sh、sha）。
+冷启动：AGENTS → STATUS 末段 → DECISIONS D125–D126 → 本段 → `src/tuic/node/recovery.rs`（`request_aux_recovery` :374、`expire_demands` :212、`recover` 循环 :795–825）和 `node_runtime.rs:540-565,850-860`（主槽在 UDP 断开时立即发起恢复）。
+下一步（已授权的本地动作）：(1) 修改探针，不再在 window 到期时取消 `service.run()`，改为保持轮询并按时间采样 phase/ledger，归因会话 Q 的来源（O-N2e）和 stop 超过 20s（O-N2f）。若 Q 是正确的终态（例如 flow 不确定），设计改为先修 Q 来源，再做 Waiting。(2) D126 的合同修订（干净的到期 ⇒ Waiting，可重试）放宽了用户批准的 N1 约束，**须由父会话/用户确认**后再写生产代码。(3) TDD：先写 A2 RED（25s 断网后恢复），再在 node/recovery.rs 增加 Waiting/再探测（可放私有子模块，≤1500 行），然后补 A3–A7 和变异，最后跑 D117 全门（新前缀，capacity-serial 含 SynBurst，joint 含 rx_fairness 与新 N2 叶；探针叶的 60s 用例不进 joint）。
+运行：`CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=target cargo test --offline --features harness --lib --no-run`，测试二进制在 guard.sh 下运行；探针 3 例并行约 108s。
+冻结非目标/禁止：N3 自动换节点、N4、N5、真实 TUN、VPS/WAN/M2、sudo、新 key 落盘、commit/push、邮件。修复测试意外失败时先停，并给出具体计划。
+
+## 新会话交接（N2，2026-11-08，D127–D129）
+Knife: compatibility recovery N2（仅本机 loopback）。已接受：N1 ACCEPTED（974367b 已推送）。本会话：D127 合同修订（用户批准）、D128 探针归因（Q/预算/stop 均为夹具假象，另记 F-N2a）、D129 Waiting 实施 + A1/A2/A6/A7 绿 + 5 个变异 RED。全部未提交。
+生产改动：`src/tuic/node/recovery/waiting.rs`（新，225）、`recovery.rs`（1171）、`node.rs`（`handshake_as`，1303）、`node_runtime.rs`（UDP 主槽改用 `await_closed_recovery`，1 行）。测试：新叶 `tuic_service/tests/native_waiting.rs`（≈410，rig/drive/Storm 可复用）、`tests/mod.rs` +1 行、`native_rebuild_high_rtt.rs` Tap 加 `loss_every`/`initials`/`new_dcids`、`node/tests/mod.rs` 加 `WaitingSample`（`tuic.rs`/`node.rs` re-export）、探针叶 `native_failure_probe.rs` 重写为不取消 run()（6 例，仅测试，不进 joint）。raw：`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n2-trace-20261108/`、`.../n2-waiting-20261108/`（g1–g6、mut/{mutate.py,build.sh,bin-sha.txt,*.log}）。guard：`.../n2-d126-probe-20261108/guard.sh`。
+下一步（已授权本地动作，按序）：(1) 按 D127 修订 `src/tuic/node/tests/recovery.rs` 的 `actual_transient_refusal_retries_twice_with_original_spacing` 与 `original_deadlines_expire_while_candidate_drain_waits_without_ticket_reset`（旧断言 first.is_some/FailedSettled/1s 内无新尝试；新合同：2 次后 Waiting、≥1s 后一次再探测、无 first failure）；先跑确认 RED，再改断言并记录。(2) A3（单程 200ms + `Tap::loss_every(50)`，30s 稳定 TCP+UDP：首连后 0 新 DCID、0 rebuild、无 first_failure；变异：QUIC idle 15→1s 或关闭 keep-alive）、A4（空闲 20s：0 新 DCID，同连接 TCP+UDP；变异：关闭 keep-alive）、A5（两并发 Connect，对端 reset 其一：另一完成，0 新 DCID，无 first_failure；变异需找"流失败升级为关连接"的点）；放在新叶 `native_waiting_steady.rs`（≤800），复用 `native_waiting::{rig, drive, stop_polling, settle_flows, assert_clean_stop}`。(3) `tests/code_growth_governance.rs` + fmt + 无 feature production check；(4) D117 全门（新前缀 n2-d129-gate-20261108，capacity-serial 含 SynBurst，joint 含 rx_fairness 与 native_waiting::；native_failure_probe:: 与 60s 用例不进 joint，单独串行跑），失败分类 D9/D11 vs NEW。(5) 更新 STATUS/HANDOFF/TODO/LEARNINGS/DECISIONS，停；独立 N2 审查由父会话开。
+构建/运行：`CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=target cargo test --offline --features harness --lib --no-run`；二进制 `target/debug/deps/mini_vpn-38e8a4ca41212e00`，`guard.sh 300 <out> <bin> tuic_service::tests::native_waiting:: --nocapture --test-threads=6` 约 61s。注意：zsh 不按空格拆分 `$F`，多文件备份/还原必须用 bash 数组（本会话两次踩坑，已全部 sha 还原）。
+冻结非目标/禁止：N3 自动换节点、N4、N5、真实 TUN、VPS/WAN/M2、sudo、新 key 落盘（勿建 certs/dev/server-key.pem）、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。修复测试意外失败时先停，给出具体计划。
+
+## 新会话交接（N2，2026-11-08，D130–D132）
+Knife: compatibility recovery N2（仅本机 loopback）。N1 ACCEPTED（974367b 已推送）。D127–D129 之上本会话完成：D130 N1 tracer `node/tests/recovery.rs::actual_transient_refusal_retries_twice_with_original_spacing` 按 D127 修订（GREEN）；新叶 `tuic_service/tests/native_waiting_steady.rs`（A3/A4/A5 GREEN，变异 MA3e/MA4/MA5b RED，MA3a–d/MA5 GREEN 记为不可达证据）；四个 N2 新文件已 rustfmt；governance 7+20 绿。D131：F-N2b（生产缺口，见下）、F-N2a、F-N2c。D132：全门 `n2-d130-gate-20261108` 12/14，joint/joint2 各 716/717，唯一失败 `udp_source::recovery::actual_hard_node_recovery_refusal_is_quiet_in_session_before_later_io`（第三个 N1 旧规则 tracer，确定性，NEW）。全部未提交。
+raw：`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n2-steady-20261108/`（n1-red/n1-amended、s1–s3/base、mut/{mutate.py,build.sh,bin-sha.txt,MA*.log}、udp-refusal-iso-*、fmt-*、governance.log）和 `.../n2-d130-gate-20261108/`；gate runner 在本会话 scratchpad `n2g/`（gate.sh、*-in.json）。
+F-N2b：`recovery.rs::expire_demands` 中 `retry = active && waiting::hold(..)`，非 active 的过期 closed demand 被 `record` 为终态。默认 tcp_pool=2 时，>15s 断网后辅助槽永久丢失，Node first failure 被记录。证据：deadline tracer 显示 waits 1、retries_held 1、first_failure true。
+下一（**需用户/父会话批准**，修复规则）：P1 按 D127 修订 udp refusal tracer（Waiting、Node 与会话都不记录、后续会话 IO 仍记录、RunningResourcesSettled），并检查其它 FailedSettled/first.is_some 旧规则 tracer；P2 修 F-N2b：对所有干净的 closed demand 执行 hold/park，修订 `original_deadlines_expire_while_candidate_drain_waits_without_ticket_reset` 为两槽 Waiting，加 tcp_pool=2 的 A2-60/A6-60 变体与变异"仅 active"⇒RED；P3 重跑 joint×2 + capacity-serial（同 runner，新前缀）。随后父会话开独立 N2 审查，再问用户是否提交；N4 在后。
+冻结非目标/禁止：N3、N4、N5、真实 TUN、VPS/WAN/M2、sudo、新 key 落盘（勿建 certs/dev/server-key.pem）、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。修复测试意外失败先停，给出计划。
+
+## 新会话交接（N2，2026-11-09，D133）
+Knife: compatibility recovery N2（仅本机 loopback）。用户已批准 P1–P3（D132 计划）。已完成：P1（udp refusal tracer 按 D127 修订，GREEN）；P2 生产代码（`src/tuic/node/recovery.rs::expire_demands`：所有干净的过期 closed demand 进入 Waiting，非 active 的在 custody 结算后 park，未结算的仍是终态）。未完成：P2 tracer 与 P3。全部未提交。
+停止原因：`tuic::node::tests::` 共 7 个失败（`n2-fix-20261109/p2-node-red.log`）。其中 6 个在修复前的 D129 树上就已存在（`p2-node-prefix.log`，二进制为 `n2-steady-20261108/mut/bin-base`），D132 门禁没选中它们。它们是：failover_rejection 2 个、failover_staged 1 个、primary_recovery::missing_consumer_seal（均为期望 FailedSettled 实得 RunningResourcesSettled）；primary_recovery::guarded_udp_panic（:46 endpoint_drained=false）；primary_recovery::shutdown_only_udp_inventory（:568 shutdown 超时）。第 7 个是预期的 deadline tracer。
+冷启动：AGENTS → STATUS 末段 → DECISIONS D126–D133 → 本段 → `src/tuic/node/recovery/waiting.rs`（`node_clean`/`hold`/`retryable`/`park`）、`recovery.rs::expire_demands`，以及上述测试文件。
+下一（已授权的本地动作）：(a) 扩大门禁 joint 过滤，加入 `tuic::node::tests::` 和 `native_complete::udp_source::`（runner 在旧会话 scratchpad `n2g/`，也可从 `.../n2-d130-gate-20261108/*-commands.json` 重建）；(b) 先诊断 2 个非断言失败。假设：`node_clean` 没把"已记录 panic/不变量/inventory 失败"当终态，所以 Waiting 行或再探测让 endpoint/UDP inventory 在 shutdown 时仍存活。证伪方法：在这些测试中观察 WaitingSample。若成立，按 D127"不变量错误仍为终态"收紧 hold/rearm 条件，修完后再看那 4 个是否随之转绿，否则按旧规则断言修订；(c) 补 P2 tracer：deadline tracer 改为两槽 Waiting/RunningResourcesSettled，加 tcp_pool=2 的 A2-60/A6-60，变异"仅 active"⇒RED；(d) P3：新前缀全门。修复测试意外失败先停，给出计划。
+构建/运行：`CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=target cargo test --offline --features harness --lib --no-run`；二进制 `target/debug/deps/mini_vpn-38e8a4ca41212e00`；guard `/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n2-d126-probe-20261108/guard.sh`。
+冻结非目标/禁止：N3、N4、N5、真实 TUN、VPS/WAN/M2、sudo、新 key 落盘、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。
+
+
+## 新会话交接（N2，2026-11-09，D134–D139）
+Knife: compatibility recovery N2（仅本机 loopback），用户已批准 P1–P3（D132）。全部未提交。
+已完成：(a) joint 过滤扩大（runner：`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n2-p3-20261109/runner/`，gate.sh 的前缀占位为 `n2-p3gate-PREFIX`，运行前替换）；(b) 6 个失败已分类并全部转绿（D134 wait_sealed fail-closed 修复 + tracer；D135 guarded 旧断言；D136 主槽 UDP 未 seal ⇒ 终态，`waiting::udp_settled`；D137 failover 旧规则）；(c) deadline tracer 两槽 Waiting 绿、A2-pool2 绿、变异 M-P2 记录（D138）。
+停止原因：A6-pool2 RED，最慢 open 14.05s > 6s（`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n2-p3-20261109/p2-pool-base.log`）⇒ F-N2d：`src/tuic/tcp_open/staged.rs` 中 `State::Recovering`（:381）只轮询 `observe_aux_recovery`，请求期限（:324）对它不生效，open 会等 aux 原 15s demand。
+冷启动：AGENTS → STATUS 末段 → DECISIONS D134–D139 → 本段 → `tcp_open/staged.rs`（Recovering、tighten_deadline、note_cancel）→ `native_waiting_pool.rs`。
+下一（需用户/父会话确认后执行）：D139 计划 (1) tcp_open 聚焦 RED tracer → (2) Recovering 到期 typed 失败，demand 留给 Node（先确认 Recovering 不持有 lease/custody）→ (3) A6-pool2 + 变异 → (4) 可选：带排队 aux demand 的 Service 判别器 → (5) P3 全 14 组门，失败按 D9/D11 或 NEW 分类。之后再更新文档；不开 N2 审查。
+构建/运行：`CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=target cargo test --offline --features harness --lib --no-run`，二进制 `target/debug/deps/mini_vpn-38e8a4ca41212e00`。HEAD 974367b 的对照二进制在 `target/headbuild/`（1.4G，可删）。
+冻结非目标/禁止：N3、N4、N5、真实 TUN、VPS/WAN/M2、sudo、新 key 落盘、commit/push、邮件；`certs/dev/ca-cert.srl` 不动；只对单个叶文件跑 rustfmt。
+
+**N2 F-N2d 复核（2026-11-09，D140，无代码改动）：** "Recovering 不受期限约束"的假设被证伪。flow 的 open 期限是 20s，staged.rs 正确遵守；A6-pool2 中 8 个慢 open 等的是它们在断网期间为 aux 槽新铸的原始 15s demand，属于 N1 原有语义。**待用户选：(A) 修订 A6-pool2 断言（新 demand 上的 open ≤16s，其余 ≤6s，仅测试）；(B) 生产修改（Node 已有干净 Waiting 时，其他槽的新 closed demand 直接进入 Waiting）。** P3 未跑。
+
+## 新会话交接（N2，2026-11-09，D141–D142）
+Knife: compatibility recovery N2（仅本机 loopback）。P1–P3 已全部本地完成，全门 `n2-p3gate-20261109` 14/14 绿（joint ×2 790/790）。全部未提交。
+本轮改动：D134 `owned_upstream/udp/generation.rs::wait_sealed` fail-closed；D136 `waiting::udp_settled`；D141 `waiting::join_parked`/`join_queued`（recovery.rs 两处调用）；测试 D135/D137/D138 修订，新叶 `node/tests/waiting_join.rs`、`tuic_service/tests/native_waiting_pool.rs`。
+下一（需父会话/用户决定）：开 N2 独立只读审查（证据见 DECISIONS D126–D142，原始日志在 `n2-p3-20261109/`、`n2-p3gate-20261109/`）；是否提交。开放项：F-N2a（非 N2）、F-N2c（N4）、O-N2a–f。
+冻结非目标/禁止：N3、N4、N5、真实 TUN、VPS/WAN/M2、sudo、新 key 落盘、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。`target/headbuild/`（1.4G，HEAD 对照二进制）可删。
+
+## 新会话交接（N2，2026-11-09，D143–D144）
+
+- 位置：N2 Waiting + 审查修复全部在工作树，**未提交**（HEAD 974367b，分支 `codex/knife14d-downlink-reap-open`）。全门 `n2-fixgate-20261109` 14/14 绿；审查报告 `docs/current/n2-review-20261109.md` 末尾有逐项修复状态。
+- 本次改动：`src/tuic/node/recovery/waiting.rs`（retryable 去 `held`、`holds`、`exhausted`、模块文档）、`src/tuic/node/recovery.rs`（终态清行、本地错误记录标记、Waiting 文案）、`src/tuic/node.rs`（`WaitingFailure`、`is_recorded`）、新叶 `src/tuic/node/tests/waiting_terminal.rs` + `src/tuic/node/tests/mod.rs` 一行、`native_waiting_pool.rs` DCID 界。
+- 下一：用户决定 commit（整树还是分批；`certs/dev/ca-cert.srl` 不要动、不要提交）；之后 N4。F-N2a 应在 N4/真实门前单独决定（F11）。
+- 不授权：TUN、VPS、WAN、M2、sudo、新 key、push。

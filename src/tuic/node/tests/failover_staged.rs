@@ -503,6 +503,12 @@ async fn original_node_tokens_drop_and_demand_settle_precede_only_cas_winner_fal
         let (original, outcome) = driver.take().unwrap().await.unwrap();
         assert!(outcome.is_ok());
         host = Some(original);
+        // D127/D137: two refused handshakes on the closed primary are a clean
+        // expiry ⇒ Node Waiting (not a recorded Node failure); the opens still
+        // fail over to the backup leg.
+        let waiting = host.as_ref().unwrap().native_weak_observer_for_test().waiting().unwrap();
+        assert!(waiting.waits >= 1 && waiting.retries_held == 1, "{waiting:?}");
+        assert!(!waiting.first_failure && !waiting.quarantined, "{waiting:?}");
         assert_eq!(
             tokio::time::timeout(
                 Duration::from_secs(15),
@@ -510,7 +516,7 @@ async fn original_node_tokens_drop_and_demand_settle_precede_only_cas_winner_fal
             )
             .await
             .unwrap(),
-            NodeShutdown::FailedSettled
+            NodeShutdown::RunningResourcesSettled
         );
         assert!(host.as_ref().unwrap().resources.state().endpoint_drained);
         assert!(

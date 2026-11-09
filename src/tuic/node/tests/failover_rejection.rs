@@ -140,13 +140,19 @@ async fn real_fallback_reports_final_reality_error_and_retained_failed_aggregate
         );
         assert_eq!(open.failure().unwrap().to_string(), first);
         assert!(!open.view().lease_held && !open.view().retirement_pending);
+        // D127/D137: two refused handshakes on the closed primary are a clean
+        // expiry ⇒ Node Waiting (not a recorded Node failure); the open still
+        // fails over to its backup leg.
+        let waiting = host.native_weak_observer_for_test().waiting().unwrap();
+        assert!(waiting.waits >= 1 && waiting.retries_held == 1, "{waiting:?}");
+        assert!(!waiting.first_failure && !waiting.quarantined, "{waiting:?}");
         drop(factory);
         drop(data);
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(15), host.drive_shutdown())
                 .await
                 .unwrap(),
-            NodeShutdown::FailedSettled
+            NodeShutdown::RunningResourcesSettled
         );
         assert!(host.resources.state().endpoint_drained);
         assert_eq!(open.view().phase, TcpOpenPhase::Settled);
@@ -242,8 +248,14 @@ async fn cold_fallback_factory_rejection_releases_factory_with_prior_real_failur
         assert!(matches!(open.failure(), Some(ClientError::Io(error)) if error.kind() == std::io::ErrorKind::Unsupported));
         assert_eq!(backup.0.load(Ordering::Relaxed), 0);
         assert!(!open.view().lease_held && !open.view().retirement_pending);
+        // D127/D137: two refused handshakes on the closed primary are a clean
+        // expiry ⇒ Node Waiting (not a recorded Node failure); the open still
+        // fails over to its backup leg.
+        let waiting = host.native_weak_observer_for_test().waiting().unwrap();
+        assert!(waiting.waits >= 1 && waiting.retries_held == 1, "{waiting:?}");
+        assert!(!waiting.first_failure && !waiting.quarantined, "{waiting:?}");
         drop(factory); drop(data);
-        assert_eq!(tokio::time::timeout(Duration::from_secs(15), host.drive_shutdown()).await.unwrap(), NodeShutdown::FailedSettled);
+        assert_eq!(tokio::time::timeout(Duration::from_secs(15), host.drive_shutdown()).await.unwrap(), NodeShutdown::RunningResourcesSettled);
         assert!(host.resources.state().endpoint_drained);
         assert_eq!(open.view().phase, TcpOpenPhase::Settled);
     }).await;

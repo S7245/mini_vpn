@@ -1,3 +1,23 @@
+## 2026-11-09 去掉过宽的分类析取时，同时检查它顺带维护的状态；"多守卫"路径的变异要一次去掉全部守卫
+
+D144：`retryable` 的 `held` 析取除了放宽分类，还顺带保证 re-probe 的 Retry 行最终会被 park 或清掉。去掉它后，终态 re-probe 留下一个未 park 的孤儿行（还会把后续 demand 的预算降为 1），第一次 GREEN 尝试因此超时；修复是在非 Waiting 分支同锁清行。A2-Q 的变异只去掉 loop 顶部的 Q 检查时仍 GREEN，因为 `reap_stats` 是第二道 Q 守卫；判别变异要去掉整个"Q 不再终态"的语义（两处一起）。负载复跑前先用 `--list` 确认每个过滤数组都非 0 匹配，并用原始 HEAD 二进制（`target/headbuild`）区分负载套件里的既有失败。另外：写含反引号的文档时 heredoc 必须加引号（`<<'EOF'`），否则 shell 会把反引号内容当命令执行。
+
+## 2026-11-09 "慢"先归因到哪个 ticket/哪个计时器，再定修复点；第一次假设两次被证伪
+
+D139–D141：A6-pool2 的 14s 先被归为 staged.rs 不遵守 open 期限（证伪：flow 的 open 期限是 20s），再被归为"新 demand 在 Node 已 Waiting 时才铸出"（证伪：两个 demand 都在检测时铸出，当时 held=(0,0)）。真正起作用的是在 `fail()` 里打印**所观察 ticket 的 Debug（index/sequence）**，加上在 mint 处打印 held 行：一次运行就看清慢 open 观察的是 aux 的原始 demand（seq 2），它排在主槽之后。教训：时延异常要按"等的是谁"（ticket、sequence、deadline）做归因，不要按症状像什么来猜；每次探针用独立二进制，并对源文件做 sha 还原。修复分成两个钩子（mint 时、分类为 Waiting 时），各配一个只让对应 tracer RED 的变异，以证明两个钩子彼此独立。
+
+## 2026-11-09 门禁未选中的失败先在原始 HEAD 上复现，再决定归因于哪个阶段
+
+D134：D133 认为 2 个 primary_recovery 失败是 N2 Waiting 的生命周期缺陷。用 `git archive HEAD | tar -x` 到 scratchpad，再用独立的 `CARGO_TARGET_DIR=target/headbuild` 构建（约 10 分钟，1.4G），在原始 HEAD 上隔离运行 3/3 同样失败，假设被证伪，确认是 N1 既有缺陷，只是从未被任何门选中。其余 4 个在 HEAD 上通过，说明它们由 D127 引起。这样做不需要 stash 或切分支，dirty 树不受影响。另外两条经验：(1) "等待 X 完成"的循环如果 X 依赖 `valid()`，就必须在无效时也能退出（wait_sealed）；(2) 判定"干净到期"时，用 custody 证据（UDP 代已 seal）作判据，比用"是否握过手"更合适，因为后者会把设计上就不握手的排队 demand 误判为终态。pool=2 的 Service tracer 没有业务流量时，aux 槽根本不会产生 demand（惰性重连），所以判别排队路径要靠 node 级 tracer。
+
+## 2026-11-08 防误报 tracer 的变异先列"哪些计时器真的在这条路径上"，多数直觉变异是不可达的
+
+D130：A3（RTT 400ms + 2% 丢包）先试了 4 个直觉变异：open 超时 300ms、QUIC idle 1s、端点 stall 100ms、重连超时 300ms，全部仍绿。原因是在持续流量下，活连接上没有任何应用层计时器会对 RTT 起反应（idle 被 3×PTO 钳住，open 不等 RTT，重连超时不管首连）。真正能区分慢路的是 Node 的握手预算（node.rs startup/re-probe 的 5s `timeout`），改成 300ms 后只有 A3 RED，A4/A5 仍绿。同理，A5 的 reset 并不在 `open_tcp_relay` 里被看到，而是在 ordered pump 的读取处。做法：写变异前先用 grep 列出常量和 timeout 的调用点，确认该路径确实会经过它；绿的变异作为"不可达"证据记下，不算判别变异。另外，修订旧 tracer 时让断言精确到"每个槽"，能逼出实现只覆盖 active 槽的缺口（F-N2b，默认 pool=2 时触发，而所有 A-test 都是 pool=1）。
+
+## 2026-11-08 "和超时同时发生"的症状先做零扰动对照：去掉注入看症状是否仍在
+
+D128：断网 25s 时 Q、预算残留、stop 卡住看起来都是 QUIC idle 15s 的后果，其实是 round-0 flow 的 15s close 尾期限恰好同时到期。决定性实验是"完全不断网"（E1），症状照旧；"先在通路正常时结算 flow 再断网"（E2）则症状消失。临时插桩可以在每个 `quarantined = true` 后打印 file:line 和 backtrace（每处上限 2 次），按 sha 还原，几分钟内就能定位源头。另外：zsh 的 `$F` 不按空格拆分，多文件备份/变异/还原要放在 bash 数组里，并在每步之后做 sha 校验。
+
 ## 2026-11-08 A/B 归因：预编译两个二进制、交替运行，树只在构建窗口内改动
 
 D122–D123：怀疑 b2 引入 joint flake 时，没有改树后反复重跑。做法是给两个 arm 各 `--no-run` 构建一次并复制 lib 测试二进制，改动只存在于 B 的构建窗口内，随后立即按 sha 还原；然后用同一组 joint 参数按 ABAB/BABA 交替运行，以抵消机器负载漂移。arm 身份用一个只在一侧 RED 的 tracer 交叉确认（rx_fairness 在 B 中 20/20 RED）。判定规则（差值 + Fisher 单侧 p）在运行前冻结；结果是 1/20 vs 0/20，p=0.5，因此判为既有 flake，并写明 n=20 的统计功效有限。另外，libtest 的 `test … FAILED` 行可能被 stderr 打断，统计失败时要用末尾的 `failures:` 列表。

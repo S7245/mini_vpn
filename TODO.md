@@ -27,3 +27,10 @@ A 出口已于 2026-11-04 按用户批准改为 A1–A4，见 [A 出口修订](d
 - 2026-11-07 D99：C9 独立只读审查完成，C1–C7 无 FAIL（[审查](docs/current/n1-c-review-20261107.md)）；C6 necessary-only，C7 D11 记录非 PASS。
 - 2026-11-07 D100：F1 门加无 feature production check、F4 文档同步；全门 n1-d100-gate-20261107；bd18abb 以来整个 N1 dirty 树单一本地提交（用户"Commit whole tree"，无 push）。仍待：C4（Node 写轴授权）、C8（外部授权）、C-B、B8（D57）、F2/F3（下次触碰 full_* 夹具）；push 未授权。日志 D101+。
 - 2026-11-07 D101–D103：C4 已闭（Node 写轴仅 C4 授权；4 tracer + 变异 RED；全门 n1-c4-gate-20261107 joint 696/696；生产语义不变，未提交）。仍待：C8、C-B、B8（D57）、F2/F3；commit/push 未授权。日志 D104+。
+- 2026-11-08 D127–D129：N2 合同修订（干净到期 ⇒ Waiting）；探针 Q 为夹具假象（F-N2a 另记）；Waiting 已实施，A1/A2/A6/A7 绿 + 变异 RED。剩：两个旧规则 N1 tracer 修订、A3–A5、governance、14 组全门（见 HANDOFF 末段）。
+- 2026-11-08 D130–D132：N1 transient tracer 按 D127 修订；A3/A4/A5 绿 + 变异 RED；governance 绿；全门 12/14（joint ×2 716/717，唯一失败为第三个旧规则 tracer `udp_source::recovery::actual_hard_node_recovery_refusal_is_quiet…`，NEW 确定性）。待批：P1 修订该 tracer、P2 修 F-N2b（非 active closed demand 也进入 Waiting；pool=2 tracer）、P3 重跑 joint×2 + capacity-serial。开放：F-N2a（flow 关闭尾 Q，非 N2）、F-N2c（per-flow 失败记为会话 first_failure，N4）。
+- 2026-11-09 D133：P1 绿；F-N2b 生产修复已写（tracer 未补）；停止：D129 树上 6 个 node tracer 早已失败但不在门禁里（2 个疑似真实生命周期缺陷：primary_recovery endpoint 未 drain、shutdown 超时）。下一：扩大 joint 过滤 → 诊断 → 分类 → P2 tracer → P3。
+- 2026-11-09 D134–D139：门 joint 过滤已扩大；6 个 node 失败全部分类转绿（2 个既有 N1 缺陷：wait_sealed 修复 + guarded 旧断言；主槽 UDP 未 seal ⇒ 终态；3 个 failover 旧规则）；P2 deadline tracer/A2-pool2 绿，A6-pool2 RED ⇒ F-N2d（aux open 在 Recovering 中等原 15s demand）。待确认：D139 计划 → P3 全门。
+- 2026-11-09 D140：F-N2d 假设证伪（flow open 期限 20s；慢 open 等的是 aux 新铸的原始 15s demand，属 N1 语义）。待用户选 (A) 修订 A6-pool2 断言或 (B) Node 已 Waiting 时新 closed demand 直接 Waiting；然后 P3。
+- 2026-11-09 D141–D142：(B) 已实施：路径已知断开时，新的/排队的 closed demand 直接进入 Waiting；A6-pool2 4.92s；P3 全门 14/14 绿（joint ×2 790/790）。下一：N2 独立审查（待决定），提交待授权。
+- 2026-11-09 D143–D144：独立审查 PASS-with-open-items；F1/F2/F3/F4/F5/F7/F12 文案已修，全门 n2-fixgate 14/14 绿（joint ×2 821/821），A6 负载下最慢 5.51s。下一：用户决定提交；开放 F6/F8–F11、F-N2a、F-N2c。

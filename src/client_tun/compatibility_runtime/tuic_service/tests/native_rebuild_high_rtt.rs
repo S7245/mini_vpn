@@ -50,6 +50,19 @@ pub(super) struct Seen {
     pub(super) at: Instant,
     pub(super) len: usize,
     pub(super) injected: bool,
+    /// N2: first 8 DCID bytes of a QUIC v1 long-header Initial, else None.
+    pub(super) initial: Option<u64>,
+}
+
+/// QUIC v1 Initial (long header, type 0): first ≤8 DCID bytes as an id.
+fn initial_dcid(bytes: &[u8]) -> Option<u64> {
+    let (&first, rest) = bytes.split_first()?;
+    if first & 0xb0 != 0x80 || rest.len() < 5 {
+        return None;
+    }
+    let len = usize::from(rest[4]).min(8);
+    let dcid = rest.get(5..5 + len)?;
+    Some(dcid.iter().fold(0u64, |acc, b| acc << 8 | u64::from(*b)))
 }
 
 /// Deterministic loss plan + bounded log, shared by both relay directions.
@@ -62,6 +75,12 @@ pub(super) struct Tap {
     plan: Vec<(usize, Dir, u64)>,
     hits: usize,
     blackhole: Option<(usize, Dir, Instant)>,
+    /// N2: discard every datagram of every generation in `[from, until)`.
+    outage: Option<(Instant, Instant)>,
+    /// N2: deterministic loss, every Nth datagram per (generation, dir).
+    loss_every: Option<u64>,
+    /// N2: every Up QUIC Initial (time, DCID id), independent of `log`; ≤1024.
+    pub(super) initials: Vec<(Instant, u64)>,
     pub(super) log: Vec<Seen>,
     pub(super) log_overflow: u64,
     pub(super) injected: u64,
@@ -69,7 +88,8 @@ pub(super) struct Tap {
 
 impl Tap {
     /// Returns true when the datagram must be dropped by the plan.
-    fn observe(&mut self, generation: usize, dir: Dir, len: usize) -> bool {
+    fn observe(&mut self, generation: usize, dir: Dir, bytes: &[u8]) -> bool {
+        let len = bytes.len();
         let count = self.counts.entry((generation, dir)).or_insert(0);
         let ordinal = *count;
         *count += 1;
@@ -77,9 +97,15 @@ impl Tap {
         let planned = self.plan.contains(&(generation, dir, ordinal));
         self.hits += usize::from(planned);
         let holed = self.blackhole.is_some_and(|(g, d, from)| g == generation && d == dir && at >= from);
-        let injected = planned || holed;
+        let out = self.outage.is_some_and(|(from, until)| at >= from && at < until);
+        let lossy = self.loss_every.is_some_and(|n| ordinal % n == n - 1);
+        let injected = planned || holed || out || lossy;
         self.injected += u64::from(injected);
-        let seen = Seen { generation, dir, ordinal, at, len, injected };
+        let initial = initial_dcid(bytes);
+        if let Some(id) = initial.filter(|_| dir == Dir::Up && self.initials.len() < 1024) {
+            self.initials.push((at, id));
+        }
+        let seen = Seen { generation, dir, ordinal, at, len, injected, initial };
         if self.log.len() < RELAY_LOG {
             self.log.push(seen);
         } else {
@@ -96,6 +122,23 @@ impl Tap {
     pub(super) fn blackhole(&mut self, generation: usize, dir: Dir, from: Instant) {
         self.blackhole = Some((generation, dir, from));
     }
+    /// N2: full-path outage (both directions, every client socket).
+    pub(super) fn outage(&mut self, from: Instant, until: Instant) {
+        self.outage = Some((from, until));
+    }
+    /// N2: drop every `n`th datagram of each (generation, dir), both ways.
+    pub(super) fn loss_every(&mut self, n: u64) {
+        self.loss_every = Some(n.max(1));
+    }
+    /// N2: distinct Up Initial DCIDs first seen in `[from, until)`.
+    pub(super) fn new_dcids(&self, from: Instant, until: Instant) -> usize {
+        let before: std::collections::BTreeSet<u64> =
+            self.initials.iter().filter(|(at, _)| *at < from).map(|(_, id)| *id).collect();
+        let ids: std::collections::BTreeSet<u64> = self.initials.iter()
+            .filter(|(at, id)| *at >= from && *at < until && !before.contains(id))
+            .map(|(_, id)| *id).collect();
+        ids.len()
+    }
     /// Every planned ordinal was observed (and dropped) exactly once.
     pub(super) fn plan_exhausted(&self) -> bool {
         self.hits == self.plan.len()
@@ -105,7 +148,7 @@ impl Tap {
 pub(super) struct RttRelay {
     pub(super) addr: SocketAddr,
     /// First datagram time per client socket (one per Node generation).
-    first_seen: Arc<Mutex<Vec<(SocketAddr, Instant)>>>,
+    pub(super) first_seen: Arc<Mutex<Vec<(SocketAddr, Instant)>>>,
     pub(super) tap: Arc<Mutex<Tap>>,
     pub(super) dropped: Arc<std::sync::atomic::AtomicU64>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -156,7 +199,7 @@ impl RttRelay {
                         children.push(tokio::spawn(async move {
                             let mut buf = vec![0u8; 65536];
                             while let Ok((n, _)) = up.recv_from(&mut buf).await {
-                                if taps.lock().unwrap().observe(generation, Dir::Down, n) {
+                                if taps.lock().unwrap().observe(generation, Dir::Down, &buf[..n]) {
                                     continue;
                                 }
                                 let item = (Instant::now() + one_way, buf[..n].to_vec(), client);
@@ -169,7 +212,7 @@ impl RttRelay {
                         (generation, line)
                     }
                 };
-                if taps.lock().unwrap().observe(generation, Dir::Up, n) {
+                if taps.lock().unwrap().observe(generation, Dir::Up, &buf[..n]) {
                     continue;
                 }
                 if line.try_send((now + one_way, buf[..n].to_vec(), server)).is_err() {

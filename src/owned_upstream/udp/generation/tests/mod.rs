@@ -144,3 +144,18 @@ fn destructing_source_cannot_reuse_previous_consumer_seal() {
     assert!(control.sealed(1));
     assert!(control.prepare_publication(1, 2).is_none());
 }
+
+/// D134: an invalid (poisoned) control can never seal, so waiting for the seal
+/// must end fail-closed; every caller re-checks `valid()` afterwards.
+#[tokio::test]
+async fn wait_sealed_ends_fail_closed_once_control_is_invalid() {
+    let control = Arc::new(GenerationControl::default());
+    assert!(control.freeze(1));
+    poison_publication(&control);
+    assert!(control.prepare_publication(1, 2).is_none());
+    assert!(!control.valid());
+    tokio::time::timeout(std::time::Duration::from_secs(1), control.wait_sealed(1))
+        .await
+        .expect("invalid control must not wait forever for a seal");
+    assert!(!control.sealed(1));
+}

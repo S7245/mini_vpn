@@ -234,7 +234,7 @@ async fn staged_factory_rebuilds_three_aux_generations_and_joins_each_stats_role
     finish(host, server, peers, result).await;
 }
 
-async fn wait_closed(data: &TuicUpstream, index: usize) {
+pub(super) async fn wait_closed(data: &TuicUpstream, index: usize) {
     tokio::time::timeout(Duration::from_secs(2), async {
         while data.tcp_pool_slots[index]
             .state
@@ -327,6 +327,8 @@ async fn original_deadlines_expire_while_candidate_drain_waits_without_ticket_re
             }
         }).await.unwrap();
         assert!(host.resources.state().connections[3].is_some(), "failed notification must precede physical retirement");
+        let (observer, w) = (host.native_weak_observer_for_test(), |o: &NativeNodeWeakObserver| o.waiting().map(|s| (s.retries_held, s.first_failure || s.quarantined, s.parked)));
+        assert_eq!(w(&observer).map(|s| (s.0, s.1)), Some((2, false)), "D127/F-N2b: active and queued clean expiries both held Waiting");
         assert_eq!(first, data.request_aux_recovery(1, data.tcp_pool_slots[1].state.lock().await).unwrap());
         drop(held);
         finish_drain.send(true).unwrap();
@@ -334,9 +336,9 @@ async fn original_deadlines_expire_while_candidate_drain_waits_without_ticket_re
         assert!(host.resources.state().connections[3].is_none());
         assert!(data.observe_aux_recovery(first).is_err());
         assert_eq!(host.resources.state().attempts_started, 4, "returning preparation after deadline must not retry");
-        drop(primary);
-        drop(data);
-        assert_eq!(tokio::time::timeout(Duration::from_secs(3), host.drive_shutdown()).await.unwrap(), NodeShutdown::FailedSettled);
+        assert_eq!(w(&observer), Some((2, false, 2)), "both park after custody settled (1s backoff each)");
+        drop(primary); drop(data);
+        assert_eq!(tokio::time::timeout(Duration::from_secs(3), host.drive_shutdown()).await.unwrap(), NodeShutdown::RunningResourcesSettled);
     }).await;
     finish(host, server, peers, result).await;
 }
@@ -616,28 +618,25 @@ async fn actual_tls_configuration_rejection_stops_same_config_without_retry() {
 }
 #[tokio::test(flavor = "current_thread")]
 async fn actual_transient_refusal_retries_twice_with_original_spacing() {
+    // N1 spacing kept; D127 amends the outcome: two clean refusals leave the
+    // same closed slot Waiting (no first failure), re-probed after 1s then 2s,
+    // and the same Node recovers that slot without a successor.
     let server = server(8);
     let mut cfg = config(server.local_addr().unwrap());
     cfg.tcp_pool = 2;
     let mut host = NodeHost::prepare(cfg.clone(), Arc::new(Metrics::default()));
     let mut peers = Vec::new();
-    let result =
-        guarded(async {
-            boot(&mut host, &server, &cfg, &mut peers).await;
-            let data = host.data().unwrap();
-            let target = TargetAddr::IpPort("192.0.2.1:443".parse().unwrap());
-            let primary = tokio::time::timeout(Duration::from_secs(2), data.open_tcp(&target))
-                .await
-                .unwrap()
-                .unwrap();
-            peers[1].close(
-                17u32.into(),
-                b"auxiliary failure before rejected successors",
-            );
-            wait_closed(&data, 1).await;
-            // Valid original configuration; actual QUIC refusal is transient.
-            let mut starts = Vec::new();
-            tokio::time::timeout(Duration::from_secs(4), async {
+    let observer = host.native_weak_observer_for_test();
+    let result = guarded(async {
+        boot(&mut host, &server, &cfg, &mut peers).await;
+        let data = host.data().unwrap();
+        let target = TargetAddr::IpPort("192.0.2.1:443".parse().unwrap());
+        let primary = tokio::time::timeout(Duration::from_secs(2), data.open_tcp(&target)).await.unwrap().unwrap();
+        peers[1].close(17u32.into(), b"auxiliary failure before refused successors");
+        wait_closed(&data, 1).await;
+        // Valid original configuration; actual QUIC refusal is transient.
+        let mut starts = Vec::new();
+        tokio::time::timeout(Duration::from_secs(4), async {
             tokio::select! {
                 _ = async {
                     tokio::join!(async { assert!(data.open_tcp(&target).await.is_err()); }, async {
@@ -651,41 +650,61 @@ async fn actual_transient_refusal_retries_twice_with_original_spacing() {
                 result = host.run() => panic!("local exhaustion ended unrelated node: {result:?}"),
             }
         }).await.unwrap();
-            assert!(starts[1].duration_since(starts[0]) >= Duration::from_millis(500));
-            {
-                let state = host.resources.state();
-                assert_eq!(state.attempts_started, 4);
-                assert_eq!(state.attempts_drained, 2);
-                assert!(!state.quarantined && state.first.is_some());
-                assert!(
-                    state
-                        .connections
-                        .iter()
-                        .flatten()
-                        .all(|entry| entry.published)
-                );
+        assert!(starts[1].duration_since(starts[0]) >= Duration::from_millis(500));
+        {
+            let state = host.resources.state();
+            assert_eq!(state.attempts_started, 4);
+            assert_eq!(state.attempts_drained, 2);
+            assert!(!state.quarantined && state.first.is_none(), "clean expiry is Waiting, not a failure");
+            assert!(state.connections.iter().flatten().all(|entry| entry.published));
+        }
+        let sample = observer.waiting().unwrap();
+        assert_eq!((sample.waits, sample.reprobes, sample.retries_held), (1, 0, 1), "{sample:?}");
+        assert!(!data.udp_runtime.node_stopping());
+        // Waiting: an open fails typed and fast, without starting a handshake.
+        assert!(tokio::time::timeout(Duration::from_millis(500), data.open_tcp(&target)).await.unwrap().is_err());
+        assert_eq!(host.resources.state().attempts_started, 4, "opens never multiply attempts");
+        // Re-probe 1 (backoff 1s) is refused again; re-probe 2 (backoff 2s) succeeds.
+        let mut reprobes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            tokio::select! {
+                _ = async {
+                    let incoming = server.accept().await.unwrap();
+                    reprobes.push(tokio::time::Instant::now());
+                    incoming.refuse();
+                    let peer = server.accept().await.unwrap().await.unwrap();
+                    reprobes.push(tokio::time::Instant::now());
+                    auth(&peer, &cfg).await;
+                    peers.push(peer);
+                    loop {
+                        if let Ok(Ok(flow)) = tokio::time::timeout(Duration::from_secs(1), data.open_tcp(&target)).await {
+                            drop(flow);
+                            break;
+                        }
+                    }
+                } => {},
+                result = host.run() => panic!("Waiting ended the node: {result:?}"),
             }
-            assert!(
-                tokio::time::timeout(Duration::from_secs(1), data.open_tcp(&target))
-                    .await
-                    .unwrap()
-                    .is_err()
-            );
-            assert_eq!(host.resources.state().attempts_started, 4);
-            assert!(!data.udp_runtime.node_stopping());
-            drop(primary);
-            drop(data);
-            assert_eq!(
-                tokio::time::timeout(Duration::from_secs(3), host.drive_shutdown())
-                    .await
-                    .unwrap(),
-                NodeShutdown::FailedSettled
-            );
-        })
-        .await;
+        }).await.unwrap();
+        assert!(reprobes[0].duration_since(starts[1]) >= Duration::from_secs(1), "backoff step 1s");
+        assert!(reprobes[1].duration_since(reprobes[0]) >= Duration::from_secs(2), "backoff step 2s");
+        {
+            let state = host.resources.state();
+            assert_eq!(state.attempts_started, 6, "exactly one handshake per re-probe");
+            assert!(!state.quarantined && state.first.is_none());
+        }
+        let sample = observer.waiting().unwrap();
+        assert_eq!((sample.reprobes, sample.retries_held), (2, 0), "commit clears the retry row: {sample:?}");
+        drop(primary);
+        drop(data);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), host.drive_shutdown()).await.unwrap(),
+            NodeShutdown::RunningResourcesSettled
+        );
+    })
+    .await;
     finish(host, server, peers, result).await;
 }
-
 #[tokio::test(flavor = "current_thread")]
 async fn old_actual_aux_carrier_keeps_predecessor_permit_through_stop_observation_cancel() {
     old_carrier_case(false).await;

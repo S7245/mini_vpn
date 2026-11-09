@@ -13,6 +13,8 @@ mod service_faults;
 mod staged_maintenance;
 mod staged_slow;
 mod startup;
+mod waiting_join;
+mod waiting_terminal;
 
 impl super::NodeHost {
     /// Install the original shared meter only before the saved startup's first poll.
@@ -187,6 +189,37 @@ impl NativeNodeWeakObserver {
         });
         drop(original);
         sample
+    }
+}
+/// N2 Waiting evidence: Waiting entries, re-mints, counted (unrecorded)
+/// handshake failures, held retry rows, Node first failure and Q.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WaitingSample {
+    pub waits: u64,
+    pub reprobes: u64,
+    pub waiting_failures: u64,
+    pub retries_held: usize,
+    pub parked: usize,
+    pub first_failure: bool,
+    pub quarantined: bool,
+}
+impl NativeNodeWeakObserver {
+    pub(crate) fn waiting(&self) -> Option<WaitingSample> {
+        let original = self.0.upgrade()?;
+        let sample = {
+            let state = original.state();
+            WaitingSample {
+                waits: state.recovery.waits,
+                reprobes: state.recovery.reprobes,
+                waiting_failures: state.recovery.waiting_failures,
+                retries_held: state.recovery.retries_held().0,
+                parked: state.recovery.retries_held().1,
+                first_failure: state.first.is_some(),
+                quarantined: state.quarantined,
+            }
+        };
+        drop(original);
+        Some(sample)
     }
 }
 impl super::NodeHost {
