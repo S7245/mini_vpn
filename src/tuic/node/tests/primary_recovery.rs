@@ -587,7 +587,7 @@ async fn shutdown_only_udp_inventory_failure_retains_first_error() {
 async fn primary_freeze_wakes_only_after_original_root_and_slot_unlock() {
     struct Probe {
         owner: Arc<StartupResources>,
-        slot: Arc<TcpPoolGenerationSlot<Connection>>,
+        slot: Arc<TcpPoolGenerationSlot<crate::tuic::generation_slot::SlotConnection>>,
         called: AtomicBool,
         unlocked: AtomicBool,
     }

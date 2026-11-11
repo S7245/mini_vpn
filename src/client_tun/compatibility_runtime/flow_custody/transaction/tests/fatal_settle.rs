@@ -187,7 +187,7 @@ fn row(owner: &SessionControl) -> Option<Row> {
         stage: flow.stage,
         slot_limit: slot.deadline,
         open_limit: flow.open_deadline,
-        flow_limit: flow.stop_deadline,
+        flow_limit: *flow.stop_deadline,
         held: (flow.w_held, flow.f_held, flow.reserved, flow.escrow_bytes),
         published: flow.published,
         producer: (flow.producer_stopped, flow.provider_cancelled),
@@ -373,7 +373,8 @@ async fn exercise(peer: &ReadyPeer) {
         assert_eq!(after.attempt, published.attempt);
         assert_eq!(after.open_limit, published.open_limit);
         assert_eq!(after.slot_limit, published.slot_limit);
-        assert_eq!(after.flow_limit, Some(flow_limit));
+        // D152 (A1): the provider bound is the tail plus one loss bound.
+        assert_eq!(after.flow_limit.map(|limit| limit + PROVIDER_LOSS_BOUND), Some(flow_limit));
         assert!(flow_limit >= before.deadline.into_std());
         assert!(matches!(view.phase, TcpOpenPhase::Retiring | TcpOpenPhase::Settled));
         assert_eq!(view.connect_written, 9);

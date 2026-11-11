@@ -92,7 +92,7 @@ fn row(owner: &SessionControl, id: FlowIdentity) -> Option<Row> {
         id: flow.id,
         stage: flow.stage,
         slot_limit: slot.deadline,
-        flow_limit: flow.stop_deadline,
+        flow_limit: *flow.stop_deadline,
         held: (flow.w_held, flow.f_held, flow.reserved, flow.escrow_bytes),
         published: flow.published,
         producer: (flow.producer_stopped, flow.provider_cancelled),

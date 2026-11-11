@@ -16,8 +16,15 @@
 //! `Retry` is terminal. A non-clean re-probe result drops its row (D144). One in-flight handshake per
 //! slot, one timer folded into the existing `run` wait, no task, no queue, and the
 //! count of attempts is independent of how many opens/UDP sends observe it.
+//! D152 (A2): once a closed demand settles Failed (parked Waiting or terminal),
+//! `release_settled` drops the dead connection's storage from the slot (a
+//! `SlotConnection` tombstone keeps identity and close evidence) and retires
+//! its physical entry, so stream witnesses on it retire and leases drain
+//! instead of holding the storage for the whole Waiting period. It runs in the
+//! same `run` loop turn, on the bounded control path, with no task or queue.
 //! Entry: `hold`, `join_parked`, `join_queued`, `park`, `rearm_due`, `next_due`, `budget`, `clean_expiry`,
-//! `TuicUpstream::await_closed_recovery`. Tests: tuic_service/tests/native_waiting*.
+//! `release_settled`, `TuicUpstream::await_closed_recovery`. Tests:
+//! tuic_service/tests/native_waiting*, tuic/node/tests/waiting_release.rs.
 use super::*;
 
 /// One re-probe = one handshake (≤5s) plus publication margin.
@@ -203,6 +210,59 @@ pub(super) fn park(owner: &StartupResources, ticket: Ticket) {
     }
     drop(root);
     owner.wake_recovery();
+}
+
+/// D152 (A2): release every settled Failed closed slot's dead storage. Its
+/// stats logger is joined first (one physical entry per tagged task); a slot
+/// that is live, draining or of another identity is left untouched. The
+/// physical entry is retired with the original witness; a failure is Q.
+pub(super) async fn release_settled(
+    owner: &StartupResources,
+    data: &TuicUpstream,
+) -> Result<(), ClientError> {
+    for index in 0..data.tcp_pool_slots.len() {
+        let identity = {
+            let root = owner.state();
+            let Some(demand) = root.recovery.demands[index].as_ref() else {
+                continue;
+            };
+            let identity = demand.ticket.identity;
+            if demand.ticket.kind != Kind::Closed
+                || demand.outcome != Outcome::Failed
+                || !demand.settled
+                || root.recovery.released(index, identity)
+                || root
+                    .tasks
+                    .iter()
+                    .any(|task| task.stable_id == Some(identity.stable_id))
+            {
+                continue;
+            }
+            identity
+        };
+        let storage = {
+            let mut slot = data.tcp_pool_slots[index].state.lock().await;
+            if slot.current.identity() != identity || slot.draining.is_some() {
+                continue;
+            }
+            let storage = slot.current.transport.release();
+            if !slot.current.transport.released() {
+                continue;
+            }
+            storage
+        };
+        drop(storage); // Outside the slot lock.
+        let entry = owner.state().connections.iter().position(|entry| {
+            entry
+                .as_ref()
+                .is_some_and(|e| e.published && e.stable_id == Some(identity.stable_id))
+        });
+        if let Some(entry) = entry {
+            owner.retire(entry).await?;
+        }
+        owner.state().recovery.released[index] = Some(identity);
+    }
+    Ok(())
 }
 
 /// Re-mint every due Waiting demand as a one-handshake Pending demand on the

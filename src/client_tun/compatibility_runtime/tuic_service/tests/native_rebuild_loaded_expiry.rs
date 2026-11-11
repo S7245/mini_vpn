@@ -99,9 +99,15 @@ async fn unretired_original_rebuild(engine: Engine) {
         assert!(!old.business_complete.load(Ordering::Acquire), "held business settled early");
         assert_eq!(rig.handle.phase(), Phase::Rebuilding);
         assert_eq!(rig.gate.cuts.load(Ordering::Acquire), 0, "no cut while held");
-        // Past the limit: sticky Q, still no completion/successor.
-        let quarantined = hold(&mut rig, limit + Duration::from_secs(1)).await;
-        let after_q = hold(&mut rig, limit + Duration::from_secs(3)).await;
+        // D152 (A1): past the limit the held provider gets its one extension.
+        let extended = hold(&mut rig, limit + Duration::from_secs(1)).await;
+        assert_ne!(rig.handle.phase(), Phase::Quarantined, "Q at the parent limit: no A1 extension");
+        let provider = fixture::a1_q_deadline(&old, limit);
+        // Past the provider deadline: sticky Q, still no completion/successor.
+        let quarantined = hold(&mut rig, provider + Duration::from_secs(1)).await;
+        let after_q = hold(&mut rig, provider + Duration::from_secs(3)).await;
+        fixture::assert_a1_extended(&old, provider);
+        eprintln!("F5 {engine:?}: A1 extended={extended:.2?}");
         eprintln!("F5 {engine:?}: (wakes/tick, cpu share) draining={draining:.2?} at_limit={quarantined:.2?} after_q={after_q:.2?}");
         drop((send, recv));
         peers.push(peer);

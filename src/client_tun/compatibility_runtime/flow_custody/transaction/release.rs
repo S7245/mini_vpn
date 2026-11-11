@@ -185,7 +185,7 @@ impl Drop for Turn {
                 if let Some(payload) = self.panic.take() { flow.retain_unwind(payload); }
                 flow.stage = FlowStage::Quarantined;
                 if let Some(deadline) = deadline {
-                    flow.stop_deadline = Some(flow.stop_deadline.map_or(deadline.into_std(), |old| old.min(deadline.into_std())));
+                    flow.stop_deadline.limit(deadline.into_std());
                 }
                 // Keep exclusive qualification after partial actual disposal.
             }

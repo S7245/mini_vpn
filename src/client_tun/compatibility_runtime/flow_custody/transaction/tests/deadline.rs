@@ -136,7 +136,7 @@ async fn expired_received_w_keeps_original_payload_until_reset_without_starting_
             flow.stop_deadline,
             Some(original_deadline + Duration::from_secs(15))
         );
-        flow.stop_deadline
+        *flow.stop_deadline
     };
     for _ in 0..256 {
         control_turn(

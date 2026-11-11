@@ -2608,7 +2608,7 @@ fn io_err<E: std::fmt::Display>(ctx: &str, e: E) -> ClientError {
 
 /// 刀9（spec §2.3）：QUIC 重连握手超时。黑洞/不可达 server 的握手默认受 idle 约束可阻塞数十秒，
 /// 5s 封顶让 failover 快路（连接死 + 重连失败）快速暴露；正常重连 1-RTT 远小于 5s，不会误伤高 RTT 链路。
-const TUIC_RECONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const TUIC_RECONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 const ENDPOINT_RECOVERY_MIN_STALL: Duration = Duration::from_secs(2);
 const ENDPOINT_RECOVERY_MAX_STALL: Duration = Duration::from_secs(7);
@@ -3692,7 +3692,7 @@ trait TcpPoolTransport: Clone {
     fn tcp_pool_install_service_state(&self) -> Option<TcpPoolInstallServiceState>;
 }
 
-impl TcpPoolTransport for Connection {
+impl TcpPoolTransport for generation_slot::SlotConnection {
     fn tcp_pool_stable_id(&self) -> usize {
         self.stable_id()
     }
@@ -3903,7 +3903,7 @@ pub struct TuicUpstream {
     password: String,
     /// Fixed logical slots own current and optional draining generations as one lifecycle unit.
     /// Slot 0 remains the single primary source for UDP relay, heartbeat, and health probes.
-    tcp_pool_slots: Vec<Arc<TcpPoolGenerationSlot<Connection>>>,
+    tcp_pool_slots: Vec<Arc<TcpPoolGenerationSlot<generation_slot::SlotConnection>>>,
     /// The frozen two-slot pool permits at most one drain-only predecessor globally.
     tcp_pool_draining_predecessor: Arc<AtomicBool>,
     /// TCP-open admission owns active/opening counts plus busy-epoch forward qualification. Stale

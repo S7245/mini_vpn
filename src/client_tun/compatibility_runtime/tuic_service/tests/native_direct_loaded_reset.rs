@@ -296,21 +296,62 @@ async fn exercise(ending: Ending, hard: bool) {
             return;
         }
         if ending == Ending::AckHeld {
-            let completed = tokio::time::timeout_at(original_deadline, service.run()).await;
+            let mut run = Box::pin(service.run());
+            let completed = tokio::time::timeout_at(original_deadline, run.as_mut()).await;
             assert!(completed.is_err() && tokio::time::Instant::now() >= original_deadline);
             // The deadline → Q publication takes several task hops after the
             // timer tick this observer shares (D29): keep driving the original
-            // run, which must never settle, until the parent phase is published.
-            fixture::window(Duration::from_secs(5), async {
-                while handle.phase() == Phase::Stopping {
-                    assert!(
-                        tokio::time::timeout(Duration::from_millis(10), service.run()).await.is_err(),
-                        "ACK-held direct custody falsely completed after parent deadline"
-                    );
+            // run until the parent phase is published.
+            // D152 (A1): hard Q follows the provider deadline, not the parent limit.
+            let a1 = hard.then(|| fixture::a1_q_deadline(&original_owner, original_deadline));
+            let wait = a1.map_or(Duration::ZERO, |provider| {
+                provider.saturating_duration_since(tokio::time::Instant::now())
+            });
+            // D187 (model T7|T6, as the D170 direct held rows): with D181's
+            // derived bound the hard provider may retire inside its one A1
+            // extension (T7: clean settle in (parent, P] keeping the reset's
+            // first failure) or outlive it (T6: second expiry, sticky Q below).
+            let id = original_flow_id.unwrap();
+            let mut tail = None;
+            let ended = fixture::window(wait + Duration::from_secs(5), std::future::poll_fn(|cx| {
+                let result = run.as_mut().poll(cx);
+                if original_owner.flow_contracts().first().is_some_and(|c| c.id == id) {
+                    tail = original_owner.flow_provider_tail_for_test(id);
                 }
-            })
+                match result {
+                    std::task::Poll::Ready(report) => std::task::Poll::Ready(Some(report)),
+                    std::task::Poll::Pending if handle.phase() != Phase::Stopping => std::task::Poll::Ready(None),
+                    std::task::Poll::Pending => std::task::Poll::Pending,
+                }
+            }))
             .await
             .expect("original Service did not publish parent phase after deadline");
+            let at = tokio::time::Instant::now();
+            drop(run);
+            if let Some(report) = ended {
+                let provider = a1.expect("non-hard ACK-held direct custody falsely completed after parent deadline");
+                eprintln!("[D187-direct-ack-ending] T7 at_after_parent={:?} provider_after_parent={:?} report={report:?}",
+                    at - original_deadline, provider - original_deadline);
+                assert!(at > original_deadline && at <= provider, "T7 outside (parent, P]");
+                assert_eq!(tail, Some((Some(provider), true)), "A1 ending without its one extension");
+                assert_eq!(report.session, SessionDeviceState::DeviceFailedSettled);
+                assert_eq!(report.node, Some(crate::tuic::NodeShutdown::RunningResourcesSettled));
+                assert_eq!(handle.phase(), Phase::Complete);
+                let owner = saved.session.lock().unwrap().as_ref().unwrap().upgrade().unwrap();
+                assert!(Arc::ptr_eq(&original_owner, &owner));
+                let flow = owner.flow_observation().unwrap();
+                assert_eq!((flow.joined, flow.released, flow.f), (4, 1, 0));
+                assert!(flow.audit && !owner.ledger().quarantined);
+                assert_eq!(fixture::first_failure_identity(&owner), first_before_release);
+                assert_eq!(backing.as_ref().unwrap().snapshot().physical_bytes, 0);
+                assert_eq!(owner.ledger().shutdown_deadline, original_session_deadline);
+                assert_eq!(*saved.deadline.lock().unwrap(), Some(original_deadline));
+                let budget = saved.backing_budget.as_ref().unwrap();
+                assert_eq!(budget.used(), 0);
+                assert!(!budget.quarantined());
+                return;
+            }
+            if let Some(provider) = a1 { fixture::assert_a1_extended(&original_owner, provider); }
             let owner = saved.session.lock().unwrap().as_ref().unwrap().upgrade().unwrap();
             let flow = owner.flow_observation().unwrap();
             let contracts = owner.flow_contracts();

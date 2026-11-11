@@ -217,6 +217,21 @@ impl LoopbackTunDevice {
         self.partial_flush = Some(probe);
         self
     }
+    /// N4 M7: count packets installed for the driver into `counter`:
+    /// `[0]` by `wait_for_rx` (main receive path), `[1]` by `try_recv_rx`.
+    pub(crate) fn with_test_rx_counter(
+        mut self,
+        counter: std::sync::Arc<[std::sync::atomic::AtomicU64; 2]>,
+    ) -> Self {
+        assert!(self.rx_installed.is_none());
+        self.rx_installed = Some(counter);
+        self
+    }
+    pub(in crate::harness) fn note_rx_installed(&self, path: usize) {
+        if let Some(counter) = &self.rx_installed {
+            counter[path].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

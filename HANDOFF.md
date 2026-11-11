@@ -350,3 +350,165 @@ Knife: compatibility recovery N2（仅本机 loopback）。P1–P3 已全部本�
 - 本次改动：`src/tuic/node/recovery/waiting.rs`（retryable 去 `held`、`holds`、`exhausted`、模块文档）、`src/tuic/node/recovery.rs`（终态清行、本地错误记录标记、Waiting 文案）、`src/tuic/node.rs`（`WaitingFailure`、`is_recorded`）、新叶 `src/tuic/node/tests/waiting_terminal.rs` + `src/tuic/node/tests/mod.rs` 一行、`native_waiting_pool.rs` DCID 界。
 - 下一：用户决定 commit（整树还是分批；`certs/dev/ca-cert.srl` 不要动、不要提交）；之后 N4。F-N2a 应在 N4/真实门前单独决定（F11）。
 - 不授权：TUN、VPS、WAN、M2、sudo、新 key、push。
+
+## 新会话交接（N4，2026-11-09，D145–D146）
+
+- 位置：N2 已接受并提交 `91ff731`。N4 设计出口 D145（`docs/current/n4-design-20261109.md`）。只改了测试代码：`tuic_service/tests/native_n4_harness.rs`、`native_n4_isolation.rs`、`tests/mod.rs` +2 行，**未提交**。raw 在 `/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-20261109/`。
+- 停止原因：F-N2a（M5(iii)）RED 已表征，关闭它要改 flow custody 关闭尾合同（`transaction.rs` 的 close/drive：15s 到期 ⇒ Quarantined）。**待用户/父会话从 D146 的 (A)/(A')/(B)/(C) 中选择**，建议 (A')。
+- 获批后：(1) 用临时探针确认到期时卡住的确切子条件（roles.data_disposed、本地 socket 活跃或 Rearming），sha 还原；(2) 按所选方案修 flow custody，M5(iii) RED→GREEN，加变异；(3) 归因 M1 stop 后多出的 1 个 task；(4) M1 跑冻结的 120s，补 M2–M7 及各自变异（M3 慢段需要 RttRelay 运行时可调延迟）；(5) 全 14 组门 + `native_n4_` 组（capacity-serial，新前缀 `n4-gate-`），失败分 D9/D11 或 NEW；O-N2b release 对比。
+- 运行：`CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=target cargo test --offline --features harness --lib --no-run`；二进制 `target/debug/deps/mini_vpn-38e8a4ca41212e00 native_n4_ --nocapture --test-threads=1`（本机没有 `timeout` 命令）；`N4_SPAN_SECS` 只能缩短 M1 的探索运行。zsh 下 heredoc 必须加引号（`<<'EOF'`），否则反引号会被当命令执行。
+- 不授权：N3、N5/C8、TUN、VPS、WAN、M2、sudo、新 key 落盘、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。
+
+## 新会话交接（N4，2026-11-09，D147–D149）
+
+- 位置：F-N2a 已按用户 (A') 关闭（D147，合同修订）：关闭尾 15s 从最后一次 App 进度起算；到期时若最近一次物理检查只在等 App，则只 RST 该 flow 并正常释放，其它到期仍 sticky Q。生产改动只在 flow custody：`flow_custody/transaction.rs`（`CloseTail`、`app_tail_wait`、drive 到期判定）、`rearm/physical_flow.rs`（3 个观测点）、`downlink_custody/ledger.rs` `remaining_bytes` + `downlink_custody.rs` 委托。tracer：M5(iii)、慢读者、单元叶 `flow_custody/transaction/tests/close_tail.rs`；4 个变异各自 RED。M1 task 残留归因为测试 RttRelay（D148），M1 120s 绿。全门 `/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-gate-20261109/` 14 组 + n4 组绿（D149）。**未提交。**
+- 下一（按顺序）：(1) M1 补 8MiB 下行批量流吞吐记录 + M1 变异（短流 release 跳过）；(2) M2–M7 按 D145 冻结阈值与变异实现（M3 需要 RttRelay 运行时可调延迟/丢包，M4 复测 F6，M6 16×4MiB，M7 DNS 4000）；(3) O-N2b release n=5；(4) 全门重跑（前缀 `n4-gate2-`，runner 复制 `/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-d147-20261109/runner/`）；(5) 父会话开 N4 独立审查。
+- 运行：`CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=target cargo test --offline --features harness --lib --no-run`；二进制 `target/debug/deps/mini_vpn-38e8a4ca41212e00 native_n4_ --nocapture --test-threads=1`。raw：`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-20261109/d147/`。
+- 不授权：N3、N5/C8、TUN、VPS、WAN、M2 验收、sudo、新 key 落盘、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。
+
+## 新会话交接（N4，2026-11-09，D150）
+
+- 位置：只改了测试代码，未提交。新叶 `tuic_service/tests/native_n4_peer.rs`、`native_n4_recovery.rs`、`native_n4_pressure.rs`；改 `native_n4_harness.rs`（拆分后 604 行）、`native_n4_isolation.rs`（M1 加 8MiB 批量流）、`native_waiting.rs`（`rig_links`、`Rig::to_service`）、`native_rebuild_high_rtt.rs`（`Tap::slow`）、`tests/mod.rs` +3。生产代码与 D147 相同。raw：`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-20261109/m27/`。
+- 停止原因（D150）：F-N4a（M2 跨代分片重组泄漏，真实）、F-N4b（M3/M4 负载下 Waiting 不再探测、stop 不完成，跨三方 ⇒ 结构门）。**修生产前需用户/父会话批准 D150 计划。**
+- 获批后按顺序：(1) F-N4b 临时探针（M4c，恢复循环每轮 old/primary_old/next/due、active_leases、reap_stats/finish_predecessor 耗时），sha 还原，给设计出口；(2) F-N4a 用 M2 单周期 tracer 定位 retire/discard 是否在 peer-close 恢复上执行；(3) 测试修正：M7 link（遵守设备上限或分批）、M5(ii) 阈值从真实窗口链推导、M3 重跑（completion 度量，slow 段用 peer connections）；(4) 各格变异（mutate.py 配方见 `n2-waiting-20261108/mut/`、`n2-steady-20261108/mut/`；M1 = release.rs `opens.slots.take` 跳过，M2 = native_fragments `retire_generation` 不清，M5 = WINDOW_BYTES 去界，M6 = ReaderWindow 不停顿，M7 = 去掉 driver.rs b2 `consume_budget`）；(5) M1 120s、O-N2b release n=5、governance、全门 `n4-gate2-`。
+- 运行：`CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=target cargo test --offline --features harness --lib --no-run`；`target/debug/deps/mini_vpn-38e8a4ca41212e00 native_n4_ --nocapture --test-threads=1`。governance 与 fmt 本轮未跑（新文件已 rustfmt）。
+- 不授权：N3、N5/C8、TUN、VPS、WAN、M2 验收、sudo、新 key 落盘、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。
+
+## 新会话交接（N4，2026-11-09，D151）
+
+- 位置：仅探针，**无生产改动**，测试代码同 D150，未提交。探针全部还原（6 个文件 sha 与原值一致，`[DEBUG-n4b]` 0 处）。raw：`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-20261109/fn4b/`。
+- F-N4b 已归因（D151），D150 的"恢复循环卡在 predecessor"假设被证伪：Node 循环正常 park/idle；stop 时 `request_stop` 按设计丢弃 running。真因：黑洞中经 relay 半关闭 10s 守卫关闭的短流，其 TUIC open 处于 Retiring，lease 要等 `quinn::BiStreamRetirement::is_retired()`；死连接的存储一直挂在 Node 槽的 `current` 上（Waiting 期间无界），见证永不退休 ⇒ 15s 关闭尾到期（非 App-only）⇒ flow Q ⇒ 会话 sticky Q ⇒ 47 条 Quarantined 行保留 ⇒ stop 永不完成。M3 推断同因（未单独探针）。
+- 停止原因：跨 flow custody / Node 槽生命周期 / TUIC open+quinn 见证三方 ⇒ 结构门。**待用户/父会话从 D151 (A)/(B)/(C)/(D) 中选择，建议 (A)=A1 provider-only 到期一次性延长 PROVIDER_LOSS_BOUND（QUIC idle 15s+5s）+ A2 Node 在 Waiting/终态时释放死连接存储。**
+- 获批后：T1 Node 叶 RED→GREEN（停在 Waiting 后 ≤1s 见证退休、activity 0）、T2 close_tail 单元、T3 M4c/M3；变异：去 A2 ⇒ T1+M4c RED，去 A1 ⇒ T2 RED。之后接着 D150 计划 (2) F-N4a M2 单周期 tracer、(3) M7 link/M5(ii) 窗口链阈值/M3 8s 重跑、(4) 各格变异、M1 120s+批量、O-N2b release n=5、governance、全门 `n4-gate2-`。
+- 运行：`CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=target cargo test --offline --features harness --lib --no-run`；`target/debug/deps/mini_vpn-38e8a4ca41212e00 n4_m4_stop_during_waiting_under_load_completes --nocapture --test-threads=1`（约 90s，RED）。
+- 不授权：N3、N5/C8、TUN、VPS、WAN、M2 验收、sudo、新 key 落盘、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。
+
+## 新会话交接（N4，2026-11-09，D152–D153）
+
+- 位置：用户选 "Option A (A1+A2)"，记为 D152 合同修订；D153 实现与证据。**未提交。** 生产改动：flow custody `transaction.rs`（A1）、`quic.rs`（pub(crate) 常量）；Node `tuic/generation_slot/released.rs`（新，SlotConnection）、`recovery/waiting.rs::release_settled`、`recovery.rs`、`node.rs`，以及 maintenance/node_runtime/startup/probe/staged/udp_send 的机械 `live()/connection()/.into()`；`tuic.rs` 保持 4003 行。测试：新叶 `tuic/node/tests/waiting_release.rs`（T1）、`close_tail.rs` +5（T2）、node recovery/drive_panic/fatal_settle 期望按合同更新、`native_n4_recovery.rs` task 归因（2×relay 客户端地址）。raw：`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-20261109/d152/`。
+- 结果：T1/T2/M4c 绿；m-a2 ⇒ T1+M4c RED，m-a1 ⇒ T2 RED（sha 已还原）；governance 7/7；units+Node 27/27；M3 30s 黑洞 3.6s 恢复。8 个既有未门禁失败经基线副本复现（D153 列表），不属本次。
+- 未完成（按顺序）：(1) F-N4a：写 M2 单周期 tracer（旧连接 frag0 pkt7 → close → 新连接 frag1 pkt7 期望 0；同代 pkt9 两片作正对照期望 1）；若证实为测试伪迹，M2 每周期用不同 packet id；(2) M3：慢段 dcids 改用 peer connections（D150 计划），重跑 8s 黑洞，若仍 >2s，先用 QUIC stats 验证 PTO 退避假设，再报告（不放宽）；(3) **F-N4d 需父会话/用户决定**：原始 pending demand 期间的 open 等满 2×5s（M4a/b 10.07s > F6 6s；D150 已存在）——选项：open 在槽已知关闭时快速失败（Node 生产改动）或把界定义为 demand 预算（阈值修订）；(4) M5(ii) 由窗口链推导、M7 burst 方法；(5) 各格变异、M1 120s+批量、O-N2b release n=5、fmt、全门 `n4-gate2-`（14 组 + n4），失败按 D9/D11 类或 NEW 分类；(6) 父会话开 N4 独立审查。
+- 运行：`CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=target cargo test --offline --features harness --lib --no-run`；`target/debug/deps/mini_vpn-38e8a4ca41212e00 native_n4_recovery --nocapture --test-threads=1`（约 4 分钟）。rustfmt 只检查了新文件。
+- 不授权：N3、N5/C8、TUN、VPS、WAN、M2 验收、sudo、新 key 落盘、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。
+
+## 新会话交接（N4，2026-11-09，D154–D155）
+
+- 位置：**未提交。** 生产改动只多了 D154：`tuic/tcp_open/staged.rs`（`recovery_bound`、`open_bound()`；sha 4d9e96cb…）。测试：`native_waiting.rs`（Storm::aligned + 新 tracer `n2_a6_storm_aligned_original_attempt_opens_settle_within_6s`）、`node/tests/mod.rs`（NativeConnectionSample.closed）、`native_n4_recovery.rs`（F-N4a 单周期 tracer、M2 每周期 packet id、M3 慢段改 peer connections）、`native_n4_harness.rs`（foreign_heads）、`native_n4_pressure.rs`（M5(ii) 窗口链界）。探针全部移除。raw：`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-20261109/d154/`。
+- 结果：F-N4d 绿 + 变异 RED；回归 tcp_open 24/24、node 100/100、native_waiting 12/12；M2 绿、M4a/b 绿、M5 绿；M3 只剩 8s 黑洞 2s 界 RED（4.2–5.9s）。
+- **停止原因：M3 冻结 2s 界在负载下物理不可达（RFC 9002 PTO 退避，证据 m3probe/m3-probe.log）。需用户批准修订（提议 ≤H+1s=9s，并断言抬起后首包为 PTO 探测），或选择其它选项（D155）。**
+- 获批后按顺序：改 M3 阈值并重跑；M7 link（`rig_links(…,512)` 启动即 DeviceFailedSettled，原因未查——先找 PacketLink/设备容量上限）与 burst 方法；各格变异（M2 = retire_generation 不清，用单周期 tracer 验证）；M1 120s+批量；O-N2b release n=5；governance + fmt；全门 `n4-gate2-`（14 组 + n4），按 D9/D11 类或 NEW 分类，并核对 D153 的 8 个既有失败；更新文档；父会话开 N4 审查。
+- 运行：`CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=target cargo test --offline --features harness --lib --no-run`；`target/debug/deps/mini_vpn-38e8a4ca41212e00 n4_m3_slow --nocapture --test-threads=1`（约 100s）。
+- 不授权：N3、N5/C8、TUN、VPS、WAN、M2 验收、sudo、新 key 落盘、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。
+
+## 新会话交接（N4，2026-11-10，D156）
+
+- 位置：同 D154–D155 交接块（未提交；生产改动 = D152/D153 + D154 `staged.rs`）。D156 已记录用户决定（M3 8s 黑洞界 ≤H+1s + "抬起后首包是 PTO 探测"断言），**尚未实现**。
+- 下一步（按顺序）：
+  1. M3：`native_n4_recovery.rs` 8s 断言改 `<= outage + 1s`；在 `Tap`（`native_rebuild_high_rtt.rs`）加一个有界、只记时间/方向/长度的 post-lift 记录（**勿**复用 D155 的 20 万条探针；它在 Tap 锁下拖垮过 30s 恢复），断言：每方向 lift 后第一批数据报 ≤2 个、在对端首次回包之前发出，且 lift 到该批之间两向 0 包。先给出可观测定义写进 D157，再找一个让它变红的生产变异（候选：Node 在 path 恢复/定时器上主动发非探测流量，例如把 keep-alive 设到 ≤100ms 后验证是否仍被 cwnd 挡住；若无可行变异，按停止规则报告）。
+  2. M7：`rig_links(…,1,512)` 启动即 `DeviceFailedSettled`（原因未查：先在 PacketLink/设备启动路径找容量上限或 preflight `native_app_cold` 随 link 增长被拒），修测试并定 burst 方法。
+  3. 各格变异（配方 `n2-waiting-20261108/mut/`、`n2-steady-20261108/mut/`；M2 用单周期 tracer 验证 retire_generation 变异）；M1 120s+批量；O-N2b release n=5；governance + fmt（`staged.rs` 827/848 与 node/tests 子模块的 fmt 差异非本轮引入）；全门 `n4-gate2-`（14 组 + n4），失败分 D9/D11 类或 NEW，并核对 D153 的 8 个既有失败。
+  4. 更新 STATUS/HANDOFF/TODO/LEARNINGS/DECISIONS/设计 §10，停止，父会话开 N4 独立审查。
+- raw：`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-20261109/d154/`。运行命令同上块。
+- 不授权：N3、N5/C8、TUN、VPS、WAN、M2 验收、sudo、新 key 落盘、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。
+
+## 新会话交接（N4，2026-11-10，D157–D158）
+
+- 位置：**未提交。** 生产数据面无新改动（同 D154）。D157：M3 按 D156 实现（`Tap::trace_window` 有界 4096 记录 + `native_n4_recovery::loss_probe`；8s 黑洞 ≤H+1s；首个抬起后突发 ≤2 且退避比 ≥1.5），GREEN 4.68/5.49s；变异 quinn-proto `MAX_BACKOFF_EXPONENT` 16→0 ⇒ 只有探测断言 RED，sha 已复原。D158：M7 启动修复（fixture `service_slots`，link=slots=512）+ RX 计量改为 harness `with_test_rx_counter`；M7 除"单 poll RX ≤128"外全绿，实测 214（来源 `timer_active_flow`/`remote_payload_deferred_delayed` 的 drain，每次上限 256，非 coop）。
+- **停止原因：D145 M7 "单 poll RX ≤128" 前提不成立，需用户/父会话选 D158 (A)/(B)/(C)。** 推荐 (A)。
+- 获批后按顺序：M7 按选项实现并验证变异；各格变异（配方 `n2-waiting-20261108/mut/`、`n2-steady-20261108/mut/`；M2 用单周期 tracer）；M1 120s+批量；O-N2b release n=5；governance（7/7 当前绿）+ fmt；全门 `n4-gate2-`（14 组 + n4），失败分 D9/D11 类或 NEW，核对 D153 的 8 个既有失败；更新 STATUS/TODO/LEARNINGS/设计 §11 格表。
+- raw：`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-20261109/d157/`（m3-green-1.log、mut/、m7-2.log、m7probe/）。运行：`CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=target cargo test --offline --features harness --lib --no-run`；`target/debug/deps/mini_vpn-38e8a4ca41212e00 n4_m7 --nocapture --test-threads=1`（30s）、`n4_m3_slow`（100s）。
+- 不授权：N3、N5/C8、TUN、VPS、WAN、M2 验收、sudo、新 key 落盘、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。
+
+## 新会话交接（N4，2026-11-10，D159）
+
+- 位置：**未提交。** 生产数据面无新改动（同 D154 `staged.rs`）。D157 M3 绿 + 变异 RED；D158/D159 M7 绿（主接收 ≤128、总 ≤512 槽；用户 "Option A"）+ 去 b2 变异 RED（driver.rs sha 已复原）。测试/harness 改动：`native_n4_recovery.rs`（loss_probe）、`native_rebuild_high_rtt.rs`（trace_window）、`native_n4_pressure.rs`（M7 计量/断言）、`native_waiting.rs`（rig_links slots + Rig::rx_installed）、`fixture/native.rs`（build/service_slots）、`harness/loopback.rs` + `loopback/tests/egress.rs`（cfg(test) RX 计数钩子）。governance 7/7；以上文件 fmt 只动了本轮行。
+- 下一（按顺序，各格变异每个只让本格 RED、恢复后核 sha；位置见设计 §4 与 D150）：M1（短流 release 跳过）、M2（retire_generation 保留残片，用单周期 tracer `n4_m2_single_cycle_fragment_generation_tracer` 核）、M4（MA7b Waiting 忽略 stop；MA6 ⇒ DCID）、M5（每流窗口去界 / MA5b）、M6（去源停顿）；M1 120s+8MiB 批量；O-N2b 同测试 `--release` n=5；全门 `n4-gate2-`（runner 复制 `/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-d147-20261109/runner/`，14 组 + n4），失败分 D9/D11 类或 NEW，核 D153 的 8 个既有失败；更新 STATUS/TODO/LEARNINGS/DECISIONS/设计 §11；停，父会话开 N4 独立审查。
+- 运行：`CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=target cargo test --offline --features harness --lib --no-run`；`target/debug/deps/mini_vpn-38e8a4ca41212e00 <filter> --nocapture --test-threads=1`（n4_m3_slow ≈100s，n4_m7 30s）。raw：`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-20261109/d159/`、`…/n4-20261109/d157/`。
+- 不授权：N3、N5/C8、TUN、VPS、WAN、M2 验收、sudo、新 key 落盘、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。
+
+## 新会话交接（N4，2026-11-10，D160）
+
+- 位置：**未提交。** 无生产改动（只有 N4 触及语句的 fmt，governance 7/7，可编译）。D160：变异扫描 + O-N2b 完成；**停止**：MA6 存活、M6 变异位置无效。
+- 结果：m2-keepfrag/m5-MA5b 只红本格；m1-norelease、m4-MA7b 本格红，但因停止/释放路径共享，全部 11 个都红（构造使然）；**m4-MA6 全绿**（30s 黑洞受握手约束，dcids 3=界 3）；**m6-nostall 无效**（停止超时 + 循环饥饿，M1/M5 连带；Native 源停顿不是 64KiB reader 窗口）。O-N2b release n=5：比值 1.006 ≤1.15 通过。
+- 待批（D160 提议）：(1) M4 以 MA7b 为变异，MA6 记为 30s 窗口内等价、由 N2 A6-60 覆盖；(2) M6 先探针找 Native 源停顿的 owner，再在该处变异并重扫；(3) 接受 m1/MA7b 的跨格红。之后：M1 120s → `n4-gate2-`（runner `/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-gate2-20261110/runner/gate.sh`，含 preexisting 组）→ 最终文档 → 父会话开 N4 审查。
+- raw：/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-20261109/fin/。不授权：N3、N5/C8、TUN、VPS、WAN、sudo、新 key、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。
+
+## 新会话交接（N4，2026-11-10，D162）
+
+- 位置：**未提交。** 无生产改动。D161 获批执行：M1 120s+批量 **绿**；gate `n4-gate2-` 跑完；M6 源停顿 owner = QUIC 连接级 MAX_DATA（探针），m6-nocredit 只红 M6 但通过 delivery 失败，且对端仍在 29.5MB 停顿。
+- **停止原因**：(a) joint/joint2 10/9 个 NEW 类失败，已归因 D152 A1（去 A1 全过，`fin/a1attr/`）：测试仍按旧"到期即 Q"计时；(b) M6 在干净树上 1 次 delivery 停顿（一条流 2.37MB/4MiB），其它 4 次通过 ⇒ 间歇。
+- 待批（D162 计划）：(1) 10 个测试的期望 Q 时间改成 D152 合同（deadline+PROVIDER_LOSS_BOUND），用 m-a1 验证会变红；(2) M6 重跑 ×5，带每流 drain 统计，复现则先探针定 owner；(3) 之后再定 M6 变异；(4) 重跑 joint×2 + n4，写最终文档。
+- raw：`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-20261109/fin/`、`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-gate2-20261110/`。不授权：N3、N5/C8、TUN、VPS、WAN、sudo、新 key、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。
+
+## 新会话交接（N4，2026-11-10，D164）
+
+- 位置：**未提交。** 无生产改动（只改测试；m-a1 和探针都已 sha 还原）。D163 = "Approve D162" 已记录。
+- 已完成：7 个硬 Native 测试对齐 A1 的 Q 时钟（父期限时不 Q，Q ≥ provider deadline，且确用了一次延长）。基线 ×4 全绿；m-a1 下 7/7 红。M6 单独跑 ×5 全绿（drain 12.7–13.7s），未复现。
+- **停止原因**：(a) direct_local_cancel ×2 在 A1 下变成干净结算（DeviceSettled，预算 0，无 first failure），与"仍断言 Q"冲突，已还原到 HEAD；(b) chunk_loaded_reset 的 Q 时间不确定（+0.6ms 到 +20s）：致命 Native disposal 按值拷贝了 `flow.stop_deadline`，与 A1 延长竞态（跨 owner），已还原到 HEAD。
+- 待批：D164 计划 (a)–(d)。
+- raw：`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-d163-20261110/`。不授权：N3、N5/C8、TUN、VPS、WAN、sudo、新 key、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。
+
+## 新会话交接（N4，2026-11-10，D166）
+
+- 位置：**未提交。** D165 = 用户 "Settle rules first"。D166 已完成：关闭尾结算模型 `docs/current/n4-close-tail-model-20261110.md`（T1–T9）；生产改动只在 flow custody + roles/failure：新增 `transaction/stop_deadline.rs`（StopDeadline，只读 Deref；open/rearm/grant/limit），8 处 clamp 都改走 `limit`，去掉 OriginalDisposal 的期限拷贝。close_tail 新增 2 个 tracer（红→绿，m-immune 红；m-a1 下 4 行红）。reset 硬 ack-debt 行接受 T8\|T9，10/10 绿。governance 7/7。
+- **停止原因**：D164(a) direct_local_cancel 硬 "≤P 干净结算" 不确定（2/7）。失败结局：P 时 Q，flow 与 roles 都已 Q，provider 仍 Retiring+lease，first=None；Q 的时间和 owner 还没探针确认（假设 T8）。该文件已还原到 HEAD。
+- 待批：D166 计划 (1) 探针；(2a) T8\|T7 析取，或 (2b) 合同修订，让 egress 期限让给 A1；(3) 非硬 ×6 基线失败另立。之后 M6（门负载）+ 变异，joint×2 + 全门（新前缀）+ 最终裁决。
+- raw：`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-d165-20261110/`。不授权：N3、N5/C8、TUN、VPS、WAN、sudo、新 key、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。
+
+## 新会话交接（N4，2026-11-10，D168）
+
+- 位置：**未提交。** D167 = 用户 "2a: accept either"（已记录）。D168：探针（源码已还原到 HEAD，sha OK），无生产/测试改动。
+- **停止原因**：direct 硬 held 行 12 次：T7 11/12（parent+10.5s 干净结算）；1/12 在 ≈P（parent+19.99s）由 `rebuild::drive` 发布 Q，provider 仍 Retiring+lease ⇒ 模型 T6，不是 T8/T9。D166 的 T8 假设被证伪。为何 provider 租约超过 P（QUIC idle 只有 15s）未定位。
+- 附带：没有任何 gate 组选中 6 个非硬失败测试；HEAD 归因未跑。
+- 待批：D168 计划 (1) 探针定位 T6 持有者（QUIC idle/close 时间 vs 租约释放；含并行负载）；(2) H1 ⇒ direct ×3 接受 {T7,T6}；H2 ⇒ 缺陷，先测后修。之后 D167 步骤 3–5。
+- raw：`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-d167-20261110/`。不授权：N3、N5/C8、TUN、VPS、WAN、sudo、新 key、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。
+
+## 新会话交接（N4，2026-11-10，D170）
+
+- 位置：**未提交。** D169 = 用户 "Approve D168"。D170：探针定为 H1（单向丢包时，对端重传会合法地重置客户端 QUIC idle 计时，再加上 A2 约 10.5s 的释放 ⇒ 退役晚于 P ⇒ T6 合法）。唯一的测试改动：`tuic_service/tests/native_direct_local_cancel.rs` 的硬 held ×2 只接受 T7\|T6，20/20 绿（T7 ×14，T6 ×6）；m-a1 下 9/10 硬行红；governance 7/7。所有探针 sha 已还原；HEAD scratch 构建已删除。
+- 非硬 ×6：3 个在 HEAD 91ff731 上就失败（reset joins_with_original_first_error、direct 两个 retires_peer，并入 D153 列表）；3 个由 A1 引起（direct 两个 holds_unretired、reset keeps_original_debt_to_parent_q，m-a1 下通过）。没有任何 gate 组选中这 6 个。由 A1 引起的结局：退役时 `rebuild.rs:340` 因 Session 状态为 Incomplete 发布 Q（≤P），模型里还没有这一行。
+- 下一步（D169 已授权）：(a) 读懂 legacy 状态为何是 Incomplete，然后补模型行 T10 并对齐 3 个非硬行（×10，m-a1 红）；若不合法则停下并给出修复计划；(b) 在完整 `native_n4_` 组内跑 M6 ×5，然后做 m6-nocredit；(c) joint ×2 + 全门（新前缀）+ 最终裁决文档（design §12、STATUS、TODO、LEARNINGS）。
+- raw：`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-d169-20261110/`。不授权：N3、N5/C8、TUN、VPS、WAN、sudo、新 key、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。
+
+## 新会话交接（N4，2026-11-10，D171）
+
+- 位置：**未提交。** D171：探针（源码已还原，sha OK），无生产/测试改动，只有文档。
+- **停止原因**：非硬 Incomplete 结局不合法。`release.rs` 的 `Turn::drop → quarantine_release` 做软 Q，因为 `roles/native.rs::release_ready` 要求 `producers == Some(true)`，而只有硬（有预算）source 才会取走并处置 producers。非硬 Native flow 永远不能干净释放（a9e7f2f 起就存在）。A1 只是把非硬 held 行带过 parent 期限，撞上这个缝。HEAD 失败的 `app_abort_retires_peer` 也是同一个缝。3 个 HEAD 失败行已记入 D153 列表。
+- 待批：**R1（推荐）** 只改 `native.rs::release_ready`：硬 ⇒ `producers == Some(true)`，非硬 ⇒ `producers.is_none()`（hard = `backing_meter.budget_limit().is_some()`）；先红后绿（direct 非硬 retires_peer ×2），m-r1 变异红；再探并对齐 3 个 A1 非硬行（T7|T6，reset 另含 parent 前 Q）×10，m-a1 红。**R2**：rebuild 校验拒绝非硬 Native（产品决定）。之后 D169 步骤 2–3（M6 门负载 ×5 + m6-nocredit；joint ×2 + 全门 + 裁决，含 PROVIDER_LOSS_BOUND 复审点）。
+- raw：`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-d171-20261110/`。不授权：N3、N5/C8、TUN、VPS、WAN、sudo、新 key、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。
+
+## 新会话交接（N4，2026-11-11，D174）
+
+- 位置：**未提交。** D172 = 用户 "R1: fix release check"。生产改动（N4 累计）= D147/D152/D154/D165 + D172 `roles/native.rs::release_ready`（按 profile 双向检查 producers）。测试改动：direct_local_cancel 非硬 held 并入 T7\|T6 分支；chunk_loaded_reset 非硬 keeps_original_debt 接受 E0\|T7\|T6。
+- 结果：retires_peer ×2 红→绿（m-r1 = 回退 ⇒ 红）；3 个 A1 非硬行 ×10 绿，m-a1 下 direct 行红（reset 行 E0 不敏感）；M6 组内 ×5 绿，m6-nocredit 红；全门 `n4-gate3-20261110` joint ×2 843/843 绿，n4 10/11（M6 间歇 drain 停顿，NEW 既有），preexisting = D153 的 8 个，nonhard 5/6（`joins_with_original_first_error` 留在 D153 列表）。
+- 裁决：设计 §13。M1–M5、M7 接受；M6 交付开放。开放项：M6 停顿 owner 探针（65535B = 一个 64KiB 窗口）；PROVIDER_LOSS_BOUND 复审。
+- 下一：父会话开独立 N4 审查。raw：`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-d172-20261110/`、`.../n4-gate3-20261110/`。不授权：N3、N5/C8、TUN、VPS、WAN、sudo、新 key、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。
+
+## 新会话交接（N4 审查跟进，2026-11-11，D175–D178）
+
+- 位置：**未提交。** 只改测试与文档，无生产改动；两个临时探针（`rearm/shutdown.rs` [DEBUG-p1]、`native_chunk_loaded_reset.rs` [DEBUG-f3]）已删除，sha 还原核对通过。
+- 测试改动：`native_waiting::Rig.links`；`native_n4_harness::Bulk.handle` pub(super)；M6 打印链路丢包与未完成流的 App 视图；`native_rebuild_high_rtt::Tap::one_way`；`native_n4_peer::DELAYED_RESET_PORT`；新叶 `native_n4_zero_window.rs`（F1 RED tracer #[ignore] + 对照）与 `native_n4_one_way.rs`（F2 RED tracer #[ignore]）。
+- 结论：F1 确认（Service 端 smoltcp 无 persist）；F2 在对端 RESET 触发的关闭尾上确认（关闭+35s sticky Q）；F3 不是丢包形态，是健康连接上 bi-stream 退役不完成的缺陷候选。
+- 待用户：F1 选 (a)/(b)；F2 选 (1)/(2)；F3 下一探针（quinn 流两半状态）。F4/F9 小修未做。
+- raw：`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-probes-20261111/`。不授权：N3、N5/C8、TUN、VPS、WAN、sudo、新 key、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。
+
+## 新会话交接（N4 修复，2026-11-11，D179–D185）
+
+- 位置：**未提交。** 生产改动：`third_party/smoltcp-0.10.0/src/socket/tcp.rs`（零窗口持续探测 + 单元测试）、`flow_custody/transaction.rs` PROVIDER_LOSS_BOUND 推导（1479 行）、`transaction/stop_deadline.rs`（F4）、`tuic.rs` TUIC_RECONNECT_TIMEOUT 改 pub(crate)（同行）。测试：zero_window 与 one_way 去掉 #[ignore]，close_tail 新 3 个单元 + 访问器，fixture a1_q_deadline 读生产界。
+- 门 gate4：见 D185。停止原因：NEW-1（确定性，D181 引起）与 NEW-2（间歇，未归因）。
+- 下一（需父会话/用户确认）：(1) NEW-1：探针确认结局是 T7（released、budget 0、deadline、first failure），是则按 D167 规则让该行接受精确 {T7, T6}，m-a1 验红；否则当缺陷停。(2) NEW-2：f_full 在 capacity-serial 负载下 ×10，对比去掉 D180 的二进制，归因后再定。(3) F3：对首个 Quarantined 写入点做回溯探针 → 确定性 tracer → 修复。然后重跑 joint×2、capacity-serial、nonhard。
+- raw：`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-probes-20261111/`、`.../n4-gate4-20261111/`。不授权：N3、N5/C8、TUN、VPS、WAN、sudo、新 key、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。
+
+## 新会话交接（N4，2026-11-11，D186–D190）
+
+- 位置：**未提交。** 本轮只改测试（`native_direct_loaded_reset.rs` AckHeld 分支对齐 {T7,T6}）与文档；所有探针已删、sha 核对通过。
+- 结果：NEW-1 闭；NEW-2 非回归；gate4b joint 845/845、capacity-serial 19/19、nonhard 5/6、joint2 844/845（收尾 flake）。
+- 待用户：F3 选 (A) 或 (B)（D189）。批准后：先写确定性 RED tracer（非硬 reset，读者终态后再到一条 lane DATA），再修，再跑 `native_eof_lane_order`、硬 ordered 行、nonhard、joint ×2。
+- 不授权：N3、N5/C8、TUN、VPS、WAN、sudo、新 key、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。
+
+## 新会话交接（N4，2026-11-11，D191–D192，gate5 运行中）
+
+- 位置：**未提交。** 本会话（D175–D192）生产改动：smoltcp 零窗口持续探测（D180）、PROVIDER_LOSS_BOUND 推导 41s（D181）、StopDeadline 最小 limit（D182）、F3 接缝 `FlowMirror::discard_late_data` + `remote_payload.rs` StaleRelayReset 调用（D191/D192）。测试：zero_window、one_way、lane-order 非硬 tracer、AckHeld 对齐 {T7,T6}、close_tail 新单元、M6 打印。所有探针/变异已还原（sha 核对）。
+- 当前：全门 `n4-gate5-20261111` 在后台跑（raw `/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-gate5-20261111/`，nonhard 组新增非硬 lane-order tracer）。完成后按组报告：joint/joint2 中 `native_rebuild_fatal::hard_native_old_drain_past_deadline_expires_without_successor` 即"joint ×2"复查（单跑 10/10 绿）。
+- 已知门外既有失败（D172 基线同样失败，不在任何门组）：非硬 `native_direct_loaded_reset_holds_local_retirement_without_return_ack`、`native_permit_loaded_app_abort_with_held_peer_keeps_charged_root`。
+- 下一：读 gate5 结果 → 更新 STATUS/DECISIONS（D193）→ 报告父会话；之后由用户决定提交。不授权：N3、N5/C8、TUN、VPS、WAN、sudo、新 key、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。

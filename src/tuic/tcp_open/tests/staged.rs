@@ -150,7 +150,7 @@ async fn auxiliary_open_failure_keeps_original_reconnect_policy() {
     let mut upstream = pair.upstream(UdpRelayMode::Native).await;
     let slot = Arc::new(TcpPoolGenerationSlot::new(
         1,
-        auxiliary.connection.clone(),
+        auxiliary.connection.clone().into(),
         1,
         1,
         upstream.clock,

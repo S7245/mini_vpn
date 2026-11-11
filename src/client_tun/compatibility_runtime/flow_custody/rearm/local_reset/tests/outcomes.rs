@@ -537,7 +537,7 @@ impl RejectedFlow {
         let id = contexts[&handle].flow_mirror.as_ref().unwrap().id;
         assert_eq!(
             Some(reset.deadline.into_std()),
-            owner.opens().flow_mut(id).unwrap().stop_deadline
+            *owner.opens().flow_mut(id).unwrap().stop_deadline
         );
         assert!(!reset.committing && !reset.quarantined());
         assert_eq!(upstream.0.load(std::sync::atomic::Ordering::SeqCst), 1);

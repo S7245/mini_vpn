@@ -507,7 +507,11 @@ impl Roles {
         self.data_disposed() && self.uplink_observer.is_none() && self.writer_callbacks.is_none() && !self.stock_retiring && self.stock.as_ref().is_none_or(stock::Inventory::done)
     }
     pub(super) fn release_ready(&self) -> bool {
-        self.settled() && self.prepared.is_none() && self.retained_producers.is_none() && self.producers == Some(true)
+        // D172: only a hard (budgeted) source owns producers to dispose; a non-hard
+        // flow's producers leave with its mirror, so it must never have taken them.
+        let hard = self.backing_meter.as_ref().is_some_and(|meter| meter.budget_limit().is_some());
+        self.settled() && self.prepared.is_none() && self.retained_producers.is_none()
+            && if hard { self.producers == Some(true) } else { self.producers.is_none() }
             && self.starts.iter().all(Option::is_none) && self.stops.iter().all(Option::is_none)
             && self.pump_start.is_none() && self.pump_failures.is_empty()
             && self.pump_panics.iter().all(Option::is_none)

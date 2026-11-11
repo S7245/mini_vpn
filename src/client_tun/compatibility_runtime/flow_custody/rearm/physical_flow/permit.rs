@@ -226,6 +226,20 @@ impl FlowMirror {
         !self.quarantined
     }
 
+    /// D191 seam: DATA that reaches a relay already closed by a terminal or
+    /// reset (late DATA) settles the in-flight event as discarded, so every
+    /// begun event ends in exactly one disposition (hard and non-hard alike).
+    pub(in crate::client_tun) fn discard_late_data(
+        ctx: &mut SocketCtx,
+        bytes: usize,
+        permit: &mut Option<DownstreamBytePermit>,
+    ) -> bool {
+        match &mut ctx.flow_mirror {
+            Some(mirror) if mirror.event_in_flight => mirror.discard_data_permit(bytes, permit),
+            _ => true,
+        }
+    }
+
     pub(super) fn pending_permits_match(
         &self,
         bytes: usize,

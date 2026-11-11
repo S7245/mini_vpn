@@ -253,7 +253,7 @@ async fn run(fault: Fault) {
         retire(&mut physical).await;
         assert!(providers_retired(&physical));
         let flow_deadlines =
-            [a, b].map(|id| physical.owner.opens().flow_mut(id).unwrap().stop_deadline);
+            [a, b].map(|id| *physical.owner.opens().flow_mut(id).unwrap().stop_deadline);
         for id in [a, b] {
             assert_eq!(
                 physical.owner.opens().flow_mut(id).unwrap().stage,

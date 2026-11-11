@@ -30,6 +30,8 @@ use tokio::sync::mpsc;
 const RELAY_QUEUE: usize = 4096;
 /// Bounded relay datagram log (C3 relay-side timestamps); overflow counted.
 const RELAY_LOG: usize = 8192;
+/// N4 M3 (D157): bounded per-hole datagram trace `(at, dir, len)`.
+pub(super) const TRACE_CAP: usize = 4096;
 const LOCAL_SLACK: Duration = Duration::from_millis(300);
 const MAX_ACK_DELAY: Duration = Duration::from_millis(25);
 const GRANULARITY: Duration = Duration::from_millis(1);
@@ -77,8 +79,15 @@ pub(super) struct Tap {
     blackhole: Option<(usize, Dir, Instant)>,
     /// N2: discard every datagram of every generation in `[from, until)`.
     outage: Option<(Instant, Instant)>,
+    /// N4 review F2: discard every `dir` datagram of every generation in `[from, until)`.
+    one_way: Option<(Dir, Instant, Instant)>,
     /// N2: deterministic loss, every Nth datagram per (generation, dir).
     loss_every: Option<u64>,
+    /// N4 M3: in `[from, until)` add `extra` one-way delay and drop every Nth.
+    slow: Option<(Instant, Instant, Duration, u64)>,
+    /// N4 M3 (D157): record every datagram in `[from, until)` into `trace`.
+    window: Option<(Instant, Instant)>,
+    pub(super) trace: Vec<(Instant, Dir, usize)>,
     /// N2: every Up QUIC Initial (time, DCID id), independent of `log`; ≤1024.
     pub(super) initials: Vec<(Instant, u64)>,
     pub(super) log: Vec<Seen>,
@@ -97,10 +106,20 @@ impl Tap {
         let planned = self.plan.contains(&(generation, dir, ordinal));
         self.hits += usize::from(planned);
         let holed = self.blackhole.is_some_and(|(g, d, from)| g == generation && d == dir && at >= from);
-        let out = self.outage.is_some_and(|(from, until)| at >= from && at < until);
-        let lossy = self.loss_every.is_some_and(|n| ordinal % n == n - 1);
+        let out = self.outage.is_some_and(|(from, until)| at >= from && at < until)
+            || self.one_way.is_some_and(|(d, from, until)| d == dir && at >= from && at < until);
+        let slow = self
+            .slow
+            .is_some_and(|(from, until, _, n)| at >= from && at < until && ordinal % n == n - 1);
+        let lossy = slow || self.loss_every.is_some_and(|n| ordinal % n == n - 1);
         let injected = planned || holed || out || lossy;
         self.injected += u64::from(injected);
+        let traced = self
+            .window
+            .is_some_and(|(from, until)| at >= from && at < until);
+        if traced && self.trace.len() < TRACE_CAP {
+            self.trace.push((at, dir, len));
+        }
         let initial = initial_dcid(bytes);
         if let Some(id) = initial.filter(|_| dir == Dir::Up && self.initials.len() < 1024) {
             self.initials.push((at, id));
@@ -125,6 +144,25 @@ impl Tap {
     /// N2: full-path outage (both directions, every client socket).
     pub(super) fn outage(&mut self, from: Instant, until: Instant) {
         self.outage = Some((from, until));
+    }
+    /// N4 review F2: one-way outage (`dir` only, every client socket).
+    pub(super) fn one_way(&mut self, dir: Dir, from: Instant, until: Instant) {
+        self.one_way = Some((dir, from, until));
+    }
+    /// N4 M3: slow window (extra one-way delay + every `n`th dropped).
+    pub(super) fn slow(&mut self, from: Instant, until: Instant, extra: Duration, n: u64) {
+        self.slow = Some((from, until, extra, n.max(1)));
+    }
+    /// N4 M3 (D157): restart the bounded trace for `[from, until)`.
+    pub(super) fn trace_window(&mut self, from: Instant, until: Instant) {
+        self.window = Some((from, until));
+        self.trace.clear();
+    }
+    /// Extra one-way delay for a datagram observed at `at`.
+    fn extra(&self, at: Instant) -> Duration {
+        self.slow
+            .filter(|(from, until, ..)| at >= *from && at < *until)
+            .map_or(Duration::ZERO, |s| s.2)
     }
     /// N2: drop every `n`th datagram of each (generation, dir), both ways.
     pub(super) fn loss_every(&mut self, n: u64) {
@@ -199,10 +237,15 @@ impl RttRelay {
                         children.push(tokio::spawn(async move {
                             let mut buf = vec![0u8; 65536];
                             while let Ok((n, _)) = up.recv_from(&mut buf).await {
-                                if taps.lock().unwrap().observe(generation, Dir::Down, &buf[..n]) {
-                                    continue;
-                                }
-                                let item = (Instant::now() + one_way, buf[..n].to_vec(), client);
+                                let now = Instant::now();
+                                let extra = {
+                                    let mut tap = taps.lock().unwrap();
+                                    if tap.observe(generation, Dir::Down, &buf[..n]) {
+                                        continue;
+                                    }
+                                    tap.extra(now)
+                                };
+                                let item = (now + one_way + extra, buf[..n].to_vec(), client);
                                 if back.try_send(item).is_err() {
                                     lost.fetch_add(1, Ordering::Relaxed);
                                 }
@@ -212,10 +255,17 @@ impl RttRelay {
                         (generation, line)
                     }
                 };
-                if taps.lock().unwrap().observe(generation, Dir::Up, &buf[..n]) {
-                    continue;
-                }
-                if line.try_send((now + one_way, buf[..n].to_vec(), server)).is_err() {
+                let extra = {
+                    let mut tap = taps.lock().unwrap();
+                    if tap.observe(generation, Dir::Up, &buf[..n]) {
+                        continue;
+                    }
+                    tap.extra(now)
+                };
+                if line
+                    .try_send((now + one_way + extra, buf[..n].to_vec(), server))
+                    .is_err()
+                {
                     lost.fetch_add(1, Ordering::Relaxed);
                 }
             }

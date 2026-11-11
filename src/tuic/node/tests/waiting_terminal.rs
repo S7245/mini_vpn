@@ -8,7 +8,7 @@ use super::running::boot;
 use super::startup::{config, finish, guarded, server};
 
 /// Slot 1 of a pool=2 Node: two refused handshakes ⇒ clean expiry ⇒ parked.
-async fn park_slot_one(
+pub(super) async fn park_slot_one(
     host: &mut NodeHost,
     server: &Endpoint,
     peers: &[Connection],

@@ -421,7 +421,12 @@ impl TerminalPool {
                     slot: slot.index,
                     current,
                     identity: generation.identity(),
-                    physical_drained: false,
+                    // D152 (A2): Waiting already retired this physical entry.
+                    physical_drained: current
+                        && owner
+                            .state()
+                            .recovery
+                            .released(slot.index, generation.identity()),
                     activity: generation.activity.clone(),
                     writes: generation.write_pressure.clone(),
                     reads: generation.read_pressure.clone(),
@@ -502,6 +507,15 @@ impl TerminalPool {
             }
         }
         for generation in &self.generations {
+            // Address-based stable ids are unique among live storage only; a
+            // drained (D152: Waiting-released) generation's id may be reused.
+            let live = self
+                .generations
+                .iter()
+                .filter(|g| {
+                    !g.physical_drained && g.identity.stable_id == generation.identity.stable_id
+                })
+                .count();
             if generation.slot >= count
                 || physical
                     .connections
@@ -509,11 +523,12 @@ impl TerminalPool {
                     .flatten()
                     .filter(|entry| entry.stable_id == Some(generation.identity.stable_id))
                     .count()
-                    != usize::from(!generation.physical_drained)
+                    != live
+                || live > 1
                 || self
                     .generations
                     .iter()
-                    .filter(|g| g.identity.stable_id == generation.identity.stable_id)
+                    .filter(|g| g.slot == generation.slot && g.identity == generation.identity)
                     .count()
                     != 1
             {

@@ -116,7 +116,7 @@ mod full_signal {
             let flow = opens.flow_mut(id).unwrap();
             assert!(flow.physical && flow.roles.is_none());
             flow.roles = Some(roles);
-            flow.roles.as_mut().unwrap().take_native_start(&owner, id, None).unwrap()
+            flow.roles.as_mut().unwrap().take_native_start(&owner, id).unwrap()
         };
         assert!(start.dispose(&owner, &mut Context::from_waker(std::task::Waker::noop())));
         let monitor_stop = owner.opens().flow_mut(id).unwrap().roles.as_mut().unwrap()
@@ -180,7 +180,7 @@ mod full_signal {
             let ctx = contexts.get_mut(&id.handle).unwrap();
             if mode == 4 { ctx.conn_epoch += 1; }
             let turn = owner.opens().flow_mut(id).unwrap().roles.as_mut().unwrap()
-                .take_native_producers(&owner, id, ctx, Some(deadline.into_std()));
+                .take_native_producers(&owner, id, ctx);
             if mode == 4 {
                 assert!(turn.is_none());
                 assert!(ctx.uplink_tx.as_ref().unwrap().same_channel(&tx) && ctx.relay_read_credit_tx.is_some());
@@ -204,7 +204,7 @@ mod full_signal {
                     let native = roles.native.as_ref().unwrap();
                     assert!(native.retained_producers.is_some());
                     assert!(native.source.as_ref().unwrap().producer_payload_matches(&producer_box));
-                    assert!(roles.take_native_producers(&owner, id, ctx, Some(deadline.into_std())).is_none(), "empty endpoints cannot retry partial Drop into success");
+                    assert!(roles.take_native_producers(&owner, id, ctx).is_none(), "empty endpoints cannot retry partial Drop into success");
                 }
             }
             if mode < 5 {

@@ -238,70 +238,91 @@ async fn exercise(ending: Ending, hard: bool) {
             fixture::observe_failed_native_stop(service.run(), &handle, original_deadline, None).await;
             return;
         }
-        if ending.held() {
-            let held_owner=hard.then(||saved.session.lock().unwrap().as_ref().unwrap().upgrade().unwrap());
-            let mut observed_first=None;
-            let completed = if let Some(observing)=held_owner.as_ref() {
-                let mut run=Box::pin(service.run());
-                tokio::time::timeout_at(original_deadline,std::future::poll_fn(|cx| {
-                    let result=run.as_mut().poll(cx);
-                    assert_eq!(Some(observing.flow_contracts()[0].id),original_id);
-                    let current=fixture::hard_q_refusal(observing,&saved,ending.parent_stop());
-                    if observed_first.is_some() { assert_eq!(current,observed_first); }
-                    else if current.is_some() { observed_first=current; }
-                    result
-                })).await
-            } else { tokio::time::timeout_at(original_deadline, service.run()).await };
-            assert!(completed.is_err());
-            assert!(tokio::time::Instant::now() >= original_deadline);
-            tokio::time::timeout_at(original_deadline + Duration::from_millis(100), async {
-                while handle.phase() != Phase::Quarantined {
-                    assert!(
-                        tokio::time::timeout(Duration::from_millis(10), service.run())
-                            .await
-                            .is_err(),
-                        "unretired direct provider falsely completed after parent deadline"
-                    );
-                }
-            })
-            .await
-            .expect("original Service did not publish parent Q after deadline");
+        let report = if ending.held() {
+            // D169 (docs/current/n4-close-tail-model-20261110.md T7|T6): the held
+            // provider is the flow's only wait and survives the parent limit on
+            // its one A1 extension to P. T7: QUIC idle plus the Node's
+            // dead-connection release retire it within P; the Service settles
+            // clean. T6: the peer's retransmissions into the one-way blackhole
+            // legally re-arm the client idle timer, the witness outlives P and
+            // the second expiry is sticky Q. No other ending passes. D172: the
+            // non-hard profile takes the same two endings (R1 release check);
+            // it has no budget and never retains a first failure.
             let owner = saved.session.lock().unwrap().as_ref().unwrap().upgrade().unwrap();
-            let flow = owner.flow_observation().unwrap();
-            let contracts = owner.flow_contracts();
-            assert_eq!(contracts.len(), 1);
-            assert_eq!(Some(contracts[0].id), original_id);
-            let provider = owner.flow_native_provider_view().unwrap();
-            let ledger = owner.ledger();
-            eprintln!("direct cancel ACK-held parent: completed={} phase={:?} flow={flow:?} provider={provider:?} Q={} rx_dropped={}",
-                completed.is_ok(), handle.phase(), ledger.quarantined, fault.snapshot().counts.rx_dropped_datagrams);
-            assert_eq!(handle.phase(), Phase::Quarantined);
-            assert_eq!((flow.joined, flow.released, flow.f), (4, 0, 1));
-            assert_eq!(flow.last_data_disposition, None);
-            assert_eq!(provider.phase, TcpOpenPhase::Retiring);
-            assert!(provider.lease_held && provider.retirement_pending);
-            assert!(ledger.quarantined);
-            if !hard { assert!(ledger.first_failure.is_none()); }
-            drop(ledger);
-            assert!(fault.snapshot().counts.rx_dropped_datagrams > 0);
-            assert_eq!(*saved.deadline.lock().unwrap(),Some(original_deadline));
-            assert_eq!(owner.ledger().shutdown_deadline,Some(original_deadline));
-            if let Some(original)=held_owner.as_ref() {
-                assert!(Arc::ptr_eq(original,&owner));
-                let budget=saved.backing_budget.as_ref().unwrap();
-                assert!(budget.quarantined() && budget.used()>0);
-                for _ in 0..2 {
-                    let current=fixture::hard_q_refusal(original,&saved,ending.parent_stop());
-                    if observed_first.is_some() { assert_eq!(current,observed_first); }
-                    else if current.is_some() { observed_first=current; }
-                    assert!(tokio::time::timeout(Duration::from_millis(5),service.run()).await.is_err());
-                    assert_eq!(*saved.deadline.lock().unwrap(),Some(original_deadline));
+            let id = original_id.unwrap();
+            let mut run = Box::pin(service.run());
+            assert!(tokio::time::timeout_at(original_deadline, run.as_mut()).await.is_err(),
+                "held provider settled before the parent limit");
+            let provider_deadline = fixture::a1_q_deadline(&owner, original_deadline);
+            let mut observed_first = None;
+            let refusal = |owner: &Arc<SessionControl>| if hard {
+                fixture::hard_q_refusal(owner, &saved, ending.parent_stop())
+            } else {
+                assert!(fixture::first_failure_identity(owner).is_none());
+                None
+            };
+            let mut tail = None;
+            let ended = tokio::time::timeout_at(provider_deadline + Duration::from_secs(1), std::future::poll_fn(|cx| {
+                let result = run.as_mut().poll(cx);
+                // A T7 release removes the row; keep the last A1 tail it showed.
+                if let Some(contract) = owner.flow_contracts().first() {
+                    assert_eq!(contract.id, id);
+                    tail = owner.flow_provider_tail_for_test(id);
                 }
-                if let Some(first)=observed_first { assert_eq!(fixture::first_failure_identity(original),Some(first)); }
-            }
-            return;
-        }
-        let report = tokio::time::timeout_at(original_deadline, service.run()).await.unwrap();
+                let current = refusal(&owner);
+                if observed_first.is_some() { assert_eq!(current, observed_first); }
+                else if current.is_some() { observed_first = current; }
+                match result {
+                    std::task::Poll::Ready(report) => std::task::Poll::Ready(Some(report)),
+                    std::task::Poll::Pending if handle.phase() == Phase::Quarantined => std::task::Poll::Ready(None),
+                    std::task::Poll::Pending => std::task::Poll::Pending,
+                }
+            })).await;
+            let at = tokio::time::Instant::now();
+            drop(run);
+            let ended = ended.unwrap_or_else(|_| {
+                let ledger = owner.ledger();
+                panic!("neither T7 nor T6 by P+1s: phase={:?} session_q={} first={:?} flow={:?} provider={:?} debug={:?}",
+                    handle.phase(), ledger.quarantined, ledger.first_failure.as_ref().map(|f| f.facts()),
+                    owner.flow_observation(), owner.flow_native_provider_view(), owner.flow_debug())
+            });
+            eprintln!("[D169-direct-ending] {} at_after_parent={:?} provider_deadline_after_parent={:?}",
+                if ended.is_some() { "T7" } else { "T6" }, at - original_deadline, provider_deadline - original_deadline);
+            assert_eq!(tail, Some((Some(provider_deadline), true)), "A1 ending without its one extension");
+            let Some(report) = ended else {
+                // T6: second expiry at P; the provider still holds its lease and witness.
+                assert!(at >= provider_deadline, "Q inside the A1 extension");
+                let flow = owner.flow_observation().unwrap();
+                let provider = owner.flow_native_provider_view().unwrap();
+                assert_eq!((flow.joined, flow.released, flow.f), (4, 0, 1));
+                assert_eq!(flow.last_data_disposition, None);
+                assert!(owner.flow_debug().iter().any(|row| row.starts_with("stage=Quarantined")));
+                assert_eq!(provider.phase, TcpOpenPhase::Retiring);
+                assert!(provider.lease_held && provider.retirement_pending);
+                assert!(owner.ledger().quarantined);
+                assert!(fault.snapshot().counts.rx_dropped_datagrams > 0);
+                if hard {
+                    let budget = saved.backing_budget.as_ref().unwrap();
+                    assert!(budget.quarantined() && budget.used() > 0);
+                }
+                for _ in 0..2 {
+                    let current = refusal(&owner);
+                    if observed_first.is_some() { assert_eq!(current, observed_first); }
+                    else if current.is_some() { observed_first = current; }
+                    assert!(tokio::time::timeout(Duration::from_millis(5), service.run()).await.is_err());
+                    assert_eq!(handle.phase(), Phase::Quarantined);
+                    assert_eq!(*saved.deadline.lock().unwrap(), Some(original_deadline));
+                }
+                assert_eq!(owner.ledger().shutdown_deadline, Some(original_deadline));
+                if let Some(first) = observed_first { assert_eq!(fixture::first_failure_identity(&owner), Some(first)); }
+                return;
+            };
+            // T7: clean settle after the parent limit and no later than P.
+            assert!(at > original_deadline && at <= provider_deadline, "T7 outside (parent, P]");
+            report
+        } else {
+            tokio::time::timeout_at(original_deadline, service.run()).await.unwrap()
+        };
         assert_eq!(report.session, SessionDeviceState::DeviceSettled);
         assert_eq!(report.node, Some(crate::tuic::NodeShutdown::RunningResourcesSettled));
         assert_eq!(handle.phase(), Phase::Complete);

@@ -192,13 +192,20 @@ async fn local_abort_case(peer_finishes: bool, hard: bool) {
                     report = service.run() => panic!("held Native Permit peer completed before deadline: {report:?}"),
                 }
             }
+            // D152 (A1): hard Q follows the provider deadline, not the parent limit.
+            let a1 = hard.then(|| {
+                assert_eq!(phase, Phase::Incomplete, "hard Q at the parent limit: no A1 extension");
+                fixture::a1_q_deadline(&saved.session.lock().unwrap().as_ref().unwrap().upgrade().unwrap(), original_deadline)
+            });
             if phase == Phase::Incomplete {
-                tokio::time::timeout(Duration::from_secs(1), async {
+                let limit = a1.unwrap_or_else(tokio::time::Instant::now) + Duration::from_secs(1);
+                tokio::time::timeout_at(limit, async {
                     while handle.phase() != Phase::Quarantined {
                         assert!(tokio::time::timeout(Duration::from_millis(10), service.run()).await.is_err());
                     }
                 }).await.unwrap();
             }
+            if let Some(provider) = a1 { fixture::assert_a1_extended(&saved.session.lock().unwrap().as_ref().unwrap().upgrade().unwrap(), provider); }
             assert_eq!(handle.phase(), Phase::Quarantined);
             assert!(service.completion.is_none());
             let owner = saved.session.lock().unwrap().as_ref().unwrap().upgrade().unwrap();

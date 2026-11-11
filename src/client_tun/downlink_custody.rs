@@ -178,11 +178,7 @@ impl SocketCtx {
     }
 
     pub(super) fn downlink_inflight_permit_bytes(&self) -> usize {
-        self.downlink_inflight_permits
-            .permits
-            .iter()
-            .map(DownstreamBytePermit::remaining_bytes)
-            .sum()
+        self.downlink_inflight_permits.remaining_bytes()
     }
 
     #[cfg(test)]

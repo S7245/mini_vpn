@@ -312,7 +312,8 @@ async fn public_udp_custody_spans_generations_until_other_tcp_handles_retire() {
     old.connection.close(0u32.into(), b"replace generation");
     {
         let mut slot = upstream.tcp_pool_slots[0].state.lock().await;
-        slot.current = TcpPoolGeneration::new(replacement.connection.clone(), 2, 1, upstream.clock);
+        slot.current =
+            TcpPoolGeneration::new(replacement.connection.clone().into(), 2, 1, upstream.clock);
     }
     old.close().await;
     {

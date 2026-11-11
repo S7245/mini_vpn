@@ -570,7 +570,7 @@ async fn actual_tls_configuration_rejection_stops_same_config_without_retry() {
                     loop {
                         let settled = {
                             let state = owner.state();
-                            state.attempts_drained == 1
+                            state.attempts_drained == 2 // rejected candidate + D152 terminal release
                                 && state.connections.iter().flatten().all(|e| e.published)
                                 && state.recovery.preparation.is_none()
                                 && state.recovery.permit.is_none()
@@ -586,7 +586,7 @@ async fn actual_tls_configuration_rejection_stops_same_config_without_retry() {
             {
                 let state = host.resources.state();
                 assert_eq!(state.attempts_started, 3);
-                assert_eq!(state.attempts_drained, 1);
+                assert_eq!(state.attempts_drained, 2);
                 assert!(!state.quarantined && state.first.is_some());
                 assert!(
                     state
@@ -654,7 +654,7 @@ async fn actual_transient_refusal_retries_twice_with_original_spacing() {
         {
             let state = host.resources.state();
             assert_eq!(state.attempts_started, 4);
-            assert_eq!(state.attempts_drained, 2);
+            assert!((2..=3).contains(&state.attempts_drained), "2 refused (+1 D152 release)");
             assert!(!state.quarantined && state.first.is_none(), "clean expiry is Waiting, not a failure");
             assert!(state.connections.iter().flatten().all(|entry| entry.published));
         }
@@ -690,7 +690,7 @@ async fn actual_transient_refusal_retries_twice_with_original_spacing() {
         assert!(reprobes[1].duration_since(reprobes[0]) >= Duration::from_secs(2), "backoff step 2s");
         {
             let state = host.resources.state();
-            assert_eq!(state.attempts_started, 6, "exactly one handshake per re-probe");
+            assert_eq!((state.attempts_started, state.attempts_drained), (6, 4), "one handshake per re-probe; 3 refused + D152 release");
             assert!(!state.quarantined && state.first.is_none());
         }
         let sample = observer.waiting().unwrap();

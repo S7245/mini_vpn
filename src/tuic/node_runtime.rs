@@ -582,7 +582,7 @@ async fn udp_connection(
         current.note_reconnect_success();
     }
     Ok(Some((
-        current.transport.clone(),
+        current.transport.connection()?,
         current.identity().generation,
     )))
 }
@@ -1161,10 +1161,13 @@ impl TuicUpstream {
             for generation in std::iter::once(&state.current)
                 .chain(state.draining.as_ref().map(|draining| &draining.generation))
             {
-                let conn = &generation.transport;
-                if conn.close_reason().is_some() {
+                let Some(conn) = generation
+                    .transport
+                    .live()
+                    .filter(|c| c.close_reason().is_none())
+                else {
                     continue;
-                }
+                };
                 let stats = conn.stats();
                 let stable_id = conn.stable_id();
                 connections.push(EndpointRecoveryConnectionSample {

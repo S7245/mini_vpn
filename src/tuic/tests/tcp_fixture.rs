@@ -148,7 +148,7 @@ impl UdpPair {
         let clock = Instant::now();
         let slot = Arc::new(TcpPoolGenerationSlot::new(
             0,
-            self.connection.clone(),
+            self.connection.clone().into(),
             1,
             1,
             clock,
@@ -225,7 +225,7 @@ pub(crate) fn upstream_endpoint(upstream: &TuicUpstream) -> Endpoint {
 /// Passive current-generation transport observation; never reconnects or reserves.
 pub(crate) fn upstream_ready_connection(upstream: &TuicUpstream) -> Option<Connection> {
     let state = upstream.tcp_pool_slots.first()?.state.try_lock().ok()?;
-    Some(state.current.transport.clone())
+    state.current.transport.live().cloned()
 }
 
 /// Hold the actual registration lock through a caller's complete cancellation.

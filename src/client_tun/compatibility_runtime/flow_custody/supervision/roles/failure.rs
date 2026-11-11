@@ -60,7 +60,6 @@ pub(in crate::client_tun::compatibility_runtime::flow_custody) struct OriginalDi
     clock: FailureClock,
     owner: std::sync::Weak<SessionControl>,
     id: super::super::super::transaction::FlowIdentity,
-    deadline: Option<std::time::Instant>,
     armed: bool,
 }
 enum Action { Io(std::mem::ManuallyDrop<std::io::Error>), Native(native::Work) }
@@ -78,8 +77,7 @@ impl OriginalDisposal {
         })
     }
     fn earliest(&self, owner: &SessionControl) -> Option<std::time::Instant> {
-        self.deadline.into_iter()
-            .chain(owner.deadline_quiet().map(|d| d.into_std()))
+        owner.deadline_quiet().map(|d| d.into_std()).into_iter()
             .chain(self.clock.parent_deadline_for_stop().map(|d| d.into_std())).min()
     }
     pub(in crate::client_tun::compatibility_runtime::flow_custody) fn dispose(
@@ -129,7 +127,7 @@ impl OriginalDisposal {
         let producers = matches!(&self.action, Some(Action::Native(work)) if work.is_producers());
         let producers_done = matches!(&self.action, Some(Action::Native(work)) if work.producers_done());
         let flow = opens.flow_mut(self.id).unwrap(); // valid() has qualified this exact row.
-        if let Some(deadline) = deadline { flow.stop_deadline = Some(flow.stop_deadline.map_or(deadline, |old| old.min(deadline))); }
+        if let Some(deadline) = deadline { flow.stop_deadline.limit(deadline); }
         let roles = flow.roles.as_mut().unwrap();
         if let Some(Action::Native(work)) = self.action.take() { work.restore(roles.native.as_mut().unwrap()); }
         let mut additional = None;
@@ -164,7 +162,7 @@ impl Drop for OriginalDisposal {
             if let Some(flow) = opens.flow_mut(self.id).filter(|flow| flow.roles.as_ref().is_some_and(|roles|
                 roles.failure_disposal && Arc::ptr_eq(&roles.failures, &self.clock))) {
                     flow.stage = super::super::super::transaction::FlowStage::Quarantined;
-                    if let Some(deadline) = deadline { flow.stop_deadline = Some(flow.stop_deadline.map_or(deadline, |old| old.min(deadline))); }
+                    if let Some(deadline) = deadline { flow.stop_deadline.limit(deadline); }
             }
             drop(opens);
         }
@@ -182,30 +180,29 @@ impl FlowRoles {
     }
     pub(in crate::client_tun::compatibility_runtime::flow_custody) fn take_native_producers(
         &mut self, owner: &Arc<SessionControl>, id: super::super::super::transaction::FlowIdentity,
-        ctx: &mut SocketCtx, deadline: Option<std::time::Instant>,
+        ctx: &mut SocketCtx,
     ) -> Option<OriginalDisposal> {
         if self.failure_disposal || self.panic.is_some() || !FlowMirror::producer_admission_matches(ctx, id) { return None; }
         let work = self.native.as_mut()?.take_producers(&mut ctx.uplink_tx, &mut ctx.relay_read_credit_tx)?;
         self.failure_disposal = true;
-        Some(OriginalDisposal { action: Some(Action::Native(work)), clock: self.failures.clone(), owner: Arc::downgrade(owner), id, deadline, armed: true })
+        Some(OriginalDisposal { action: Some(Action::Native(work)), clock: self.failures.clone(), owner: Arc::downgrade(owner), id, armed: true })
     }
     pub(in crate::client_tun::compatibility_runtime::flow_custody) fn take_native_start(
         &mut self, owner: &Arc<SessionControl>, id: super::super::super::transaction::FlowIdentity,
-        deadline: Option<std::time::Instant>,
     ) -> Option<OriginalDisposal> {
         if self.failure_disposal || self.panic.is_some() { return None; }
         let work = self.native.as_mut()?.take_start_disposal()?;
         self.failure_disposal = true;
-        Some(OriginalDisposal { action: Some(Action::Native(work)), clock: self.failures.clone(), owner: Arc::downgrade(owner), id, deadline, armed: true })
+        Some(OriginalDisposal { action: Some(Action::Native(work)), clock: self.failures.clone(), owner: Arc::downgrade(owner), id, armed: true })
     }
     pub(in crate::client_tun::compatibility_runtime::flow_custody) fn take_native_disposal(
         &mut self, owner: &Arc<SessionControl>, id: super::super::super::transaction::FlowIdentity,
-        producer_stopped: bool, deadline: Option<std::time::Instant>,
+        producer_stopped: bool,
     ) -> Option<OriginalDisposal> {
         if self.failure_disposal || self.panic.is_some() { return None; }
         let work = self.native.as_mut()?.take_disposal(producer_stopped)?;
         self.failure_disposal = true;
-        Some(OriginalDisposal { action: Some(Action::Native(work)), clock: self.failures.clone(), owner: Arc::downgrade(owner), id, deadline, armed: true })
+        Some(OriginalDisposal { action: Some(Action::Native(work)), clock: self.failures.clone(), owner: Arc::downgrade(owner), id, armed: true })
     }
     pub(in crate::client_tun::compatibility_runtime::flow_custody) fn take_original_disposal(
         &mut self, owner: &Arc<SessionControl>, id: super::super::super::transaction::FlowIdentity,
@@ -223,7 +220,7 @@ impl FlowRoles {
             if let Some(error) = error {
                 self.failure_disposal = true;
                 return Some(OriginalDisposal { action: Some(Action::Io(std::mem::ManuallyDrop::new(error))),
-                    clock: self.failures.clone(), owner: Arc::downgrade(owner), id, deadline: None, armed: true });
+                    clock: self.failures.clone(), owner: Arc::downgrade(owner), id, armed: true });
             }
         }
         None

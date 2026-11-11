@@ -1,3 +1,43 @@
+## 2026-11-11 单次 n4 组 ×5 绿不能证明间歇失败已消失：同一门在负载下仍会复现
+
+D174：M6 在完整 `native_n4_` 组内跑 ×5 都是绿，drain 12.7–13.7s。紧接着全门 n4 组又出现一次 drain 停顿（一流停在 65535B）。间歇失败要按累计频率判断（现在约 2/12），要先给停顿的流做 owner 普查再说是否修好。裁决里要把它写成"开放"，不能写成"接受"。raw `n4-gate3-20261110/gate-n4.log`。
+
+## 2026-11-10 "fail-closed 结局"被接受进模型前，先找出把会话标成 Q 的那一次写入：Q 可能来自永远不可满足的释放门
+
+D171：非硬 held 行在 provider 退役时 Q，看起来像"合法的 T9 类结局"。给 `SessionControl::ledger()` 临时套一个 guard（false→true 翻转时打 backtrace），再给 release_ready 各项打布尔向量，两轮定位：`native.rs::release_ready` 要求 `producers == Some(true)`，非硬 profile 永远到不了 ⇒ 非硬 Native flow 从不干净释放。看起来合法的 fail-closed Q，其实是既有缺陷，不能写进模型。raw `n4-d171-20261110/`。
+
+## 2026-11-10 归因"竞态"前，先给每个 Q 发布点打一次性 backtrace：结局分布可能来自两个独立 owner
+
+D166：D164 把 chunk_loaded_reset 的 Q 时间分布（+0.6ms…+20s）归因为 disposal 按值拷贝期限。D165 在 Q 发布点（`Control::publish`、`SessionControl::quarantine_quiet`、flow Q）各打一个一次性 backtrace，跑 12 次：拷贝从未降低期限。真正的来源是 Session egress 期限（T8，9/12）与 A1 provider 退役后带 ACK 债完成（T9，3/12）两个 owner 竞态。教训：(1) 先定位"谁发布了 Q"，再谈期限；(2) 两个合法、都 fail-closed 的结局可以并存，测试要按判别量接受恰好其一，而不是放宽时间窗；(3) 潜在的旁路（已过期的 limit 撤销授予）用单 owner 类型（只读 Deref + limit 规则）在编译期关掉，而不是加守卫。Raw `n4-d165-20261110/probe/`。
+
+## 2026-11-10 改期限合同后，先找所有"按值拷贝该期限"的旁路 owner；对齐测试前先问结局是否仍是 Q
+
+D164：A1 只把 flow 的 `stop_deadline` 延长了一次，但致命 Native disposal 在被取出时已按值拷贝旧期限（`roles/failure.rs::take_native_disposal`）⇒ 同一场景下会话 Q 落在 +0.6ms 到 +20s 之间。另有 2 个"等 Q"的测试，在 A1 下因 QUIC idle 让 provider 正常退役而干净结算，"把 Q 时间往后挪"对它们不成立。做法：先用 m-a1 证明有鉴别力，再对每个测试取到实际结局（report/flow/预算），然后才定期望。
+
+## 2026-11-09 恢复时延阈值先对照 RFC 9002 PTO 退避算一遍：有在途数据的黑洞抬起后，下一个包要等下一次 PTO
+
+D155：M3 8s 黑洞冻结"抬起后 ≤2s 恢复"。探针显示两端 PTO 探测成对翻倍（0.75/1.5/3/6s），抬起后到下一次 PTO（12.0/12.4s）之间两向都是 0 个包；cwnd 被在途流数据占满，App 数据报发不出。空载 A1 0.5s 只因无在途数据。阈值要按 next PTO − H ∈ (0, H] 定，不能用空载经验值。另：同一 open 界要覆盖它真正等待的所有状态（D154 首个修复只盖了 Recovering，探针显示 99% 在 Acquiring Busy/Contended）。
+
+## 2026-11-09 释放连接存储前，先查所有"按地址身份"比较的地方：quinn `stable_id` 是存储地址，释放后会被新连接复用
+
+D153：A2 在 Waiting 时释放死连接存储后，`actual_transient_refusal` 的 shutdown 变成 Quarantined（"connection identity mismatch"）：后继连接分配到同一地址，`stable_id` 与已退休前任相同。原代码默认"所有代际都持有活存储"，所以按 stable_id 唯一性校验是对的；释放后必须改为按完整 identity（stable_id+generation）记录、commit 跳过过期 id 查找、终态校验按"每个 id 的活代际数"计。另：probe 先只换掉槽的 transport 再看 strong count，才发现第二持有者是 Node 握手 `Attempt` 记录（connection + ConnectionDrain）。测试 relay 每个客户端 socket 地址 2 个 task，endpoint rebind 会多一个地址。证据 n4-20261109/d152/。
+
+## 2026-11-09 "活性卡住"先看是不是被 Q 吃掉了：会话 sticky Q 会让 stop 永不完成，看起来像恢复循环卡住
+
+D151：D150 把 M4c "Waiting 中 stop 59s 不完成"归为恢复循环卡在 predecessor 收尾；一次带标签探针（循环每轮状态 + shutdown census 的 live/stage + 所有 Q 置位点）证伪：Node 循环正常 park，会话在 stop 之前就已 Q。根因是两个独立有界机制的期限不相容：flow 关闭尾 15s < provider 自己的结算（QUIC idle 15s + Node 释放死连接存储；Waiting 中后者无界）。教训：(1) 先在所有 Q 置位点加一次性探针，定位"第一个 Q"；(2) 跨 owner 的期限必须写成不等式（tail ≥ provider bound）并由编译期常数绑定；(3) 空载 tracer 测不到"关闭中的流跨越连接死亡"。证据 `n4-20261109/fn4b/probe-m4c-4.log`。
+
+## 2026-11-09 组合验收的故障格必须在"有在途负载"下跑；空载 tracer 证明不了恢复/stop 的活性
+
+D150：N2 的 A2/A7 都在故障前结算 flow，所以全绿；N4 在标准负载 L 下第一次跑，30s 黑洞抬起后不恢复、Waiting 中 stop 不完成（App 持续重开的 open 让 Waiting 的 re-probe 一直不发生），显式断线下还暴露了跨代分片重组泄漏。阈值不要自己发明（M5(ii) 的 <1MiB 被 M6 的实测每流 ≈1.5MB 推翻），要从真实的窗口链推导。
+
+## 2026-11-09 期限修订先钉住"到期时到底在等谁"，再用"本次物理检查只在等 App"作为确定性证明
+
+D147：F-N2a 的修复没有把 15s 到期整体改成本地中止，而是先用一次临时探针确认到期时 flow 在 Rearming、custody 已全部结算、只剩 socket 在等 App 的 FIN。实现上，每次物理检查开始时清掉 `tail.wait`，只在三个"只等 App"的返回点置位；到期时 `tail.wait == 当前 stage` 才算确定，否则仍 Q。App 进度定义为未送达尾字节严格低于最小值（只有 App ACK 能让它下降，内部搬运不算）。四个变异（从 FIN 计时、到期即 Q、去掉证明、去掉一次性）各自只让目标 tracer 变红。另：task 普查残留先做"逐个 drop"探针再归因（D148：是测试 RttRelay 每连接 2 个 task，不是 Service）。
+
+## 2026-11-09 组合验收先用真实 App 行为（半关闭 socket）跑一次，再冻结隔离结论
+
+D146：N2 的 tracer 都在断网前先结算 flow，所以从没覆盖"peer FIN 后 App 继续持有 socket"。N4 harness 第一次就复现了 F-N2a，而且不需要断网：15s 关闭尾到期 ⇒ 整个会话 sticky Q。教训：组合/隔离验收要包含常见的 App 侧不配合行为（半关闭、慢读、RST），而不只是协议侧故障；先写 RED 表征，再判断需不需要改合同。另外，新的上界（live flows）要从合同推导（速率 × 关闭尾），不要凭感觉加常数。
+
 ## 2026-11-09 去掉过宽的分类析取时，同时检查它顺带维护的状态；"多守卫"路径的变异要一次去掉全部守卫
 
 D144：`retryable` 的 `held` 析取除了放宽分类，还顺带保证 re-probe 的 Retry 行最终会被 park 或清掉。去掉它后，终态 re-probe 留下一个未 park 的孤儿行（还会把后续 demand 的预算降为 1），第一次 GREEN 尝试因此超时；修复是在非 Waiting 分支同锁清行。A2-Q 的变异只去掉 loop 顶部的 Q 检查时仍 GREEN，因为 `reap_stats` 是第二道 Q 守卫；判别变异要去掉整个"Q 不再终态"的语义（两处一起）。负载复跑前先用 `--list` 确认每个过滤数组都非 0 匹配，并用原始 HEAD 二进制（`target/headbuild`）区分负载套件里的既有失败。另外：写含反引号的文档时 heredoc 必须加引号（`<<'EOF'`），否则 shell 会把反引号内容当命令执行。

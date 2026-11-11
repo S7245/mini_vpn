@@ -297,7 +297,7 @@ impl Turn {
             .min();
         if let Some(deadline) = parent {
             let deadline = deadline.into_std();
-            flow.stop_deadline = Some(flow.stop_deadline.map_or(deadline, |old| old.min(deadline)));
+            flow.stop_deadline.limit(deadline);
         }
         let unknown = !physical
             || !context
@@ -588,8 +588,7 @@ impl Drop for Turn {
                 }
                 if let Some(deadline) = deadline {
                     let deadline = deadline.into_std();
-                    flow.stop_deadline =
-                        Some(flow.stop_deadline.map_or(deadline, |old| old.min(deadline)));
+                    flow.stop_deadline.limit(deadline);
                 }
                 flow.stage = FlowStage::Quarantined;
             }

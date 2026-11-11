@@ -22,6 +22,11 @@ pub(super) struct Rig {
     pub(super) handle: Handle,
     pub(super) saved: Arc<Control>,
     pub(super) budget: bytes::BackingBudget,
+    /// Device installs for the driver, `[0]` main receive path (b2), `[1]`
+    /// drains (N4 M7 RX per Service poll).
+    pub(super) rx_installed: Arc<[std::sync::atomic::AtomicU64; 2]>,
+    /// TUN links `[App→Service, Service→App]` (N4 P1 drop census).
+    pub(super) links: [PacketLink; 2],
     /// Owns the in-memory CA/trust fixture the Service startup reads.
     _profile: ServiceProfile,
 }
@@ -35,6 +40,15 @@ pub(super) async fn rig_pool(
     one_way: Duration,
     tcp_pool: usize,
 ) -> (Service<impl Future<Output = Completion>>, Rig) {
+    rig_links(one_way, tcp_pool, 64).await
+}
+
+/// `rig_pool` with an explicit TUN link capacity in packets (N4 M7 flood).
+pub(super) async fn rig_links(
+    one_way: Duration,
+    tcp_pool: usize,
+    link: usize,
+) -> (Service<impl Future<Output = Completion>>, Rig) {
     let profile = ServiceProfile::new(true);
     let server =
         quinn::Endpoint::server(profile.server_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
@@ -45,9 +59,18 @@ pub(super) async fn rig_pool(
     let runtime = TunRuntimeConfig::from_sources(Some("1"))
         .unwrap()
         .with_relay_policy(policy);
-    let (inbound, outbound) = (PacketLink::bounded(64), PacketLink::bounded(64));
+    let (inbound, outbound) = (PacketLink::bounded(link), PacketLink::bounded(link));
     let apps = Apps::new(outbound.clone(), inbound.clone());
-    let mut service = profile.service(inbound, outbound, cfg.clone(), runtime);
+    let (link_in, link_out) = (inbound.clone(), outbound.clone());
+    let rx_installed = Arc::new([0, 0].map(std::sync::atomic::AtomicU64::new));
+    let mut service = profile.service_slots(
+        inbound,
+        outbound,
+        cfg.clone(),
+        runtime,
+        link,
+        rx_installed.clone(),
+    );
     let handle = service.take_handle().unwrap();
     let saved = service.control.clone();
     let budget = saved
@@ -64,6 +87,8 @@ pub(super) async fn rig_pool(
             handle,
             saved,
             budget,
+            rx_installed,
+            links: [link_in, link_out],
             _profile: profile,
         },
     )
@@ -165,6 +190,9 @@ pub(super) fn assert_clean_stop(
 pub(super) struct Storm {
     start_after: Duration,
     end: Duration,
+    /// F-N4d: detection = the Node's own connection close (client side), not
+    /// the peer's, so opens really land in the original recovery attempt.
+    aligned: bool,
     /// (socket, opened at, payload sent, settled after).
     sockets: Vec<(
         smoltcp::iface::SocketHandle,
@@ -179,8 +207,13 @@ impl Storm {
         Self {
             start_after,
             end,
+            aligned: false,
             sockets: Vec::with_capacity(64),
         }
+    }
+    pub(super) fn aligned(mut self) -> Self {
+        self.aligned = true;
+        self
     }
     pub(super) fn step(&mut self, apps: &mut Apps, from: Instant, detected: Option<Instant>) {
         if let Some(detected) = detected.filter(|_| self.sockets.len() < 64) {
@@ -292,8 +325,18 @@ async fn outage_round(rig: &mut Rig, outage: Duration, mut storm: Option<Storm>)
             if now >= lift && (storm_done || now >= lift + Duration::from_secs(6)) {
                 break;
             }
-            if detected.is_none() && first.close_reason().is_some() {
+            let aligned = storm.as_ref().is_some_and(|s| s.aligned);
+            if detected.is_none()
+                && (if aligned {
+                    node(&rig.saved)
+                        .sample()
+                        .is_some_and(|s| s.connections.iter().flatten().any(|c| c.closed))
+                } else {
+                    first.close_reason().is_some()
+                })
+            {
                 detected = Some(now);
+                println!("N2A detected={:?}", now - from);
             }
             if let Some(storm) = storm.as_mut() {
                 storm.step(&mut rig.apps, from, detected);
@@ -489,6 +532,25 @@ async fn n2_a6_storm_25s_opens_settle_and_do_not_multiply_attempts() {
         )),
     )
     .await;
+    assert!(outcome.dcids <= a2_bound(outage), "dcids={}", outcome.dcids);
+    let worst = outcome.worst_open.expect("every open settled");
+    assert!(
+        worst <= Duration::from_secs(6),
+        "slowest open settled after {worst:?}"
+    );
+    assert!(outcome.recovered <= Duration::from_secs(36));
+}
+
+/// F-N4d (D154): the storm starts at the Node's own loss detection, so every
+/// open is issued during the ORIGINAL closed-slot attempt (2×5s handshakes).
+/// Each open must still settle ≤6s from its own start (D126 open bound).
+#[tokio::test(flavor = "current_thread")]
+async fn n2_a6_storm_aligned_original_attempt_opens_settle_within_6s() {
+    // Client idle detection lands at ~15–20s (keep-alive resets idle); 40s keeps
+    // both original handshakes inside the outage, so the attempt fails on its own.
+    let outage = Duration::from_secs(40);
+    let storm = Storm::new(Duration::from_millis(100), Duration::from_secs(29)).aligned();
+    let outcome = run_outage(outage, Some(storm)).await;
     assert!(outcome.dcids <= a2_bound(outage), "dcids={}", outcome.dcids);
     let worst = outcome.worst_open.expect("every open settled");
     assert!(

@@ -60,14 +60,14 @@ impl TuicUpstream {
                     .await?;
                 current.note_reconnect_success();
             }
-            return Ok(current.transport.clone());
+            return current.transport.connection();
         }
     }
 
     pub(in crate::tuic) async fn reconnect_locked(
         &self,
         index: usize,
-        conn: &mut Connection,
+        conn: &mut crate::tuic::generation_slot::SlotConnection,
         reason: &'static str,
     ) -> Result<(), ClientError> {
         self.reject_unowned_maintenance()?;
@@ -84,7 +84,7 @@ impl TuicUpstream {
             &self.password,
             self.zero_rtt,
         );
-        *conn = tokio::time::timeout(TUIC_RECONNECT_TIMEOUT, hs)
+        let fresh = tokio::time::timeout(TUIC_RECONNECT_TIMEOUT, hs)
             .await
             .map_err(|_| {
                 io_err(
@@ -95,8 +95,9 @@ impl TuicUpstream {
         if let Some(secs) = self.quic_stats_secs
             && let Some(stop) = &self.quic_stats_stop
         {
-            spawn_quic_stats_logger(conn.clone(), index, secs, stop.subscribe());
+            spawn_quic_stats_logger(fresh.clone(), index, secs, stop.subscribe());
         }
+        *conn = fresh.into();
         Ok(())
     }
 
@@ -112,7 +113,9 @@ impl TuicUpstream {
             .collect()
     }
 
-    fn tcp_pool_observation(current: &TcpPoolGeneration<Connection>) -> TcpPoolPathObservation {
+    fn tcp_pool_observation(
+        current: &TcpPoolGeneration<crate::tuic::generation_slot::SlotConnection>,
+    ) -> TcpPoolPathObservation {
         let conn = &current.transport;
         if conn.close_reason().is_some() {
             return TcpPoolPathObservation::Unknown;
@@ -438,7 +441,7 @@ impl TuicUpstream {
                     )
                 })?;
         let successor = TcpPoolGeneration::new_successor(
-            successor_conn.clone(),
+            successor_conn.clone().into(),
             successor_generation,
             auth_attempts as u64,
             self.clock,
@@ -658,11 +661,12 @@ impl TuicUpstream {
                 )
             {
                 self.reject_unowned_maintenance()?;
-                let outcome = self.probe_tcp_pool_connection(
-                    &current.transport,
-                    TUIC_TCP_POOL_LIVENESS_PROBE_TIMEOUT,
-                )
-                .await;
+                let outcome = self
+                    .probe_tcp_pool_connection(
+                        &current.transport.connection()?,
+                        TUIC_TCP_POOL_LIVENESS_PROBE_TIMEOUT,
+                    )
+                    .await;
                 probe_result = match outcome {
                     TcpPoolProbeOutcome::Alive { .. } => "alive",
                     TcpPoolProbeOutcome::Closed => "closed",
@@ -683,11 +687,12 @@ impl TuicUpstream {
                     .await?;
                 current.note_reconnect_success();
                 if index != 0 {
-                    let ready = self.probe_tcp_pool_connection(
-                        &current.transport,
-                        TUIC_TCP_POOL_LIVENESS_PROBE_TIMEOUT,
-                    )
-                    .await;
+                    let ready = self
+                        .probe_tcp_pool_connection(
+                            &current.transport.connection()?,
+                            TUIC_TCP_POOL_LIVENESS_PROBE_TIMEOUT,
+                        )
+                        .await;
                     probe_result = match ready {
                         TcpPoolProbeOutcome::Alive { .. } => "reconnected_alive",
                         TcpPoolProbeOutcome::Closed => "reconnected_closed",
@@ -707,7 +712,7 @@ impl TuicUpstream {
                 }
             }
 
-            let conn = current.transport.clone();
+            let conn = current.transport.connection()?;
             let generation = open_state.generation();
             let write_pressure = current.write_pressure.clone();
             let read_pressure = current.read_pressure.clone();

@@ -188,7 +188,7 @@ fn snapshot(owner: &SessionControl, id: FlowIdentity) -> Option<Snapshot> {
         id: flow.id,
         slot_deadline: slot.deadline,
         open_deadline: flow.open_deadline,
-        stop_deadline: flow.stop_deadline,
+        stop_deadline: *flow.stop_deadline,
         stage: flow.stage,
         storage: (
             flow.escrow.len(),
@@ -506,7 +506,11 @@ async fn exercise(peer: &ReadyPeer, prior_io: bool, site: FaultSite) {
         let cancelled = *facts.cancelled.lock().unwrap();
         assert_eq!(
             cancelled,
-            Some((TcpOpenCancel::Cancelled, after.stop_deadline.unwrap()))
+            // D152 (A1): the provider bound is the tail plus one loss bound.
+            Some((
+                TcpOpenCancel::Cancelled,
+                after.stop_deadline.unwrap() + PROVIDER_LOSS_BOUND
+            ))
         );
         assert_eq!(
             (counts.0[3], counts.0[4], counts.0[5]),
@@ -516,7 +520,11 @@ async fn exercise(peer: &ReadyPeer, prior_io: bool, site: FaultSite) {
         if site == FaultSite::Settle {
             let call = *facts.settle_call.lock().unwrap();
             let (now, limit) = call.expect("actual inner settle returned before Box unwind");
-            assert_eq!(Some(limit), after.stop_deadline);
+            // D152 (A1): the provider bound is the tail plus one loss bound.
+            assert_eq!(
+                Some(limit),
+                after.stop_deadline.map(|d| d + PROVIDER_LOSS_BOUND)
+            );
             assert!(now < limit);
             println!("B58 actual settle returned now={now:?} originalFlowLimit={limit:?}");
         }

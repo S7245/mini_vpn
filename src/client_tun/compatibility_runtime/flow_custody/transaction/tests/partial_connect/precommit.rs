@@ -101,7 +101,7 @@ async fn run(fault: Fault) {
         .await
         .unwrap();
         let source = active_error(&physical.owner);
-        let stop_deadline = physical.owner.opens().flow_mut(id).unwrap().stop_deadline;
+        let stop_deadline = *physical.owner.opens().flow_mut(id).unwrap().stop_deadline;
         tokio::time::timeout(
             Duration::from_secs(2),
             peer_retirement(halves.take().unwrap()),

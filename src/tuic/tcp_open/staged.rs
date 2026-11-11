@@ -33,6 +33,7 @@ pub(super) fn create(
         failure: None,
         cancel_requested: false,
         settle_deadline: None,
+        recovery_bound: tokio::time::Instant::now().into_std() + TUIC_OPEN_TIMEOUT,
         interrupted: false,
         quarantined: false,
     })
@@ -51,6 +52,12 @@ pub(super) struct Attempt {
     failure: Option<ClientError>,
     cancel_requested: bool,
     settle_deadline: Option<Instant>,
+    /// D154 F-N4d: an open that is only waiting on Node-held slot state — a
+    /// pending closed-slot demand, or admission Busy/Contended because recovery
+    /// holds the slot preparation — fails at its own 5s bound from the open,
+    /// not at the demand's 2×5s budget. The shared demand is unchanged; this
+    /// open neither starts nor extends a handshake.
+    recovery_bound: Instant,
     interrupted: bool,
     quarantined: bool,
 }
@@ -173,6 +180,14 @@ struct ReadyConnection {
     replacement_installed: bool,
 }
 
+/// Typed per-open failure; the Node records nothing (the demand stays authoritative).
+fn open_bound() -> ClientError {
+    ClientError::Io(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "TUIC open waited past its 5s bound on Node-held slot state",
+    ))
+}
+
 fn maintenance(message: &'static str) -> ClientError {
     ClientError::Io(io::Error::new(io::ErrorKind::NotConnected, message))
 }
@@ -237,7 +252,7 @@ fn ready_generation(
         return Err(maintenance("TUIC ready pool requires maintenance"));
     }
     Ok(Some(ReadyGeneration::Connection(ReadyConnection {
-        conn: current.transport.clone(),
+        conn: current.transport.connection()?,
         open_state: current.open_state.clone(),
         write_pressure: current.write_pressure.clone(),
         read_pressure: current.read_pressure.clone(),
@@ -361,6 +376,10 @@ impl Attempt {
                     Err(
                         TcpPoolAdmissionRoundError::Contended
                         | TcpPoolAdmissionRoundError::Reservation(TcpPoolReservationError::Busy),
+                    ) if now >= self.recovery_bound => self.fail(open_bound(), now),
+                    Err(
+                        TcpPoolAdmissionRoundError::Contended
+                        | TcpPoolAdmissionRoundError::Reservation(TcpPoolReservationError::Busy),
                     ) => {}
                     Err(error) => {
                         self.state = State::Retiring(Custody::empty());
@@ -380,6 +399,7 @@ impl Attempt {
             }
             State::Recovering(ticket) => match upstream.observe_aux_recovery(*ticket) {
                 Ok(true) => self.state = State::Acquiring,
+                Ok(false) if now >= self.recovery_bound => self.fail(open_bound(), now),
                 Ok(false) => {}
                 Err(error) => self.fail(error, now),
             },

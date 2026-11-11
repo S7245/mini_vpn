@@ -410,14 +410,14 @@ impl OpenDispatch {
                 }
                 if let Some(flow) = opens.flow_mut(id) {
                     if let Some(deadline) = deadline {
-                        flow.stop_deadline = Some(flow.stop_deadline.map_or(deadline, |old| old.min(deadline)));
+                        flow.stop_deadline.limit(deadline);
                     }
                 }
                 return;
             }
             flow.close(("native_uplink", "escrow_admission_failed"));
             if let Some(parent) = parent_deadline {
-                flow.stop_deadline = Some(flow.stop_deadline.map_or(parent, |old| old.min(parent)));
+                flow.stop_deadline.limit(parent);
             }
             if let Some(fact) = preparation_fact {
                 owner.record(fact);
@@ -524,6 +524,7 @@ impl OpenDispatch {
         let Some(flow) = opens.flow_mut(id) else {
             return false;
         };
+        flow.clear_app_tail_wait();
         if flow.preparing || flow.roles.as_ref().is_some_and(FlowRoles::disposition_in_flight) { return false; }
         if flow.panic.is_some() && owner.app_meter.as_ref().is_some_and(|meter| meter.budget_limit().is_some()) {
             return false; // Hard opaque work is permanently closed; original fatal turns still JOIN.
@@ -637,21 +638,35 @@ impl OpenDispatch {
         // arrives on the monitor/signal path and can overtake DATA the dispatcher
         // already queued in the relay lane. Keep the producers (so
         // relay_allows_remote_payload) until the mirror has begun every published
-        // DATA message, the exact witness Rearming uses below. Bounded by the 15s
-        // close deadline (drive → Quarantined); stop bypasses.
+        // DATA message, the exact witness Rearming uses below. This waits on the
+        // App draining (D147 close tail: progress re-arms, idle expiry aborts
+        // the tail and discards it below); stop bypasses.
         if flow.stage == FlowStage::Closing
             && !flow.producer_stopped
+            && !flow.tail.aborted()
             && matches!(flow.close_reason, ("remote_to_local", "remote_eof" | "remote_read_failed"))
             && !owner.stop.stopping.load(std::sync::atomic::Ordering::Acquire)
             && flow.roles.as_ref().is_some_and(|roles| roles.hard_source_producers()
                 && roles.published().is_none_or(|sent| mirror.data_messages < sent.messages))
         {
+            let unbegun = flow
+                .roles
+                .as_ref()
+                .and_then(FlowRoles::published)
+                .map_or(0, |sent| sent.bytes.saturating_sub(mirror.data_bytes));
+            let socket = completion.sockets.get::<TcpSocket>(id.handle).send_queue();
+            flow.app_tail_wait(
+                unbegun
+                    .saturating_add(ctx.downlink_pending.len())
+                    .saturating_add(ctx.downlink_inflight_permits.remaining_bytes())
+                    .saturating_add(socket),
+            );
             return true;
         }
         if matches!(flow.stage, FlowStage::Quarantined | FlowStage::Closing)
             && !flow.producer_stopped && flow.roles.as_ref().is_some_and(FlowRoles::hard_source_producers)
         {
-            let turn = flow.roles.as_mut().and_then(|roles| roles.take_native_producers(owner, id, ctx, flow.stop_deadline));
+            let turn = flow.roles.as_mut().and_then(|roles| roles.take_native_producers(owner, id, ctx));
             drop(opens);
             if let Some(turn) = turn {
                 turn.dispose_producers(owner, &mut std::task::Context::from_waker(std::task::Waker::noop()), ctx);
@@ -791,8 +806,17 @@ impl OpenDispatch {
             .stop
             .stopping
             .load(std::sync::atomic::Ordering::Acquire);
-        if !shutdown && flow.close_reason == ("remote_to_local", "remote_eof") {
+        // D147: these waits are App-only (custody already settled above); an
+        // aborted tail skips them and the reset below RSTs the App socket.
+        let tail_open = !shutdown && !flow.tail.aborted();
+        let outstanding = ctx
+            .downlink_pending
+            .len()
+            .saturating_add(ctx.downlink_inflight_permits.remaining_bytes())
+            .saturating_add(socket.send_queue());
+        if tail_open && flow.close_reason == ("remote_to_local", "remote_eof") {
             if !ctx.downlink_pending.is_empty() {
+                flow.app_tail_wait(outstanding);
                 return true;
             }
             if !ctx.local_eof_sent {
@@ -800,13 +824,15 @@ impl OpenDispatch {
                 ctx.local_eof_sent = true;
             }
             if socket.is_active() {
+                flow.app_tail_wait(outstanding);
                 return true;
             }
         }
-        if !shutdown
+        if tail_open
             && socket.is_active()
             && (!ctx.downlink_pending.is_empty() || socket.send_queue() != 0)
         {
+            flow.app_tail_wait(outstanding);
             return true;
         }
         if !ordered
@@ -829,7 +855,7 @@ impl OpenDispatch {
             mirror.quarantined = true;
             return false;
         };
-        let Some(deadline) = flow.stop_deadline else {
+        let Some(deadline) = *flow.stop_deadline else {
             mirror.quarantined = true;
             flow.stage = FlowStage::Quarantined;
             owner.ledger().quarantined = true;
@@ -1144,7 +1170,7 @@ impl OpenDispatch {
                 physical.uncertain = true;
                 let disposal = flow.roles.as_mut().and_then(|roles| {
                     roles.all_original_roles_joined().then(|| roles.take_original_disposal(owner, flow.id)).flatten()
-                        .or_else(|| roles.take_native_disposal(owner, flow.id, flow.producer_stopped, flow.stop_deadline))
+                        .or_else(|| roles.take_native_disposal(owner, flow.id, flow.producer_stopped))
                 });
                 if let Some(disposal) = disposal {
                     drop(opens);
@@ -1164,7 +1190,7 @@ impl OpenDispatch {
                     flow.stage = FlowStage::Quarantined;
                     drop(opens); owner.quarantine_quiet(); return Poll::Pending;
                 };
-                let turn = flow.roles.as_mut().and_then(|roles| roles.take_native_producers(owner, flow.id, ctx, flow.stop_deadline));
+                let turn = flow.roles.as_mut().and_then(|roles| roles.take_native_producers(owner, flow.id, ctx));
                 drop(opens);
                 if let Some(turn) = turn { turn.dispose_producers(owner, cx, ctx); }
                 else { owner.quarantine_quiet(); }
@@ -1224,7 +1250,7 @@ impl OpenDispatch {
             }
             let disposal = flow.roles.as_mut().and_then(|roles| {
                 roles.all_original_roles_joined().then(|| roles.take_original_disposal(owner, flow.id)).flatten()
-                    .or_else(|| roles.take_native_disposal(owner, flow.id, flow.producer_stopped, flow.stop_deadline))
+                    .or_else(|| roles.take_native_disposal(owner, flow.id, flow.producer_stopped))
             });
             if let Some(disposal) = disposal {
                 physical.pending = true;
@@ -1410,7 +1436,7 @@ impl OpenDispatch {
             if error != bytes::MeteredCopyError::Quarantined && flow.rejection.is_none() {
                 flow.rejection = Some(super::super::transaction::FlowRejection::ReportedNativeUplink(error));
             }
-            if let Some(deadline) = deadline { flow.stop_deadline = Some(flow.stop_deadline.map_or(deadline, |old| old.min(deadline))); }
+            if let Some(deadline) = deadline { flow.stop_deadline.limit(deadline); }
         }
     }
 }

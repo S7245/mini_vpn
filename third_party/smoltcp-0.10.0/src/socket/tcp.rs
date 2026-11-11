@@ -258,6 +258,12 @@ enum Timer {
         delay: Duration,
     },
     FastRetransmit,
+    /// mini_vpn N4 F1 (RFC 9293 §3.8.6.1): the remote window is zero, data is
+    /// queued and nothing is in flight; a probe elicits the current window.
+    ZeroWindowProbe {
+        expires_at: Instant,
+        delay: Duration,
+    },
     Close {
         expires_at: Instant,
     },
@@ -279,6 +285,30 @@ impl Timer {
                 keep_alive_at: Some(keep_alive_at),
             } if timestamp >= keep_alive_at => true,
             _ => false,
+        }
+    }
+
+    fn should_zero_window_probe(&self, timestamp: Instant) -> bool {
+        matches!(*self, Timer::ZeroWindowProbe { expires_at, .. } if timestamp >= expires_at)
+    }
+
+    fn set_for_zero_window_probe(&mut self, timestamp: Instant, delay: Duration) {
+        if let Timer::Idle { .. } = *self {
+            *self = Timer::ZeroWindowProbe {
+                expires_at: timestamp + delay,
+                delay,
+            }
+        }
+    }
+
+    /// Back off after each probe, bounded by the maximum RTO.
+    fn zero_window_probe_sent(&mut self, timestamp: Instant) {
+        if let Timer::ZeroWindowProbe { delay, .. } = *self {
+            let delay = (delay * 2).min(Duration::from_millis(RTTE_MAX_RTO as u64));
+            *self = Timer::ZeroWindowProbe {
+                expires_at: timestamp + delay,
+                delay,
+            }
         }
     }
 
@@ -309,6 +339,7 @@ impl Timer {
             } => PollAt::Ingress,
             Timer::Retransmit { expires_at, .. } => PollAt::Time(expires_at),
             Timer::FastRetransmit => PollAt::Now,
+            Timer::ZeroWindowProbe { expires_at, .. } => PollAt::Time(expires_at),
             Timer::Close { expires_at } => PollAt::Time(expires_at),
         }
     }
@@ -335,7 +366,9 @@ impl Timer {
 
     fn set_for_retransmit(&mut self, timestamp: Instant, delay: Duration) {
         match *self {
-            Timer::Idle { .. } | Timer::FastRetransmit { .. } => {
+            Timer::Idle { .. }
+            | Timer::FastRetransmit { .. }
+            | Timer::ZeroWindowProbe { .. } => {
                 *self = Timer::Retransmit {
                     expires_at: timestamp + delay,
                     delay,
@@ -2148,6 +2181,25 @@ impl<'a> Socket<'a> {
             }
         }
 
+        // mini_vpn N4 F1: arm the persist timer when the remote window is zero,
+        // data is queued and nothing is in flight (no retransmit timer runs).
+        if self.remote_win_len == 0
+            && !self.tx_buffer.is_empty()
+            && self.remote_last_seq == self.local_seq_no
+            && matches!(
+                self.state,
+                State::Established
+                    | State::CloseWait
+                    | State::FinWait1
+                    | State::Closing
+                    | State::LastAck
+            )
+        {
+            self.timer
+                .set_for_zero_window_probe(cx.now(), self.rtte.retransmission_timeout());
+        }
+        let is_zero_window_probe = self.timer.should_zero_window_probe(cx.now());
+
         // Decide whether we're sending a packet.
         if self.seq_to_transmit(cx) {
             // If we have data to transmit and it fits into partner's window, do it.
@@ -2164,6 +2216,8 @@ impl<'a> Socket<'a> {
         } else if self.timer.should_keep_alive(cx.now()) {
             // If we need to transmit a keep-alive packet, do it.
             tcp_trace!("keep-alive timer expired");
+        } else if is_zero_window_probe {
+            tcp_trace!("zero-window probe timer expired");
         } else if self.timer.should_close(cx.now()) {
             // If we have spent enough time in the TIME-WAIT state, close the socket.
             tcp_trace!("TIME-WAIT timer expired");
@@ -2288,7 +2342,10 @@ impl<'a> Socket<'a> {
         // sequence space will elicit an ACK, we only need to send an explicit packet if we
         // couldn't fill the sequence space with anything.
         let is_keep_alive;
-        if self.timer.should_keep_alive(cx.now()) && repr.is_empty() {
+        // A zero-window probe has the keep-alive shape (SEG.SEQ = SND.UNA − 1,
+        // one octet): it never advances sequence space and always elicits an
+        // ACK carrying the current window.
+        if (self.timer.should_keep_alive(cx.now()) || is_zero_window_probe) && repr.is_empty() {
             repr.seq_number = repr.seq_number - 1;
             repr.payload = b"\x00"; // RFC 1122 says we should do this
             is_keep_alive = true;
@@ -2354,6 +2411,9 @@ impl<'a> Socket<'a> {
         // Leave the rest of the state intact if sending a keep-alive packet, since those
         // carry a fake segment.
         if is_keep_alive {
+            if is_zero_window_probe {
+                self.timer.zero_window_probe_sent(cx.now());
+            }
             return Ok(());
         }
 
@@ -6262,6 +6322,49 @@ mod test {
                 ..RECV_TEMPL
             })
         );
+    }
+
+    #[test]
+    fn test_zero_window_probe() {
+        let mut s = socket_established();
+        s.send_slice(b"abcdef").unwrap();
+        // The remote closes its window before any data was sent.
+        send!(s, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            window_len: 0,
+            ..SEND_TEMPL
+        });
+        recv_nothing!(s, time 0);
+        // Persist timer armed at the initial RTO (700 ms).
+        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Time(Instant::from_millis(700)));
+        recv_nothing!(s, time 699);
+        recv!(s, time 700, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &[0],
+            ..RECV_TEMPL
+        }));
+        // Backed off ×2; the window update that answers it releases the data.
+        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Time(Instant::from_millis(2100)));
+        recv!(s, time 2100, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &[0],
+            ..RECV_TEMPL
+        }));
+        send!(s, time 2110, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            window_len: 64,
+            ..SEND_TEMPL
+        });
+        recv!(s, time 2110, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"abcdef"[..],
+            ..RECV_TEMPL
+        }));
     }
 
     #[test]

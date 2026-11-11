@@ -4,6 +4,9 @@ mod identity;
 #[cfg(feature = "harness")]
 mod deadline;
 
+#[cfg(feature = "harness")]
+mod close_tail;
+
 mod control;
 
 #[cfg(feature = "harness")]

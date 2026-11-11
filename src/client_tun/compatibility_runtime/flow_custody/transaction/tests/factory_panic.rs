@@ -71,7 +71,7 @@ fn snapshot(owner: &SessionControl, id: FlowIdentity) -> Option<Snapshot> {
         id: flow.id,
         slot_deadline: slot.deadline,
         open_deadline: flow.open_deadline,
-        stop_deadline: flow.stop_deadline,
+        stop_deadline: *flow.stop_deadline,
         stage: flow.stage,
         escrow: flow.escrow.to_vec(),
         storage: (

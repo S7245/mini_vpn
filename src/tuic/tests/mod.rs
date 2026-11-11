@@ -4296,7 +4296,7 @@ async fn tcp_pool_replacement_handoff_publishes_the_exact_current_service() {
         .await
         .unwrap();
     let clock = Instant::now();
-    let slot = TcpPoolGenerationSlot::new(1, connection.clone(), 1, 1, clock);
+    let slot = TcpPoolGenerationSlot::new(1, connection.clone().into(), 1, 1, clock);
     let identity = TcpPoolTransportIdentity::new(connection.stable_id(), 1);
     let old_floor = connection.stats().path.cwnd;
     {
@@ -4344,7 +4344,7 @@ async fn tcp_pool_replacement_handoff_rejects_a_stale_generation() {
         .unwrap()
         .await
         .unwrap();
-    let slot = TcpPoolGenerationSlot::new(1, connection.clone(), 7, 1, Instant::now());
+    let slot = TcpPoolGenerationSlot::new(1, connection.clone().into(), 7, 1, Instant::now());
     let stale_identity = TcpPoolTransportIdentity::new(connection.stable_id(), 6);
 
     assert_eq!(

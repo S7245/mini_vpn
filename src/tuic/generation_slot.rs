@@ -5,6 +5,9 @@
 //! Existing characterizers and service-proof tests live in tuic/tests/mod.rs.
 use super::*;
 
+mod released;
+pub(super) use released::SlotConnection;
+
 impl<T: TcpPoolTransport> TcpPoolGenerationSlot<T> {
     pub(super) fn new(
         index: usize,
@@ -163,7 +166,7 @@ impl<T: TcpPoolTransport> TcpPoolGenerationSlot<T> {
     }
 }
 
-impl TcpPoolGenerationSlot<Connection> {
+impl TcpPoolGenerationSlot<SlotConnection> {
     pub(super) async fn prepare_replacement_current_service_handoff(
         &self,
         expected_identity: TcpPoolTransportIdentity,

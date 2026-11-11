@@ -18,6 +18,7 @@ use super::super::tests as runtime_tests;
 use super::super::{SessionControl, SessionStop};
 mod release;
 mod slot_table;
+mod stop_deadline;
 pub(in crate::client_tun::compatibility_runtime) use slot_table::SlotTable;
 pub(in crate::client_tun::compatibility_runtime) mod custody;
 use crate::owned_upstream::OwnedUpstream;
@@ -663,7 +664,8 @@ pub(in crate::client_tun::compatibility_runtime) struct FlowTransaction {
     pub(super) carrier: Option<OpenedOwnedTcp>,
     pub(super) roles: Option<FlowRoles>,
     pub(super) close_reason: (&'static str, &'static str),
-    pub(super) stop_deadline: Option<std::time::Instant>,
+    pub(super) stop_deadline: stop_deadline::StopDeadline,
+    pub(super) tail: CloseTail,
     pub(super) panic: Option<Box<dyn std::any::Any + Send>>,
     upstream: Option<Arc<dyn OwnedUpstream>>,
     target: crate::shared::TargetAddr,
@@ -675,6 +677,39 @@ pub(in crate::client_tun::compatibility_runtime) struct FlowTransaction {
     #[cfg(test)]
     pub(super) missing_start_gate: Option<usize>,
     physical_check: Option<(FlowStage, tokio::time::Instant)>,
+}
+
+const CLOSE_TAIL: std::time::Duration = std::time::Duration::from_secs(15);
+/// D152 (A1), value D181: the provider's own bounded loss settlement — peer idle
+/// then own idle (one-way loss re-arms ours, RFC 9000 §10.1), then the Node's
+/// release of the dead connection after two bounded reconnect handshakes, + 1 s.
+const PROVIDER_LOSS_BOUND: std::time::Duration =
+    std::time::Duration::from_secs(2 * crate::quic::QUIC_MAX_IDLE_SECS + 1)
+        .saturating_add(crate::tuic::TUIC_RECONNECT_TIMEOUT.saturating_mul(2));
+
+/// D147 (A') close tail. `stop_deadline` runs 15s from the later of the close
+/// and the last App progress (a strict drop of the flow's undelivered tail
+/// below its minimum since close, reported by the physical pass). Expiry is a
+/// local reset of this flow only when the latest physical pass of the same
+/// stage waited on nothing but the App socket (custody certain). D152 (A1):
+/// an expiry whose latest drive proved the only wait is the cancelled
+/// provider's own retirement gets one extension to the provider deadline
+/// (fixed at cancel as tail + PROVIDER_LOSS_BOUND). Every other expiry, and any
+/// second expiry, stays sticky Q.
+#[derive(Default)]
+pub(super) struct CloseTail {
+    wait: Option<FlowStage>,
+    min: Option<usize>,
+    aborted: bool,
+    provider_wait: bool,
+    provider_deadline: Option<std::time::Instant>,
+    extended: bool,
+}
+
+impl CloseTail {
+    pub(super) fn aborted(&self) -> bool {
+        self.aborted
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -830,18 +865,60 @@ impl FlowTransaction {
             return;
         }
         self.close_reason = reason;
-        self.stop_deadline =
-            Some(tokio::time::Instant::now().into_std() + std::time::Duration::from_secs(15));
+        self.stop_deadline.open(tokio::time::Instant::now().into_std() + CLOSE_TAIL);
         if self.stage != FlowStage::Quarantined {
             self.stage = FlowStage::Closing;
         }
     }
 
+    /// Physical pass start: no App-only wait is proven for this pass yet.
+    pub(super) fn clear_app_tail_wait(&mut self) {
+        self.tail.wait = None;
+    }
+
+    /// The physical pass ends waiting only on the App socket, `outstanding`
+    /// tail bytes not yet acknowledged by it. App progress re-arms the tail.
+    pub(super) fn app_tail_wait(&mut self, outstanding: usize) {
+        self.tail.wait = Some(self.stage);
+        if self.tail.min.is_some_and(|min| outstanding < min) {
+            self.stop_deadline.rearm(tokio::time::Instant::now().into_std() + CLOSE_TAIL);
+        }
+        self.tail.min = Some(
+            self.tail
+                .min
+                .map_or(outstanding, |min| min.min(outstanding)),
+        );
+    }
+
     pub(super) fn drive(&mut self, cx: &mut std::task::Context<'_>) {
         if self.panic.is_some() { return; } // Only the original fatal JOIN boundary may proceed.
         let now = tokio::time::Instant::now().into_std();
+        let provider_wait = std::mem::take(&mut self.tail.provider_wait);
         if self.stop_deadline.is_some_and(|deadline| now >= deadline) {
-            self.stage = FlowStage::Quarantined;
+            let certain = !self.tail.aborted
+                && !self.tail.extended
+                && !self.preparing
+                && self.cold_retained.is_none()
+                && !self
+                    .roles
+                    .as_ref()
+                    .is_some_and(FlowRoles::disposition_in_flight);
+            let app_only = certain
+                && matches!(self.stage, FlowStage::Closing | FlowStage::Rearming)
+                && self.tail.wait == Some(self.stage);
+            let provider_only = certain && provider_wait && self.stage == FlowStage::Closing;
+            if app_only {
+                // Certain custody: abandon only the App tail; the normal path
+                // resets the App socket and releases within one fresh tail.
+                self.tail.aborted = true;
+                self.stop_deadline.grant(now + CLOSE_TAIL);
+            } else if let Some(deadline) = self.tail.provider_deadline.filter(|_| provider_only) {
+                // D152 (A1): only the provider's bounded loss settlement remains.
+                self.tail.extended = true;
+                self.stop_deadline.grant(deadline);
+            } else {
+                self.stage = FlowStage::Quarantined;
+            }
         }
         if self.preparing || self.cold_retained.is_some() || self.roles.as_ref().is_some_and(FlowRoles::disposition_in_flight) { return; }
         if let Some(roles) = &mut self.roles {
@@ -889,9 +966,14 @@ impl FlowTransaction {
                 }
             }
             if let Some(attempt) = &mut self.attempt {
-                let Some(deadline) = self.stop_deadline else {
+                let Some(deadline) = *self.stop_deadline else {
                     return;
                 };
+                // Fixed on first use: the provider bound covers one A1 extension.
+                let deadline = *self
+                    .tail
+                    .provider_deadline
+                    .get_or_insert(deadline + PROVIDER_LOSS_BOUND);
                 if !self.provider_cancelled {
                     if !matches!(
                         attempt.view().phase,
@@ -909,6 +991,8 @@ impl FlowTransaction {
                 }
                 if view.phase != TcpOpenPhase::Settled || view.lease_held || view.retirement_pending
                 {
+                    self.tail.provider_wait = view.phase == TcpOpenPhase::Retiring
+                        && (view.lease_held || view.retirement_pending);
                     return;
                 }
             }
@@ -1013,7 +1097,8 @@ impl OpenDispatch {
             carrier: None,
             roles: None,
             close_reason: ("root", "opening"),
-            stop_deadline: None,
+            stop_deadline: Default::default(),
+            tail: CloseTail::default(),
             panic: None,
             upstream: Some(upstream),
             target,
@@ -1311,7 +1396,7 @@ impl OpenDispatch {
                 }
             }
             if let Some(disposal) = flow.roles.as_mut().and_then(|roles|
-                roles.take_native_disposal(owner, flow.id, flow.producer_stopped, flow.stop_deadline)) {
+                roles.take_native_disposal(owner, flow.id, flow.producer_stopped)) {
                 let stock_wait = disposal.is_stock_retirement();
                 let id = flow.id;
                 drop(opens);

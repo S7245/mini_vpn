@@ -102,15 +102,41 @@ impl ServiceProfile {
         cfg: TuicClientConfig,
         runtime: TunRuntimeConfig,
     ) -> Service<impl Future<Output = Completion> + use<>> {
-        self.service_with_partial_probe(inbound, outbound, cfg, runtime, None)
+        self.build(inbound, outbound, cfg, runtime, None, 64, None)
+    }
+    /// N4 M7: hard Native with `slots` Device slots; both links must be
+    /// `PacketLink::bounded(slots)` (the loopback Device requires equality).
+    /// `rx` counts Device installs: `[0]` main receive path, `[1]` drains.
+    pub(in crate::client_tun::compatibility_runtime::tuic_service::tests) fn service_slots(
+        &self,
+        inbound: PacketLink,
+        outbound: PacketLink,
+        cfg: TuicClientConfig,
+        runtime: TunRuntimeConfig,
+        slots: usize,
+        rx: Arc<[std::sync::atomic::AtomicU64; 2]>,
+    ) -> Service<impl Future<Output = Completion> + use<>> {
+        self.build(inbound, outbound, cfg, runtime, None, slots, Some(rx))
     }
     pub(in crate::client_tun::compatibility_runtime::tuic_service::tests) fn service_with_partial_probe(
+        &self,
+        inbound: PacketLink,
+        outbound: PacketLink,
+        cfg: TuicClientConfig,
+        runtime: TunRuntimeConfig,
+        partial: Option<Arc<crate::harness::PartialFlushProbe>>,
+    ) -> Service<impl Future<Output = Completion> + use<>> {
+        self.build(inbound, outbound, cfg, runtime, partial, 64, None)
+    }
+    fn build(
         &self,
         inbound: PacketLink,
         outbound: PacketLink,
         mut cfg: TuicClientConfig,
         mut runtime: TunRuntimeConfig,
         mut partial: Option<Arc<crate::harness::PartialFlushProbe>>,
+        slots: usize,
+        rx: Option<Arc<[std::sync::atomic::AtomicU64; 2]>>,
     ) -> Service<impl Future<Output = Completion> + use<>> {
         let input = match self {
             Self::Legacy => {
@@ -124,7 +150,9 @@ impl ServiceProfile {
                 cfg.ca_path = identity.path.join("ca.pem").to_str().unwrap().to_owned();
                 // Protocol tier from the installed shape (C6/D83); equals native_hard for config().
                 let reserve = crate::client_tun::compatibility_runtime::tuic_service::tests::fixture::native_reserve_for(&cfg.transport_shape());
-                runtime = runtime.with_native_limits((32 << 20) + reserve, 64).unwrap();
+                runtime = runtime
+                    .with_native_limits((32 << 20) + reserve, slots)
+                    .unwrap();
                 runtime.tun_mtu = 1500;
                 DeviceInput::Native(inbound, outbound)
             }
@@ -141,9 +169,13 @@ impl ServiceProfile {
                             ))
                         })?;
                         let device =
-                            LoopbackTunDevice::native_with_factory(64, 1500, &meter, || {
+                            LoopbackTunDevice::native_with_factory(slots, 1500, &meter, || {
                                 Ok((inbound, outbound))
                             })?;
+                        let device = match rx {
+                            Some(rx) => device.with_test_rx_counter(rx),
+                            None => device,
+                        };
                         Ok::<_, ClientError>(match partial {
                             Some(probe) => device.with_test_partial_flush_probe(probe),
                             None => device,
@@ -160,6 +192,36 @@ impl ServiceProfile {
             NoopSink,
         )
     }
+}
+
+/// D152 (A1) Q clock of a provider-held original Flow: its close-tail expiry
+/// waited only on the cancelled provider, so Q follows one extension to the
+/// provider deadline (Flow tail + PROVIDER_LOSS_BOUND), never the parent limit.
+/// The Flow tail ends at or (by its own close hop) just after `parent`.
+pub(in crate::client_tun::compatibility_runtime::tuic_service::tests) fn a1_q_deadline(
+    owner: &SessionControl,
+    parent: tokio::time::Instant,
+) -> tokio::time::Instant {
+    let bound = owner.provider_loss_bound_for_test();
+    let id = owner.flow_contracts()[0].id;
+    let (provider, _) = owner.flow_provider_tail_for_test(id).expect("original Flow row");
+    let provider = provider.expect("cancelled provider carries its A1 deadline");
+    assert!(
+        provider > parent && provider <= parent + bound + std::time::Duration::from_secs(1),
+        "A1 provider deadline {provider:?} is not one bounded extension of parent {parent:?}"
+    );
+    provider
+}
+
+/// After Q: the original Flow used exactly its one A1 extension.
+pub(in crate::client_tun::compatibility_runtime::tuic_service::tests) fn assert_a1_extended(
+    owner: &SessionControl,
+    provider: tokio::time::Instant,
+) {
+    assert!(tokio::time::Instant::now() >= provider, "Q before the A1 provider deadline");
+    let tail = owner.flow_provider_tail_for_test(owner.flow_contracts()[0].id);
+    let tail = tail.expect("original Flow row");
+    assert_eq!(tail, (Some(provider), true), "Q without the one A1 extension");
 }
 
 // Hard Main may return its original admission refusal after the old Flow limit

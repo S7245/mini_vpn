@@ -73,6 +73,9 @@ pub struct LoopbackTunDevice {
     receive_watch: Option<Arc<Mutex<LoopbackReceiveWatch>>>,
     #[cfg(test)]
     partial_flush: Option<Arc<PartialFlushProbe>>,
+    /// N4 M7: packets installed for the driver, [wait_for_rx, try_recv_rx].
+    #[cfg(test)]
+    rx_installed: Option<Arc<[AtomicU64; 2]>>,
 }
 
 /// One test-only device failure after a real bounded-link payload handoff.
@@ -206,6 +209,8 @@ impl LoopbackTunDevice {
             receive_watch: None,
             #[cfg(test)]
             partial_flush: None,
+            #[cfg(test)]
+            rx_installed: None,
         }
     }
 
@@ -340,12 +345,16 @@ impl TunIo for LoopbackTunDevice {
         if let Some(pump) = self.ingress_pump.as_mut() {
             let mut packet = Some(pump.recv().await.ok_or_else(device_closed)??);
             self.rx.install(&mut packet, 0)?;
+            #[cfg(test)]
+            self.note_rx_installed(0);
             return Ok(());
         }
         let inbound = self.inbound.as_ref().ok_or_else(device_closed)?;
         loop {
             if let Some(pkt) = inbound.pop() {
                 self.rx.install(&mut Some(pkt.into()), 0)?;
+                #[cfg(test)]
+                self.note_rx_installed(0);
                 // D116 b1: a ready pop spends tokio's coop budget like real
                 // tokio IO, so a backlog cannot keep this task from yielding.
                 // The packet is already installed (owned by `rx`); a Pending
@@ -376,6 +385,8 @@ impl TunIo for LoopbackTunDevice {
         };
         if packet.is_some() {
             self.rx.install(&mut packet, 0)?;
+            #[cfg(test)]
+            self.note_rx_installed(1);
         }
         Ok(self.rx.has_current())
     }

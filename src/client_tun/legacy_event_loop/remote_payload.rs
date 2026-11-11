@@ -88,6 +88,8 @@ pub(in crate::client_tun) async fn handle_remote_payload_with_gate<D: TunIo>(
                 handle,
                 payload.len()
             );
+            // D191: late DATA after the terminal is settled as discarded.
+            let _ = compatibility_runtime::FlowMirror::discard_late_data(ctx, payload.len(), downstream_permit);
             return Ok(0);
         }
         RemotePayloadDisposition::TerminalNoSend => {

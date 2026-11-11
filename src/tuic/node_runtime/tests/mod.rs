@@ -3,7 +3,14 @@ mod lifecycle;
 
 impl super::super::TuicUpstream {
     pub(crate) async fn udp_native_heartbeat_for_test(&self) -> u8 {
-        let conn = self.tcp_pool_slots[0].state.lock().await.current.transport.clone();
+        let conn = self.tcp_pool_slots[0]
+            .state
+            .lock()
+            .await
+            .current
+            .transport
+            .connection()
+            .unwrap();
         match self.udp_runtime.heartbeat(&conn) {
             super::UdpTurn::Continue => 0,
             super::UdpTurn::Disconnected => 1,

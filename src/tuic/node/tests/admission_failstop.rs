@@ -54,7 +54,14 @@ impl Drop for Identity {
 }
 
 async fn transport(data: &TuicUpstream, index: usize) -> Connection {
-    data.tcp_pool_slots[index].state.lock().await.current.transport.clone()
+    data.tcp_pool_slots[index]
+        .state
+        .lock()
+        .await
+        .current
+        .transport
+        .connection()
+        .unwrap()
 }
 
 #[tokio::test(flavor = "current_thread")]

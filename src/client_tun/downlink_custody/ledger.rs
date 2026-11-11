@@ -105,6 +105,14 @@ pub(in crate::client_tun) struct EgressPermitLedger {
     next_cap_ordinal: u64,
 }
 impl EgressPermitLedger {
+    /// Bytes still held by the original in-flight capabilities.
+    pub(in crate::client_tun) fn remaining_bytes(&self) -> usize {
+        self.permits
+            .iter()
+            .map(DownstreamBytePermit::remaining_bytes)
+            .sum()
+    }
+
     pub(super) fn capture_queue_matches(&self, expected: &PermitQueueIdentity) -> bool {
         self.queue
             .as_ref()

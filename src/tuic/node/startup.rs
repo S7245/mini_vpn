@@ -214,7 +214,7 @@ impl TuicUpstream {
             .map(|(index, (conn, auth_attempts))| {
                 Arc::new(TcpPoolGenerationSlot::new(
                     index,
-                    conn,
+                    conn.into(),
                     1,
                     auth_attempts,
                     clock,

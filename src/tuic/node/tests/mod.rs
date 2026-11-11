@@ -14,6 +14,7 @@ mod staged_maintenance;
 mod staged_slow;
 mod startup;
 mod waiting_join;
+mod waiting_release;
 mod waiting_terminal;
 
 impl super::NodeHost {
@@ -117,6 +118,8 @@ pub(crate) struct NativeConnectionSample {
     pub actual_id: Option<usize>,
     pub published: bool,
     pub stats: Option<quinn::ConnectionStats>,
+    /// The Node's own connection is terminally closed (client-side detection).
+    pub closed: bool,
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NativeNodeSample {
@@ -172,6 +175,9 @@ impl NativeNodeWeakObserver {
                             actual_id: actual,
                             published: *published,
                             stats: connection.as_ref().map(quinn::Connection::stats),
+                            closed: connection
+                                .as_ref()
+                                .is_some_and(|c| c.close_reason().is_some()),
                         }
                     })
             });

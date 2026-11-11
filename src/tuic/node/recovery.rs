@@ -51,7 +51,8 @@ struct Demand {
 pub(super) struct Predecessor {
     pub(super) generation: TerminalGeneration,
     pub(super) permit: TcpPoolDrainingPermit,
-    entry: usize,
+    /// `None` only when Waiting already retired this physical entry (D152 A2).
+    entry: Option<usize>,
     healthy: bool,
 }
 pub(super) struct State {
@@ -69,6 +70,10 @@ pub(super) struct State {
     probe_custody: Vec<Option<probe::ProbeSlot>>,
     /// N2 Waiting side table (`waiting`), one row per slot.
     retries: Vec<Option<waiting::Retry>>,
+    /// D152 (A2): identity of a slot's current connection whose storage and
+    /// physical entry were released while its closed demand settled. Its
+    /// address-based stable id may be reused by a later connection.
+    released: Vec<Option<TcpPoolTransportIdentity>>,
     /// N2 counters: Waiting entries, re-mints, and retryable handshake
     /// failures (counted, never recorded as Node/session failures).
     pub(super) waits: u64,
@@ -93,6 +98,11 @@ impl State {
             .flatten()
             .filter(|slot| slot.complete())
             .count()
+    }
+
+    /// D152 (A2): this exact current connection's physical entry is retired.
+    pub(super) fn released(&self, index: usize, identity: TcpPoolTransportIdentity) -> bool {
+        self.released.get(index).copied().flatten() == Some(identity)
     }
 
     pub(super) fn has_rebuild_debt(&self) -> bool {
@@ -152,6 +162,7 @@ impl State {
             primary_permit: Arc::new(AtomicBool::new(false)),
             probe_custody: (0..count).map(|_| None).collect(),
             retries: (0..count).map(|_| None).collect(),
+            released: vec![None; count],
             waits: 0,
             reprobes: 0,
             waiting_failures: 0,
@@ -412,7 +423,10 @@ impl TuicUpstream {
     pub(in crate::tuic) fn request_aux_recovery(
         &self,
         index: usize,
-        slot: tokio::sync::MutexGuard<'_, TcpPoolGenerationSlotState<Connection>>,
+        slot: tokio::sync::MutexGuard<
+            '_,
+            TcpPoolGenerationSlotState<crate::tuic::generation_slot::SlotConnection>,
+        >,
     ) -> Result<Ticket, ClientError> {
         if !self.tcp_pool_slots.get(index).is_some_and(|expected| {
             std::ptr::eq(&expected.state, tokio::sync::MutexGuard::mutex(&slot))
@@ -674,6 +688,7 @@ async fn run_inner(
         notified.as_mut().enable();
         owner.expire_demands();
         owner.reap_stats().await?;
+        waiting::release_settled(owner, data).await?;
         let (old, primary_old, next, due) = {
             let mut state = owner.state();
             if state.stopping || state.quarantined {
@@ -931,11 +946,17 @@ async fn commit(
             io_err("tuic recovery", "activity poisoned")
         })?;
     let mut root = owner.state();
-    let old_entry = root.connections.iter().position(|entry| {
-        entry
-            .as_ref()
-            .is_some_and(|e| e.stable_id == Some(ticket.identity.stable_id) && e.published)
-    });
+    let released = root.recovery.released(ticket.index, ticket.identity);
+    // A released id may already name a newer connection (address reuse).
+    let old_entry = (!released)
+        .then(|| {
+            root.connections.iter().position(|entry| {
+                entry
+                    .as_ref()
+                    .is_some_and(|e| e.stable_id == Some(ticket.identity.stable_id) && e.published)
+            })
+        })
+        .flatten();
     let new_entry = root.connections.iter().position(|entry| {
         entry.as_ref().is_some_and(|e| {
             e.stable_id == Some(candidate.stable_id())
@@ -952,9 +973,10 @@ async fn commit(
         || !Arc::ptr_eq(&activity, &slot.current.activity)
         || (ticket.kind != Kind::Healthy && slot.current.transport.close_reason().is_none())
         || slot.draining.is_some()
-        || old_entry.is_none()
+        || old_entry.is_none() != released
         || new_entry.is_none()
         || root.connections.iter().flatten().count()
+            + root.recovery.released.iter().flatten().count()
             != data.tcp_pool_slots.len()
                 + 1
                 + [
@@ -976,7 +998,7 @@ async fn commit(
         root.quarantined = true;
         return Err(io_err("tuic recovery", "publication inventory mismatch"));
     }
-    let (Some(old_entry), Some(new_entry)) = (old_entry, new_entry) else {
+    let Some(new_entry) = new_entry else {
         return Err(recorded_failure());
     };
     // Every tagged task names one real physical entry; no duplicate connection
@@ -1038,7 +1060,7 @@ async fn commit(
     };
     let successor = if let Some(proof) = proof {
         let successor = TcpPoolGeneration::new_successor(
-            candidate,
+            candidate.into(),
             generation,
             attempts,
             data.clock,
@@ -1064,14 +1086,14 @@ async fn commit(
                 "healthy publication lacks service proof",
             ));
         }
-        TcpPoolGeneration::new(candidate, generation, attempts, data.clock)
+        TcpPoolGeneration::new(candidate.into(), generation, attempts, data.clock)
     };
     let successor_identity = successor.identity();
     let predecessor = TerminalGeneration {
         slot: ticket.index,
         current: false,
         identity: ticket.identity,
-        physical_drained: false,
+        physical_drained: released,
         activity: slot.current.activity.clone(),
         writes: slot.current.write_pressure.clone(),
         reads: slot.current.read_pressure.clone(),
@@ -1100,6 +1122,7 @@ async fn commit(
         demand.ready_identity = Some(successor_identity);
     }
     waiting::clear(&mut root.recovery, ticket.index);
+    root.recovery.released[ticket.index] = None;
     drop(root);
     drop(activity);
     drop(slot);
@@ -1128,7 +1151,7 @@ async fn finish_predecessor(owner: &StartupResources, primary: bool) -> Result<(
     if healthy {
         activity.wait_for_zero().await;
         wait_registries(owner, primary).await?;
-        if !drained {
+        if let Some(entry) = entry.filter(|_| !drained) {
             owner.retire(entry).await?;
             if let Some(old) = owner.state().recovery.predecessor_mut(primary).as_mut() {
                 old.generation.physical_drained = true;
@@ -1137,7 +1160,9 @@ async fn finish_predecessor(owner: &StartupResources, primary: bool) -> Result<(
         }
     }
     owner.reap_stats().await?;
-    let old_logger_pending = {
+    // A Waiting-released predecessor (no entry) joined its logger before
+    // release; a newer connection may reuse its address-based stable id.
+    let old_logger_pending = entry.is_some() && {
         let state = owner.state();
         let id = state
             .recovery
@@ -1152,7 +1177,7 @@ async fn finish_predecessor(owner: &StartupResources, primary: bool) -> Result<(
     if old_logger_pending {
         std::future::pending::<()>().await;
     }
-    if !drained {
+    if let Some(entry) = entry.filter(|_| !drained) {
         owner.retire(entry).await?;
         if let Some(old) = owner.state().recovery.predecessor_mut(primary).as_mut() {
             old.generation.physical_drained = true;

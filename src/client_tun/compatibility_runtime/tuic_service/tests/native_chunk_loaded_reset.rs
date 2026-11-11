@@ -300,6 +300,7 @@ async fn reset_case(hold_ack: bool, hard: bool) {
             assert!(fault.snapshot().counts.rx_dropped_datagrams > 0);
         }
         let report = tokio::time::timeout_at(original_deadline, service.run()).await;
+        let mut settled_in_extension = None;
         if hold_ack {
             assert!(report.is_err());
             if hard {
@@ -317,7 +318,14 @@ async fn reset_case(hold_ack: bool, hard: bool) {
                 // that the bounded retirement census/UI publishes in this poll.
                 // Match the existing fatal observation watchdog, never a new
                 // cleanup or clean-settlement deadline.
-                let observed_q = tokio::time::timeout_at(original_deadline + Duration::from_secs(5), async {
+                // D166 T8/T9 (docs/current/n4-close-tail-model-20261110.md):
+                // two independent owners race for this Q. T8: the Session
+                // egress deadline Qs at the parent limit while a flush is
+                // pending. T9: the flow takes its one A1 extension, the
+                // provider retires within it and completion Qs on the held
+                // ACK debt. Either way Q comes no later than the provider deadline.
+                let a1 = fixture::a1_q_deadline(&original_owner, original_deadline);
+                let observed_q = tokio::time::timeout_at(a1 + Duration::from_secs(5), async {
                     tokio::select! {
                         _ = async {
                             loop {
@@ -342,15 +350,69 @@ async fn reset_case(hold_ack: bool, hard: bool) {
                     eprintln!("[N1-RESET-Q-publication] flow={:?} debug={:?} census={:?}", original_owner.flow_observation(), original_owner.flow_debug(), original_owner.relay_event_test_bridge().unwrap().fatal_census());
                 }
                 observed_q.expect("original bounded census must publish Q without restarting its deadline");
+                let q_at = tokio::time::Instant::now();
+                let (_, extended) = original_owner
+                    .flow_provider_tail_for_test(original_id.unwrap())
+                    .expect("original Flow row");
+                let flow_q = original_owner.flow_debug().iter().any(|row| row.starts_with("stage=Quarantined"));
+                eprintln!("[D166-reset-ending] extended={extended} flow_q={flow_q} q_after_parent={:?} provider_deadline_after_parent={:?}",
+                    q_at - original_deadline, a1 - original_deadline);
+                if extended {
+                    // T9: the provider owned the remaining wait; Q ≤ P.
+                    assert!(q_at > original_deadline && q_at <= a1 + Duration::from_secs(5));
+                } else {
+                    // T8: egress Q at the parent limit; the flow tail did not Q.
+                    assert!(q_at <= original_deadline + Duration::from_secs(5));
+                    assert!(!flow_q, "flow tail Q at the parent limit without its A1 extension");
+                }
+                if extended {
+                    // T9 keeps the source-first failure, the ACK debt and the
+                    // budget Q; the retired provider/flow rows are not asserted.
+                    let ledger = original_owner.ledger();
+                    eprintln!("[D166-reset-T9] flow={:?} provider={:?} debug={:?}", original_owner.flow_observation(),
+                        original_owner.flow_native_provider_view(), original_owner.flow_debug());
+                    assert_eq!(handle.phase(), Phase::Quarantined);
+                    assert!(ledger.quarantined);
+                    assert_eq!(ledger.shutdown_deadline, original_session_deadline);
+                    assert_eq!(*saved.deadline.lock().unwrap(), Some(original_deadline));
+                    let budget = saved.backing_budget.as_ref().unwrap();
+                    assert!(budget.quarantined() && budget.used() > 0);
+                    let first = ledger.first_failure.as_ref().unwrap();
+                    return Some((first as *const _ as usize, format!("{:?}", first.facts()), first.text_bytes().to_vec()));
+                }
+            } else if handle.phase() == Phase::Quarantined {
+                // D172 non-hard E0: the fatal reset left custody uncertain at the
+                // parent limit, so the flow is Q without its A1 extension (T3/T4).
+                let tail = original_owner.flow_provider_tail_for_test(original_id.unwrap());
+                assert_eq!(tail.map(|(_, extended)| extended), Some(false));
             } else {
-            if handle.phase() != Phase::Quarantined {
-                let observed = tokio::time::timeout(
-                    Duration::from_millis(100),
-                    service.run(),
-                ).await;
-                assert!(observed.is_err());
+                // D172 non-hard (close-tail model T7|T6): the flow took its one
+                // A1 extension. T7: the provider retires within P and the
+                // release settles with the reset's first failure. T6: second
+                // expiry at P with the provider still held. No other ending passes.
+                let a1 = fixture::a1_q_deadline(&original_owner, original_deadline);
+                let mut run = Box::pin(service.run());
+                let ended = tokio::time::timeout_at(a1 + Duration::from_secs(1), std::future::poll_fn(|cx| {
+                    match run.as_mut().poll(cx) {
+                        std::task::Poll::Ready(report) => std::task::Poll::Ready(Some(report)),
+                        std::task::Poll::Pending if handle.phase() == Phase::Quarantined => std::task::Poll::Ready(None),
+                        std::task::Poll::Pending => std::task::Poll::Pending,
+                    }
+                })).await.expect("neither T7 nor T6 by P+1s");
+                let at = tokio::time::Instant::now();
+                drop(run);
+                eprintln!("[D172-reset-ending] {} at_after_parent={:?} provider_deadline_after_parent={:?}",
+                    if ended.is_some() { "T7" } else { "T6" }, at - original_deadline, a1 - original_deadline);
+                if ended.is_some() {
+                    assert!(at > original_deadline && at <= a1, "T7 outside (parent, P]");
+                } else {
+                    fixture::assert_a1_extended(&original_owner, a1);
+                    assert!(at <= a1 + Duration::from_secs(1));
+                    assert!(original_owner.flow_debug().iter().any(|row| row.starts_with("stage=Quarantined")));
+                }
+                settled_in_extension = ended;
             }
-            }
+            if settled_in_extension.is_none() {
             let owner = saved.session.lock().unwrap().as_ref().unwrap().upgrade().unwrap();
             let flow = owner.flow_observation().unwrap();
             let provider = owner.flow_native_provider_view().unwrap();
@@ -374,8 +436,9 @@ async fn reset_case(hold_ack: bool, hard: bool) {
                 assert!(budget.quarantined() && budget.used() > 0);
             }
             return Some((first as *const _ as usize, format!("{:?}", first.facts()), first.text_bytes().to_vec()));
+            }
         }
-        let report = report.unwrap();
+        let report = settled_in_extension.unwrap_or_else(|| report.unwrap());
         assert_eq!(report.session, SessionDeviceState::DeviceFailedSettled);
         assert_eq!(
             report.node,

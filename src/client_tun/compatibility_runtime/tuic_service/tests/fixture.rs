@@ -4,7 +4,7 @@ use smoltcp::socket::{tcp, udp};
 use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Address};
 
 mod native;
-pub(super) use native::{hard_q_refusal, PublicCa, ServiceProfile};
+pub(super) use native::{a1_q_deadline, assert_a1_extended, hard_q_refusal, PublicCa, ServiceProfile};
 #[path = "../../../../../tests/tuic_service/observe_window.rs"]
 mod observe_window;
 pub(super) use observe_window::{progress_window, window, ProgressElapsed, WindowElapsed};

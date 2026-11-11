@@ -66,7 +66,10 @@ impl TuicUpstream {
     pub(in crate::tuic) fn submit_healthy_replacement(
         &self,
         replacement: TcpPoolAuxiliaryReplacementPreparation,
-        slot: tokio::sync::MutexGuard<'_, TcpPoolGenerationSlotState<Connection>>,
+        slot: tokio::sync::MutexGuard<
+            '_,
+            TcpPoolGenerationSlotState<crate::tuic::generation_slot::SlotConnection>,
+        >,
         deadline: tokio::time::Instant,
     ) -> Result<Ticket, SubmissionFailure> {
         let index = replacement.index;

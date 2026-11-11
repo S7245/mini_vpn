@@ -241,7 +241,7 @@ impl OpenDispatch {
         completion.metrics_handle.inc_relays_spawned();
         let start = opens.flow_mut(id).and_then(|flow| {
             let roles = flow.roles.as_mut()?;
-            if native { roles.take_native_start(owner, id, flow.stop_deadline) }
+            if native { roles.take_native_start(owner, id) }
             else { roles.start(); None }
         });
         drop(opens);

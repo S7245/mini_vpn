@@ -57,7 +57,7 @@ impl TuicUpstream {
     pub(in crate::tuic) fn node_probe_kind(
         &self,
         reservation: &TcpPoolSlotReservation,
-        current: &TcpPoolGeneration<Connection>,
+        current: &TcpPoolGeneration<crate::tuic::generation_slot::SlotConnection>,
         proved: bool,
     ) -> Option<ProbeKind> {
         if reservation.index == 0 || reservation.active_before != 0 {
@@ -81,7 +81,10 @@ impl TuicUpstream {
     pub(in crate::tuic) fn submit_probe(
         &self,
         mut reservation: TcpPoolSlotReservation,
-        slot: tokio::sync::MutexGuard<'_, TcpPoolGenerationSlotState<Connection>>,
+        slot: tokio::sync::MutexGuard<
+            '_,
+            TcpPoolGenerationSlotState<crate::tuic::generation_slot::SlotConnection>,
+        >,
         kind: ProbeKind,
         deadline: tokio::time::Instant,
     ) -> Result<Ticket, ProbeSubmissionFailure> {
@@ -336,7 +339,7 @@ pub(super) async fn recover(
         {
             return Err(io_err("tuic probe", "original idle custody changed"));
         }
-        slot.current.transport.clone()
+        slot.current.transport.connection()?
     };
     if tokio::time::Instant::now() >= ticket.deadline {
         return Err(io_err("tuic probe", "deadline before initial phase"));

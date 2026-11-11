@@ -622,7 +622,7 @@ impl TuicUpstream {
         if guard.current.transport.close_reason().is_some() {
             None
         } else {
-            Some(guard.current.transport.clone())
+            guard.current.transport.live().cloned()
         }
     }
 
