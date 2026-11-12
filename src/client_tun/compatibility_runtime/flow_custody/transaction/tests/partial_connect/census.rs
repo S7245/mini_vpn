@@ -1,6 +1,8 @@
 //! Census-only faults with two actually admitted partial CONNECT donors.
 //! Owns only test wiring; original pool/root/physical service retain authority.
-//! A retains custody after restoration while distinct-IP B commits exactly once.
+//! A retains custody after restoration. Distinct-IP B completes its physical
+//! receipt, but the B560 release Turn checks session Q fresh before every step,
+//! so B's root ACK is refused and B is held under that Q (D195).
 use super::*;
 
 #[derive(Clone, Copy, Debug)]
@@ -313,9 +315,10 @@ async fn run(fault: Fault) {
             FlowStage::Rearming
         );
 
-        // B goes through original reset, real poll/flush, listen and ACK.
+        // B goes through original reset, real poll/flush and listen; its root
+        // ACK is refused under the session Q and the receipt stays retained.
         tokio::time::timeout(Duration::from_secs(2), async {
-            while physical.owner.flow_observation().unwrap().released != 1 {
+            while physical.owner.opens().flow_mut(b).unwrap().stage != FlowStage::Quarantined {
                 receipt::service(&mut physical, b);
                 physical.flush().await;
                 tokio::task::yield_now().await;
@@ -323,11 +326,19 @@ async fn run(fault: Fault) {
         })
         .await
         .unwrap();
-        let b_failure = physical.owner.retained_provider_failure().unwrap();
-        assert_eq!((b_failure.0, b_failure.2), sources[1]);
-        assert_eq!(b_failure.1.phase, TcpOpenPhase::Settled);
+        assert!(physical.owner.retained_provider_failure().is_none());
+        {
+            let mut opens = physical.owner.opens();
+            let flow = opens.flow_mut(b).unwrap();
+            assert!(flow.preparing);
+            assert_eq!(flow.attempt.as_ref().unwrap().view().phase, TcpOpenPhase::Settled);
+            assert_eq!(flow.escrow.as_slice(), PAYLOAD);
+            assert_eq!(flow.stop_deadline, flow_deadlines[1]);
+        }
         assert_eq!(physical.contexts[&b.handle].conn_epoch, b.epoch + 1);
-        assert!(physical.contexts[&b.handle].flow_mirror.is_none());
+        let b_mirror = physical.contexts[&b.handle].flow_mirror.as_ref().unwrap();
+        assert!(!b_mirror.quarantined && b_mirror.live_lease().is_none());
+        assert_eq!(b_mirror.commit_probe(), (true, false, true));
         assert_eq!(
             physical.server.sockets.get::<TcpSocket>(b.handle).state(),
             smoltcp::socket::tcp::State::Listen
@@ -347,8 +358,8 @@ async fn run(fault: Fault) {
             let seen = physical.owner.flow_observation().unwrap();
             assert_eq!(
                 (seen.live, seen.w, seen.f, seen.escrow_bytes, seen.reserved),
-                (1, 1, 1, PAYLOAD.len(), MAX_UPLINK_BUFFER),
-                "census {fault:?} donor must remain owned"
+                (2, 2, 2, 2 * PAYLOAD.len(), 2 * MAX_UPLINK_BUFFER),
+                "census {fault:?} donor and held B must remain owned"
             );
             assert_eq!(
                 (
@@ -358,11 +369,11 @@ async fn run(fault: Fault) {
                     seen.joined,
                     seen.running
                 ),
-                (2, 0, 1, 0, 0)
+                (2, 0, 0, 0, 0)
             );
             assert_eq!(
                 (seen.retry, seen.stopped_producers, seen.settled_providers),
-                (retry, 1, 1)
+                (retry, 2, 2)
             );
             assert!(seen.audit && physical.owner.ledger().quarantined);
             assert_eq!(source(&physical, a), sources[0]);
@@ -408,11 +419,11 @@ async fn run(fault: Fault) {
 }
 
 #[tokio::test]
-async fn census_count_fault_retains_a_and_releases_actual_b() {
+async fn census_count_fault_retains_a_and_holds_b_receipt_under_session_q() {
     run(Fault::Count).await;
 }
 
 #[tokio::test]
-async fn census_missing_lease_retains_a_and_releases_actual_b() {
+async fn census_missing_lease_retains_a_and_holds_b_receipt_under_session_q() {
     run(Fault::Lease).await;
 }

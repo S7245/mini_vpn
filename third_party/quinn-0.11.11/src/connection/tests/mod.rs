@@ -30,4 +30,7 @@ mod endpoint_source;
 mod reply_poison;
 
 #[cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
+mod unwind_drop;
+
+#[cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
 mod native_closed;

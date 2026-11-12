@@ -43,11 +43,11 @@ async fn guarded_udp_panic_keeps_error_but_proves_original_children_joined() {
             assert!(control.prepare_publication(1, 2).is_none());
             let state = host.resources.state();
             assert!(state.first.is_some());
-            // D135: the child panic (fault 2) unwinds a frame owning a live
-            // quinn RecvStream; the fork poisons that connection (no genuine
-            // Drained/ACK), so the endpoint witness fails closed. The parent
-            // panic (fault 1) holds no quinn state and still drains.
-            assert_eq!(state.endpoint_drained, fault == 1);
+            // D202 (supersedes D135 here): the child panic (fault 2) unwinds a
+            // frame owning a live quinn RecvStream, but that stream's Drop
+            // section starts during the foreign unwind and completes (D196),
+            // so the connection is not poisoned. Both faults drain cleanly.
+            assert!(state.endpoint_drained);
             drop(state);
             drop(source);
         })

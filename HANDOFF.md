@@ -512,3 +512,13 @@ Knife: compatibility recovery N2（仅本机 loopback）。P1–P3 已全部本�
 - 当前：全门 `n4-gate5-20261111` 在后台跑（raw `/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n4-gate5-20261111/`，nonhard 组新增非硬 lane-order tracer）。完成后按组报告：joint/joint2 中 `native_rebuild_fatal::hard_native_old_drain_past_deadline_expires_without_successor` 即"joint ×2"复查（单跑 10/10 绿）。
 - 已知门外既有失败（D172 基线同样失败，不在任何门组）：非硬 `native_direct_loaded_reset_holds_local_retirement_without_return_ack`、`native_permit_loaded_app_abort_with_held_peer_keeps_charged_root`。
 - 下一：读 gate5 结果 → 更新 STATUS/DECISIONS（D193）→ 报告父会话；之后由用户决定提交。不授权：N3、N5/C8、TUN、VPS、WAN、sudo、新 key、commit/push、邮件；`certs/dev/ca-cert.srl` 不动。
+
+## 新会话交接（清理阶段，2026-11-11，D194–D200，全门待跑）
+
+- 位置：N4 提交 5d473f1 之后的本地清理。**未提交。** 生产改动只有一处：quinn `connection/state_lock.rs`（StateGuard 按临界区判断中断，D196），新增 quinn 测试 `connection/tests/unwind_drop.rs`。其余均为测试对齐：control、preparation、census（D195/D198）、非硬 direct AckHeld 与 permit held（D194），以及 F7 tracer（close_tail，D197）。F6、O-N2a 只记录文档（D199/D200）。
+- 10 个失败已逐一归类：C1 D62 过时（4）、C2 B560 过时（2）、C3 quinn 缺陷已修（2）、C4 D152 A1 过时（2）。raw 在 `/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/cleanup-20261111/`（bisect/、probe1/、probe2/、mut/、repeat/、c4/）。
+- 门 `cleanup-gate-20261111` 已跑（D201）：除 joint/joint2 外全绿。joint 两次都红同样 2 行：`primary_recovery::guarded_udp_panic…`（D196 与 D135 的对齐冲突，确定性）、`hard_native_ordered_chunk_loaded_reset_keeps_source_first_and_ack_debt`（负载下 'original Flow row'，单跑前后都绿，未归因）。停止，待用户选 D196 保留（对齐 primary_recovery 并归因 chunk 行）或回退（C3 两行改记为 D135 合同下过时、对齐测试）。不授权：commit/push、N3/N5/C8、TUN/VPS/WAN/sudo/M2、新 key、邮件；`AGENTS.md`、`certs/dev/ca-cert.srl` 不动。
+- 待用户：D195 后续（soft session Q 之后任何 flow 都不能 release）是设计问题，未修。
+
+- 2026-11-11 续（D202–D204）：用户"Keep the fix"。primary_recovery 已对齐（m-sl 红）；chunk-reset 行判为既有负载时序测试假象（D203，D196 前同样 1/16）。joint ×2：joint 847/847 绿，joint2 846/847：同一行进入"行已释放"的 T9 变体后，`ledger.quarantined` 断言失败（Q 属 Service 预算检查，不属 flow 账本）。停止，待批 D204 方案（T9 拆成 T9a/T9b，先用 D196 前探针确认）。
+- 2026-11-11 续（D205–D206）：用户"Approve D204"。T9 拆成 T9a/T9b（测试 + 模型文档），D196 前探针确认 T9b 同态；变异 m-t9b、m-budget 分别使对应分支红。joint ×2：joint2 847/847；joint 846/847，仅 D190 已知 teardown flake（单跑 5/5 绿）。停止，待用户决定提交。

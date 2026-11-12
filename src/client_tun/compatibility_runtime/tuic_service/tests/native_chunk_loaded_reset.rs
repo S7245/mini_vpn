@@ -351,9 +351,21 @@ async fn reset_case(hold_ack: bool, hard: bool) {
                 }
                 observed_q.expect("original bounded census must publish Q without restarting its deadline");
                 let q_at = tokio::time::Instant::now();
-                let (_, extended) = original_owner
-                    .flow_provider_tail_for_test(original_id.unwrap())
-                    .expect("original Flow row");
+                // D203/D205: in T9 the row may already be released within its
+                // extension when Q publishes (T9b); only an extended flow
+                // outlives the parent limit, so a released row is T9 by construction.
+                let row_present = original_owner.flow_provider_tail_for_test(original_id.unwrap()).is_some();
+                let extended = match original_owner.flow_provider_tail_for_test(original_id.unwrap()) {
+                    Some((_, extended)) => extended,
+                    None => {
+                        let flow = original_owner.flow_observation().unwrap();
+                        assert_eq!((flow.live, flow.f, flow.released, flow.joined), (0, 0, 1, 5));
+                        assert!(flow.audit && flow.last_data_disposition.is_some());
+                        assert!(original_owner.flow_native_provider_view().is_none());
+                        assert!(q_at > original_deadline, "row released before the parent limit");
+                        true
+                    }
+                };
                 let flow_q = original_owner.flow_debug().iter().any(|row| row.starts_with("stage=Quarantined"));
                 eprintln!("[D166-reset-ending] extended={extended} flow_q={flow_q} q_after_parent={:?} provider_deadline_after_parent={:?}",
                     q_at - original_deadline, a1 - original_deadline);
@@ -367,12 +379,15 @@ async fn reset_case(hold_ack: bool, hard: bool) {
                 }
                 if extended {
                     // T9 keeps the source-first failure, the ACK debt and the
-                    // budget Q; the retired provider/flow rows are not asserted.
+                    // budget Q. T9a: Q publishes before the row is released and
+                    // the flow ledger is Q. T9b (D205): the flow released cleanly
+                    // inside its extension, so the ledger stays clean and the Q
+                    // is the Service budget check's alone.
                     let ledger = original_owner.ledger();
                     eprintln!("[D166-reset-T9] flow={:?} provider={:?} debug={:?}", original_owner.flow_observation(),
                         original_owner.flow_native_provider_view(), original_owner.flow_debug());
                     assert_eq!(handle.phase(), Phase::Quarantined);
-                    assert!(ledger.quarantined);
+                    assert_eq!(ledger.quarantined, row_present, "T9a ledger Q iff the row is still held");
                     assert_eq!(ledger.shutdown_deadline, original_session_deadline);
                     assert_eq!(*saved.deadline.lock().unwrap(), Some(original_deadline));
                     let budget = saved.backing_budget.as_ref().unwrap();

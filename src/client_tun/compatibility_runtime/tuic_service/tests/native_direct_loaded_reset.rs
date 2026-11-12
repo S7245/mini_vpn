@@ -302,8 +302,9 @@ async fn exercise(ending: Ending, hard: bool) {
             // The deadline → Q publication takes several task hops after the
             // timer tick this observer shares (D29): keep driving the original
             // run until the parent phase is published.
-            // D152 (A1): hard Q follows the provider deadline, not the parent limit.
-            let a1 = hard.then(|| fixture::a1_q_deadline(&original_owner, original_deadline));
+            // D152 (A1): Q follows the provider deadline, not the parent limit;
+            // the extension has no meter gate, so non-hard rows get it too (D194).
+            let a1 = Some(fixture::a1_q_deadline(&original_owner, original_deadline));
             let wait = a1.map_or(Duration::ZERO, |provider| {
                 provider.saturating_duration_since(tokio::time::Instant::now())
             });
@@ -329,7 +330,7 @@ async fn exercise(ending: Ending, hard: bool) {
             let at = tokio::time::Instant::now();
             drop(run);
             if let Some(report) = ended {
-                let provider = a1.expect("non-hard ACK-held direct custody falsely completed after parent deadline");
+                let provider = a1.expect("A1 provider deadline");
                 eprintln!("[D187-direct-ack-ending] T7 at_after_parent={:?} provider_after_parent={:?} report={report:?}",
                     at - original_deadline, provider - original_deadline);
                 assert!(at > original_deadline && at <= provider, "T7 outside (parent, P]");
@@ -346,9 +347,11 @@ async fn exercise(ending: Ending, hard: bool) {
                 assert_eq!(backing.as_ref().unwrap().snapshot().physical_bytes, 0);
                 assert_eq!(owner.ledger().shutdown_deadline, original_session_deadline);
                 assert_eq!(*saved.deadline.lock().unwrap(), Some(original_deadline));
-                let budget = saved.backing_budget.as_ref().unwrap();
-                assert_eq!(budget.used(), 0);
-                assert!(!budget.quarantined());
+                if hard {
+                    let budget = saved.backing_budget.as_ref().unwrap();
+                    assert_eq!(budget.used(), 0);
+                    assert!(!budget.quarantined());
+                }
                 return;
             }
             if let Some(provider) = a1 { fixture::assert_a1_extended(&original_owner, provider); }

@@ -173,9 +173,16 @@ async fn budget_case(
             };
             assert_eq!(observed, vec![(FlowStage::Opening, Some(first), budget > 1), second],
                 "forward phases must use remaining tokens before another table scan; no-credit Opening stops");
-            assert!(matches!(event, Poll::Ready(Some(OpenEvent::Yield))));
-            assert_eq!(owner.control_remaining.load(Ordering::Relaxed), 0);
-            assert_eq!(owner.opens().cursor, if budget < 4 { 0 } else if budget == 32 { 26 } else { 1 });
+            // D62 R-a/R-b: empty rows spend no control; with credit left after
+            // both flows the pass wraps and parks (24 of 32 unspent).
+            if budget == 32 {
+                assert!(event.is_pending());
+                assert_eq!(owner.control_remaining.load(Ordering::Relaxed), 24);
+            } else {
+                assert!(matches!(event, Poll::Ready(Some(OpenEvent::Yield))));
+                assert_eq!(owner.control_remaining.load(Ordering::Relaxed), 0);
+            }
+            assert_eq!(owner.opens().cursor, usize::from(budget == 4));
             let seen = owner.flow_observation().unwrap();
             assert_eq!((seen.live, seen.w, seen.f, seen.attempts),
                 (2, 2, if budget == 32 { 2 } else { 1 }, if budget == 32 { 2 } else { 1 }));
@@ -233,9 +240,15 @@ async fn budget_case(
             expected,
             "the same pool preparation must not wait a full scan when another control token exists"
         );
-        assert!(matches!(event, Poll::Ready(Some(OpenEvent::Yield))));
-        assert_eq!(owner.control_remaining.load(Ordering::Relaxed), 0);
-        assert_eq!(owner.opens().cursor, if budget == 1 { 0 } else { 27 });
+        // D62 R-a/R-b: with credit left after both flows the pass parks.
+        if budget == 32 {
+            assert!(event.is_pending());
+            assert_eq!(owner.control_remaining.load(Ordering::Relaxed), 25);
+        } else {
+            assert!(matches!(event, Poll::Ready(Some(OpenEvent::Yield))));
+            assert_eq!(owner.control_remaining.load(Ordering::Relaxed), 0);
+        }
+        assert_eq!(owner.opens().cursor, 0);
         let seen = owner.flow_observation().unwrap();
         assert_eq!((seen.live, seen.w, seen.f, seen.attempts),
             (2, 2, if budget == 1 { 1 } else { 2 }, if budget == 1 { 1 } else { 2 }));
@@ -314,7 +327,11 @@ async fn budget_case(
                 }
                 if check {
                     let seen = owner.flow_observation().unwrap();
-                    assert_eq!(owner.control_remaining.load(Ordering::Relaxed), 0);
+                    // One token per occupied flow (D62 R-a), never the empty rows.
+                    assert_eq!(
+                        owner.control_remaining.load(Ordering::Relaxed),
+                        if stop_budget == 32 { 30 } else { 0 }
+                    );
                     assert_eq!(dirty.len(), seen.stopped_producers);
                     first_stop = Some((
                         seen.stopped_producers,

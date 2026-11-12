@@ -281,6 +281,35 @@ async fn app_abort_then_provider_wait_is_one_expiry_only() {
     );
 }
 
+/// F7 (N4 review, D197): App progress can re-arm the tail past the provider
+/// deadline P fixed at the first cancel, so A1 would have nothing left to
+/// grant. None is needed: a provider keeping the TcpOpenAttempt contract
+/// quarantines itself at P (staged.rs "retirement observed after deadline"),
+/// so the flow ends Q at P, never later, without using the one extension.
+#[tokio::test(start_paused = true)]
+async fn app_progress_past_provider_deadline_ends_q_at_the_provider_bound() {
+    let closed = tokio::time::Instant::now().into_std();
+    let (owner, id, facts) = provider_retiring_flow().await;
+    let provider = closed + TAIL + PROVIDER_LOSS_BOUND;
+    assert_eq!(*facts.1.lock().unwrap(), Some(provider));
+    let mut outstanding = 1000;
+    with_flow(&owner, id, |flow| flow.app_tail_wait(outstanding));
+    while tokio::time::Instant::now().into_std() + TAIL <= provider {
+        tokio::time::advance(Duration::from_secs(10)).await;
+        outstanding -= 10; // the slow App keeps acknowledging bytes
+        with_flow(&owner, id, |flow| flow.app_tail_wait(outstanding));
+        assert_eq!(drive(&owner, id).0, FlowStage::Closing);
+    }
+    let rearmed = drive(&owner, id).2.unwrap();
+    assert!(rearmed > provider, "the tail was re-armed past P");
+    let now = tokio::time::Instant::now().into_std();
+    tokio::time::advance(provider - now - Duration::from_millis(1)).await;
+    assert_eq!(drive(&owner, id).0, FlowStage::Closing);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert_eq!(drive(&owner, id).0, FlowStage::Quarantined, "Q at P, not at the re-armed tail");
+    assert_eq!(owner.flow_provider_tail_for_test(id), Some((Some(provider.into()), false)));
+}
+
 /// D166 T5/T4: a limit the grant already answered (the expired parent limit,
 /// re-offered by a later Native disposal or uplink/cold settlement) cannot pull
 /// the extended deadline back into the past.

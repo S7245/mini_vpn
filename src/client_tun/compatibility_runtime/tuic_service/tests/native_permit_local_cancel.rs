@@ -192,9 +192,10 @@ async fn local_abort_case(peer_finishes: bool, hard: bool) {
                     report = service.run() => panic!("held Native Permit peer completed before deadline: {report:?}"),
                 }
             }
-            // D152 (A1): hard Q follows the provider deadline, not the parent limit.
-            let a1 = hard.then(|| {
-                assert_eq!(phase, Phase::Incomplete, "hard Q at the parent limit: no A1 extension");
+            // D152 (A1): Q follows the provider deadline, not the parent limit;
+            // the extension has no meter gate, so non-hard rows get it too (D194).
+            let a1 = Some({
+                assert_eq!(phase, Phase::Incomplete, "Q at the parent limit: no A1 extension");
                 fixture::a1_q_deadline(&saved.session.lock().unwrap().as_ref().unwrap().upgrade().unwrap(), original_deadline)
             });
             if phase == Phase::Incomplete {
