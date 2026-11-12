@@ -136,7 +136,7 @@ async fn hard_native_old_drain_with_retained_data_stays_incomplete() {
             let facts = ledger.first_failure.as_ref().expect("typed expiry").facts();
             assert_eq!(facts.origin.phase, crate::shared::errors::FailurePhase::SessionLoop);
             assert_eq!(facts.io_kind, Some(std::io::ErrorKind::TimedOut));
-            assert!(!ledger.quarantined);
+            assert!(!ledger.quarantined());
             // D107 F3: the bounded verdict and the late Expired settlement are
             // one expiry event, recorded once.
             assert_eq!(ledger.additional_failures, 0, "one expiry, one TimedOut record");
@@ -168,7 +168,7 @@ async fn hard_native_settled_drain_custody_contradiction_is_sticky_q() {
         {
             let ledger = old.ledger();
             let first = ledger.first_failure.as_ref().map(|f| f.facts().class.clone());
-            println!("C4 T2 session first={first:?} q={}", ledger.quarantined);
+            println!("C4 T2 session first={first:?} q={}", ledger.quarantined());
             assert!(ledger.first_failure.is_none(), "D102 observation: Node-local first only");
         }
         assert!(budget.quarantined(), "contradiction quarantines the shared budget");
@@ -218,7 +218,7 @@ async fn refused(fault: u8, node: crate::tuic::NodeShutdown, failed: bool, expec
         assert_eq!(disposition(&mut rig), expected);
         {
             let ledger = old.ledger();
-            assert!(!ledger.quarantined);
+            assert!(!ledger.quarantined());
             match ledger.first_failure.as_ref() {
                 Some(first) => {
                     let facts = first.facts();

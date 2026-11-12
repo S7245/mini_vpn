@@ -120,7 +120,7 @@ pub(super) fn ledger(saved: &Control) -> (bool, bool, usize, usize, usize) {
         .map_or((0, 0, 0), |f| (f.live, f.opening_providers, f.waiting));
     let ledger = control.ledger();
     (
-        ledger.quarantined,
+        ledger.quarantined(),
         ledger.first_failure.is_some(),
         flows.0,
         flows.1,

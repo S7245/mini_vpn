@@ -184,14 +184,14 @@ async fn hard_native_resume_error_is_typed_without_successor_data_or_q() {
             assert!(!Arc::ptr_eq(current, old), "failure owned by the successor");
             {
                 let ledger = old.ledger();
-                assert!(ledger.first_failure.is_none() && !ledger.quarantined);
+                assert!(ledger.first_failure.is_none() && !ledger.quarantined());
             }
         }
         {
             let ledger = current.ledger();
             let facts = ledger.first_failure.as_ref().expect("typed resume failure").facts();
             assert_eq!(facts.raw_os_code, Some(13), "original resume error retained");
-            assert!(!ledger.quarantined);
+            assert!(!ledger.quarantined());
         }
         assert_eq!(current.flow_observation().map(|f| f.published).unwrap_or(0), 0,
             "successor never published DATA");
@@ -231,7 +231,7 @@ async fn hard_native_resume_panic_is_sticky_q_without_successor_data() {
         assert!(report.is_none(), "resume panic never completes: {report:?}");
         {
             let ledger = old.ledger();
-            assert!(ledger.quarantined, "original session owns the unknown Device");
+            assert!(ledger.quarantined(), "original session owns the unknown Device");
             let facts = ledger.first_failure.as_ref().unwrap().facts();
             assert_eq!(facts.origin.phase, crate::shared::errors::FailurePhase::DeviceShutdown);
         }
@@ -335,7 +335,7 @@ async fn hard_native_old_drain_past_deadline_expires_without_successor() {
             let facts = ledger.first_failure.as_ref().expect("typed expiry").facts();
             assert_eq!(facts.origin.phase, crate::shared::errors::FailurePhase::SessionLoop);
             assert_eq!(facts.io_kind, Some(std::io::ErrorKind::TimedOut));
-            assert!(!ledger.quarantined);
+            assert!(!ledger.quarantined());
         }
         assert!(!rig.handle.request_rebuild(), "no further generation");
         assert!(!budget.quarantined());

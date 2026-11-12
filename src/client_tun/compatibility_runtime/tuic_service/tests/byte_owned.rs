@@ -101,7 +101,7 @@ async fn byte_owned_pending_quinn_reader_stops_joins_and_settles_original_servic
                     assert_eq!((flow.published, flow.released, flow.f), (1, 0, 1));
                     assert_eq!((flow.w, flow.reserved, flow.escrow_bytes), (0, 0, 0));
                     assert!(flow.audit);
-                    assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined);
+                    assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined());
                     assert_eq!(*saved.deadline.lock().unwrap(), Some(original_deadline));
                     break;
                 }
@@ -137,7 +137,7 @@ async fn byte_owned_pending_quinn_reader_stops_joins_and_settles_original_servic
         assert_eq!((flow.live, flow.w, flow.f, flow.running), (0, 0, 0, 0));
         assert_eq!((flow.reserved, flow.escrow_bytes), (0, 0));
         assert!(flow.audit);
-        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined);
+        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined());
         assert_eq!(*saved.deadline.lock().unwrap(), Some(original_deadline));
         let physical = backing.as_ref().unwrap().snapshot();
         assert_eq!(
@@ -291,7 +291,7 @@ async fn byte_owned_charged_payload_stops_joins_without_false_budget_release() {
                     assert_eq!((flow.published, flow.released, flow.f), (1, 0, 1));
                     assert_eq!((flow.w, flow.reserved, flow.escrow_bytes), (0, 0, 0));
                     assert!(flow.audit);
-                    assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined);
+                    assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined());
                     assert_eq!(*saved.deadline.lock().unwrap(), Some(original_deadline));
                     let (queue, budget, same_budget) = owner.flow_d16_physical_snapshots().unwrap();
                     assert!(same_budget);
@@ -356,7 +356,7 @@ async fn byte_owned_charged_payload_stops_joins_without_false_budget_release() {
         assert_eq!((flow.live, flow.w, flow.f, flow.running), (1, 0, 1, 0));
         assert_eq!((flow.reserved, flow.escrow_bytes), (0, 0));
         assert!(flow.audit);
-        assert!(owner.ledger().first_failure.is_none() && owner.ledger().quarantined);
+        assert!(owner.ledger().first_failure.is_none() && owner.ledger().quarantined());
         assert_eq!(*saved.deadline.lock().unwrap(), Some(original_deadline));
         let (queue, budget, same_budget) = owner.flow_d16_physical_snapshots().unwrap();
         assert!(same_budget);
@@ -581,7 +581,7 @@ async fn run_full_delivery(reply_bytes: usize) {
         assert_eq!((flow.live, flow.w, flow.f, flow.running), (0, 0, 0, 0));
         assert_eq!((flow.reserved, flow.escrow_bytes), (0, 0));
         assert!(flow.audit);
-        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined);
+        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined());
         assert_eq!(*saved.deadline.lock().unwrap(), Some(original_deadline));
         let physical = backing.as_ref().unwrap().snapshot();
         assert_eq!(

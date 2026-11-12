@@ -99,7 +99,7 @@ where
             Err(payload) => {
                 // Keep actual D in this original future. In particular, do not
                 // unwind through D to reach the outer saved-future guard.
-                initial_owner.ledger().quarantined = true;
+                initial_owner.quarantine_quiet();
                 initial_owner.record(RetainedFailure::opaque_panic(SessionControl::origin(
                     FailurePhase::DeviceRead,
                 )));
@@ -178,7 +178,7 @@ where
                 },
                 state = host.start() => state,
             };
-            if owner.ledger().quarantined {
+            if owner.ledger().quarantined() {
                 saved.stop_session(&owner);
                 saved.publish(Phase::Quarantined);
                 std::future::pending::<()>().await;
@@ -390,7 +390,7 @@ where
                     if !retiring { saved.stop_session(&owner); }
                 },
             }
-            if owner.ledger().quarantined {
+            if owner.ledger().quarantined() {
                 saved.stop_session(&owner);
                 saved.publish(Phase::Quarantined);
             }
@@ -414,7 +414,7 @@ where
             && rebuilds == 0
             && !saved.stop.stopping.load(Ordering::Acquire)
             && business_state == SessionDeviceState::BusinessSettled
-            && !owner.ledger().quarantined
+            && !owner.ledger().quarantined()
             && namespace.fake_pool.usage().1 == 0
             && timely;
         if can_retire {
@@ -538,7 +538,7 @@ where
         });
         std::future::poll_fn(|cx| {
             let result = physical.as_mut().poll(cx);
-            if owner.ledger().quarantined {
+            if owner.ledger().quarantined() {
                 saved.stop_session(&owner);
                 saved.publish(Phase::Quarantined);
             }

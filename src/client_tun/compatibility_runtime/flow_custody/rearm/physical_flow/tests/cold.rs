@@ -211,7 +211,7 @@ fn fire_stop(owner: &SessionControl, id: FlowIdentity, probe: &Probe) {
     assert!(flow.preparing && flow.attempt.is_none() && flow.carrier.is_none());
     assert!(flow.w_held && flow.f_held && flow.roles.is_none() && !flow.published);
     flow.close(("root", "session_stop"));
-    flow.drive(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+    assert!(flow.drive(&mut std::task::Context::from_waker(std::task::Waker::noop())));
     assert_eq!(flow.stage, FlowStage::Closing);
     assert!(flow.preparing);
     if probe.mode == 1 {
@@ -574,7 +574,7 @@ impl SessionControl {
         let ledger = self.ledger();
         assert!(ledger.first_failure.is_none());
         assert_eq!(ledger.additional_failures, 0);
-        assert!(ledger.quarantined && self.stop.stopping.load(Ordering::Acquire));
+        assert!(ledger.quarantined() && self.stop.stopping.load(Ordering::Acquire));
         assert_eq!(ledger.shutdown_deadline.map(tokio::time::Instant::into_std), Some(expected));
         assert!(self.app_meter.as_ref().unwrap().is_quarantined());
     }

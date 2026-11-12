@@ -42,29 +42,6 @@ impl QuietFailureSink for SessionControl {
         }
     }
 }
-impl SessionControl {
-    pub(super) fn quarantine_quiet(&self) {
-        let proposed = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        let parent = self.parent_deadline.get().and_then(|deadline| {
-            *deadline
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        });
-        let mut ledger = self.ledger();
-        ledger.quarantined = true;
-        ledger.shutdown_deadline = Some(
-            parent
-                .into_iter()
-                .chain(ledger.shutdown_deadline)
-                .fold(proposed, std::cmp::min),
-        );
-        self.stop.stopping.store(true, Ordering::Release);
-        if let Some(meter) = &self.app_meter {
-            meter.quarantine();
-        }
-    }
-}
-
 impl Drop for SessionControl {
     fn drop(&mut self) {
         let Some(meter) = self
@@ -93,24 +70,11 @@ impl Drop for SessionControl {
         // DATA admission observes the same budget Q before any original slot
         // is detached. No destructor, notification or synthetic JOIN runs here.
         meter.quarantine();
-        self.stop.stopping.store(true, Ordering::Release);
-        let proposed = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        let parent = self.parent_deadline.get().and_then(|deadline| {
-            *deadline
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        });
+        self.quarantine_session_owned();
         let ledger = self
             .ledger
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        ledger.quarantined = true;
-        ledger.shutdown_deadline = Some(
-            parent
-                .into_iter()
-                .chain(ledger.shutdown_deadline)
-                .fold(proposed, std::cmp::min),
-        );
         std::mem::forget(ledger.first_egress_io.take());
         let opens = self
             .opens

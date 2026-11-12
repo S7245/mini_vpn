@@ -209,7 +209,7 @@ async fn pressure(permit: bool) {
         let owner = service.completion.as_ref().unwrap().control.clone();
         let flow = owner.flow_observation().unwrap();
         assert_eq!((flow.published, flow.joined, flow.released, flow.f), (1,5,1,0));
-        assert!(flow.audit && owner.ledger().first_failure.is_none() && !owner.ledger().quarantined);
+        assert!(flow.audit && owner.ledger().first_failure.is_none() && !owner.ledger().quarantined());
         let (_, bytes, transferred, discarded, _) = flow.last_data_disposition.unwrap();
         assert_eq!((bytes, transferred, discarded), (REPLY,REPLY,0));
         assert_eq!(backing.as_ref().unwrap().snapshot().physical_bytes, 0);

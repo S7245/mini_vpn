@@ -28,7 +28,7 @@ fn ready_custody(owner: &SessionControl) -> (FrozenReady, tokio::time::Instant) 
         (seen.published, seen.released, seen.joined, seen.running),
         (0, 0, 0, 0)
     );
-    assert!(seen.audit && !owner.ledger().quarantined);
+    assert!(seen.audit && !owner.ledger().quarantined());
     let opens = owner.opens();
     let slot = opens.slots.iter().flatten().next().unwrap();
     let OpenPhase::Flow(flow) = &slot.phase else {
@@ -75,7 +75,7 @@ fn ready_settled(owner: &SessionControl) -> (usize, String) {
         ),
         (1, 1, 0, 0, 0)
     );
-    assert!(seen.audit && !owner.ledger().quarantined);
+    assert!(seen.audit && !owner.ledger().quarantined());
     let failure = owner.retained_provider_failure().unwrap();
     assert_eq!(failure.1.phase, TcpOpenPhase::Settled);
     assert_eq!(failure.1.connect_written, encode_connect(&target()).len());

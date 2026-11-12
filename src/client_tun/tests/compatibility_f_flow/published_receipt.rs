@@ -240,7 +240,7 @@ impl ReceiptScenario {
                     (first.id, first.disposition, calls)
                 );
                 assert!(held.row_held && held.quarantined && held.original_matches);
-                assert!(session.control.ledger().quarantined);
+                assert!(session.control.ledger().quarantined());
                 let seen = session.control.flow_observation().unwrap();
                 assert_eq!(
                     (seen.live, seen.f, seen.released, seen.retry, seen.joined),
@@ -262,7 +262,7 @@ impl ReceiptScenario {
                 );
                 assert_eq!(seen.last_data_disposition, Some(first.disposition));
                 assert!(!session.control.held_receipt().unwrap().row_held);
-                assert!(!session.control.ledger().quarantined);
+                assert!(!session.control.ledger().quarantined());
             }
         }
         self.exchange(session, apps, *b"two!").await;

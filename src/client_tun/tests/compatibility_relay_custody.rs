@@ -572,7 +572,7 @@ async fn session_unknown_device_callbacks_preserve_custody_in_sticky_quarantine(
         }
         {
             let ledger = session.control.ledger();
-            assert!(ledger.quarantined);
+            assert!(ledger.quarantined());
             assert_eq!(ledger.additional_failures, 0);
             assert_eq!(
                 ledger.first_failure.as_ref().unwrap().facts().origin.phase,

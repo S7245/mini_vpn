@@ -200,7 +200,7 @@ async fn loaded_terminal_case(ending: Ending, hard: bool) {
             let meter = backing.as_ref().unwrap().snapshot();
             let ledger = owner.ledger();
             eprintln!("Native Permit loaded RESET wait: flow={flow:?} debug={debug:?} queue={queue:?} meter={meter:?} first={:?} Q={} peer={:?}",
-                ledger.first_failure.as_ref().map(|first| first.facts()), ledger.quarantined,
+                ledger.first_failure.as_ref().map(|first| first.facts()), ledger.quarantined(),
                 peer.as_ref().map(|conn| conn.stats()));
             panic!("loaded Native Permit RESET disposition: {elapsed}");
         });
@@ -354,7 +354,7 @@ async fn loaded_terminal_case(ending: Ending, hard: bool) {
             assert_eq!(transferred.checked_add(discarded), Some(total));
             if hard { flow.assert_permit_reset_receipt(); }
             else { flow.assert_permit_reset_balance(original_queue.as_ref().unwrap()); }
-            assert!(flow.audit && !owner.ledger().quarantined);
+            assert!(flow.audit && !owner.ledger().quarantined());
             let ledger = owner.ledger();
             if remote_reset {
                 let first = ledger.first_failure.as_ref().unwrap();
@@ -414,7 +414,7 @@ async fn loaded_terminal_case(ending: Ending, hard: bool) {
         let owner = saved.session.lock().unwrap().as_ref().unwrap().upgrade().unwrap();
         let flow = owner.flow_observation().unwrap();
         assert_eq!((flow.published, flow.released, flow.joined, flow.f), (1, 0, 5, 1));
-        assert!(owner.ledger().quarantined);
+        assert!(owner.ledger().quarantined());
         if remote_reset {
             let ledger = owner.ledger();
             let first = ledger.first_failure.as_ref().unwrap();

@@ -17,6 +17,7 @@ pub(in crate::client_tun) use receive_window::ReaderWindow;
 pub(in crate::client_tun) use receive_window::ReceiveWindow;
 
 pub(in crate::client_tun::compatibility_runtime) use transaction::OpenCustody;
+pub(in crate::client_tun::compatibility_runtime) use transaction::FlowQRow;
 pub(in crate::client_tun::compatibility_runtime) use transaction::ROOT_GEOMETRY;
 pub(in crate::client_tun::compatibility_runtime) use transaction::custody::Owner as OpenOwner;
 pub(in crate::client_tun) use transaction::{HandshakeNotice, OpenDispatch, OpenEvent};

@@ -58,13 +58,13 @@ async fn physical_scan_shares_control_budget_wraps_and_leaves_unused_epochs_unch
             .all(|ctx| ctx.conn_epoch == 0 && ctx.local_reset.is_none())
     );
     assert!(dispatch.flow_shutdown_complete(&sockets, &mut contexts, &pool));
-    assert!(!owner.ledger().quarantined);
+    assert!(!owner.ledger().quarantined());
     // A stopped default Legacy owner still has legal physical relay resources.
     *owner.opens() = OpenCustody::default();
     contexts.values_mut().next().unwrap().uplink_tx = Some(crate::client_tun::uplink::channel(1).0);
     assert!(!dispatch.flow_shutdown_complete(&sockets, &mut contexts, &pool));
     assert!(
-        !owner.ledger().quarantined,
+        !owner.ledger().quarantined(),
         "F census cannot quarantine Legacy"
     );
     assert!(contexts.values().any(|ctx| ctx.uplink_tx.is_some()));
@@ -118,7 +118,7 @@ async fn unknown_no_flow_identity_or_resources_are_retained_without_reset() {
                 !dispatch.flow_shutdown_complete(&server.sockets, &mut contexts, &pool),
                 "case {case}"
             );
-            assert!(owner.ledger().quarantined);
+            assert!(owner.ledger().quarantined());
             assert_eq!(owner.ledger().shutdown_deadline, deadline);
             let socket = server.sockets.get::<TcpSocket>(server.handle);
             assert_eq!(
@@ -191,7 +191,7 @@ async fn root_without_mirror_cannot_be_reclassified_as_bare_socket() {
         )
     );
     assert_eq!(owner.control_remaining.load(Ordering::Relaxed), 31);
-    assert!(!owner.ledger().quarantined);
+    assert!(!owner.ledger().quarantined());
     let ctx = contexts.get_mut(&server.handle).unwrap();
     let mirror = ctx.flow_mirror.take().unwrap(); // Retain the contradictory physical capability.
     ctx.state = SocketState::Listening;
@@ -209,7 +209,7 @@ async fn root_without_mirror_cannot_be_reclassified_as_bare_socket() {
         0,
     );
     assert!(!dispatch.flow_shutdown_complete(&server.sockets, &mut contexts, &pool));
-    assert!(owner.ledger().quarantined);
+    assert!(owner.ledger().quarantined());
     assert_eq!(
         server
             .sockets
@@ -231,7 +231,7 @@ async fn orphan_context_fails_reverse_physical_census() {
     let socket = server.sockets.remove(server.handle);
     owner.request_stop();
     assert!(!dispatch.flow_shutdown_complete(&server.sockets, &mut contexts, &FakeIpPool::new()));
-    assert!(owner.ledger().quarantined);
+    assert!(owner.ledger().quarantined());
     assert_eq!(contexts[&server.handle].conn_epoch, 0);
     assert!(matches!(socket, smoltcp::socket::Socket::Tcp(_)));
 }
@@ -286,7 +286,7 @@ async fn delayed_no_flow_reset_keeps_first_root_shutdown_deadline() {
             .quarantined()
     );
     assert!(!dispatch.flow_shutdown_complete(&server.sockets, &mut contexts, &pool));
-    assert!(owner.ledger().quarantined);
+    assert!(owner.ledger().quarantined());
     assert_eq!(owner.ledger().shutdown_deadline, Some(deadline));
     assert_eq!(contexts[&server.handle].conn_epoch, 0);
     assert_eq!(

@@ -300,7 +300,7 @@ async fn exercise_host(quarantine: bool) {
                     assert!(poll_once(host.drive_until_settled()).await.is_none());
                     let after = control.flow_observation().unwrap();
                     if after.joined == 3 && after.settled_providers == 1
-                        && peer_stop.load(Ordering::SeqCst) && control.ledger().quarantined {
+                        && peer_stop.load(Ordering::SeqCst) && control.ledger().quarantined() {
                         break;
                     }
                     tokio::task::yield_now().await;

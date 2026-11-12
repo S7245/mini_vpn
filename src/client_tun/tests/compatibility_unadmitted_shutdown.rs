@@ -141,7 +141,7 @@ async fn idle_shutdown(end: End) {
         if end == End::FailedFlush {
             let (source, facts) = {
                 let ledger = session.control.ledger();
-                assert!(ledger.quarantined);
+                assert!(ledger.quarantined());
                 let source = ledger.first_egress_io.as_ref().unwrap().clone();
                 assert_eq!(source.raw_os_error(), Some(5));
                 (
@@ -156,7 +156,7 @@ async fn idle_shutdown(end: End) {
                     SessionDeviceState::Incomplete
                 );
                 let ledger = session.control.ledger();
-                assert!(ledger.quarantined);
+                assert!(ledger.quarantined());
                 assert!(Arc::ptr_eq(
                     &source,
                     ledger.first_egress_io.as_ref().unwrap()
@@ -174,7 +174,7 @@ async fn idle_shutdown(end: End) {
                 );
             }
         } else {
-            assert!(!session.control.ledger().quarantined);
+            assert!(!session.control.ledger().quarantined());
             assert!(session.control.ledger().first_failure.is_none());
         }
     })

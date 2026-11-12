@@ -64,7 +64,7 @@ async fn saved_f_stale_fake_ip_is_refused_before_receive_or_factory() {
         );
         assert!(snapshot.audit);
         let ledger = session.control.ledger();
-        assert!(!ledger.quarantined && ledger.first_failure.is_none());
+        assert!(!ledger.quarantined() && ledger.first_failure.is_none());
         // The actual app observed RST. Exact epoch/recv ordering is additionally
         // covered at the original-loop admission/gateway seam, not inferred
         // from a fabricated global event or direct context mutation.
@@ -357,7 +357,7 @@ async fn saved_f_provider_rejection_sends_reset_before_releasing_physical_flow()
         );
         assert!(snapshot.audit);
         let ledger = session.control.ledger();
-        assert!(!ledger.quarantined);
+        assert!(!ledger.quarantined());
         assert_eq!(
             ledger.first_failure.as_ref().unwrap().facts().io_kind,
             Some(std::io::ErrorKind::Unsupported)
@@ -603,7 +603,7 @@ async fn saved_f_real_tuic_provider_failure_retains_source_after_actual_reset_an
             SessionDeviceState::DeviceFailedSettled
         );
         assert_eq!(session.control.retained_provider_failure().unwrap(), source);
-        assert!(!session.control.ledger().quarantined);
+        assert!(!session.control.ledger().quarantined());
     })
     .await;
     session.request_stop();

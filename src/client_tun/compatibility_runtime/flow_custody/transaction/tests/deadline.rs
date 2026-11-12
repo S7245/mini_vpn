@@ -221,7 +221,7 @@ async fn expired_received_w_keeps_original_payload_until_reset_without_starting_
         (seen.released, seen.joined, seen.published, seen.attempts),
         (1, 0, 0, 0)
     );
-    assert!(seen.audit && !owner.ledger().quarantined);
+    assert!(seen.audit && !owner.ledger().quarantined());
     let opens = owner.opens();
     assert_eq!(
         opens.flow.as_ref().unwrap().first_rejection,

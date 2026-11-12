@@ -2,6 +2,9 @@
 mod identity;
 
 #[cfg(feature = "harness")]
+mod soft_q;
+
+#[cfg(feature = "harness")]
 mod deadline;
 
 #[cfg(feature = "harness")]

@@ -175,7 +175,7 @@ async fn failed_checked_admission_preserves_rx_and_nonzero_custody_without_retry
             payload.len()
         );
         assert_eq!(upstream.0.load(Ordering::SeqCst), 0);
-        assert!(owner.ledger().quarantined);
+        assert!(owner.ledger().session_quarantined() && owner.stop.stopping.load(Ordering::Acquire), "F8: fake-IP integrity is Session scope");
         let ctx = &contexts[&server.handle];
         assert!(ctx.fake_ip.is_none(), "no lease was acquired");
         assert_eq!(ctx.conn_epoch, 1);
@@ -237,7 +237,7 @@ async fn failed_checked_admission_preserves_rx_and_nonzero_custody_without_retry
     assert_eq!(socket.peek_slice(&mut bytes).unwrap(), payload.len());
     assert_eq!(&bytes, payload);
     let ledger = owner.ledger();
-    assert!(ledger.quarantined);
+    assert!(ledger.quarantined());
     assert_eq!(
         ledger.additional_failures, 0,
         "repeated observation does not duplicate the source error"
@@ -310,7 +310,7 @@ async fn flow_and_local_reset_conflict_retains_both_physical_owners() {
             TcpState::Closed
         );
         assert_eq!(upstream.0.load(Ordering::SeqCst), 0);
-        assert!(owner.ledger().quarantined);
+        assert!(owner.ledger().quarantined());
     }
     owner.request_stop();
     assert!(!dispatch.flow_shutdown_complete(&server.sockets, &mut contexts, &pool));

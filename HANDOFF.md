@@ -522,3 +522,63 @@ Knife: compatibility recovery N2（仅本机 loopback）。P1–P3 已全部本�
 
 - 2026-11-11 续（D202–D204）：用户"Keep the fix"。primary_recovery 已对齐（m-sl 红）；chunk-reset 行判为既有负载时序测试假象（D203，D196 前同样 1/16）。joint ×2：joint 847/847 绿，joint2 846/847：同一行进入"行已释放"的 T9 变体后，`ledger.quarantined` 断言失败（Q 属 Service 预算检查，不属 flow 账本）。停止，待批 D204 方案（T9 拆成 T9a/T9b，先用 D196 前探针确认）。
 - 2026-11-11 续（D205–D206）：用户"Approve D204"。T9 拆成 T9a/T9b（测试 + 模型文档），D196 前探针确认 T9b 同态；变异 m-t9b、m-budget 分别使对应分支红。joint ×2：joint2 847/847；joint 846/847，仅 D190 已知 teardown flake（单跑 5/5 绿）。停止，待用户决定提交。
+
+## 新会话交接（soft session Q 设计，2026-11-11，D207–D209，停在用户选项）
+
+- 位置：HEAD a518896 之上。**未提交。** 生产代码没改（m-q 变异已按 sha 还原 `transaction/release.rs`）。仅新增测试叶 `flow_custody/transaction/tests/soft_q.rs`（+ `tests/mod.rs` 3 行注册），按设计为红；文档 `docs/current/soft-q-design-20261111.md`、DECISIONS D207–D209、STATUS 第 7 行指针。
+- 结论：默认非硬档（F4096 无预算）下任何 soft session Q 都会让会话继续 Running 并接纳新 flow，之后关闭的 flow 永久扣留（F、slot、smoltcp handle、retry 额度），属生产泄漏。硬档有界（下一次拒绝即停会话）。不变量跨 5 个 owner ⇒ 结构收敛门；m-q 不可接受。
+- RED 集合：tracer `transaction::tests::soft_q::soft_session_q_does_not_keep_admitting_flows_it_cannot_release`，以及 3 个 `f_flow::` 行（isolation window_failure、published_receipt ×2）；这 3 行在 HEAD 与 974367b 都红，m-q 下绿。另有 5 个 `f_flow::` 红行与此无关、未归因（见设计说明 §7）。没有门组选中 `f_flow::`。
+- 下一：用户选 A/B/C。选 A 时：先出写入点分类表（file:line → Flow/Session + 理由），再按设计说明 §6 走 TDD。raw：/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/soft-q-20261111/。
+- 不授权：commit/push、N3/N5/C8、TUN/VPS/WAN/sudo/M2、新 key、邮件、开其它会话；`AGENTS.md`、`certs/dev/ca-cert.srl` 不动；不得生成 `certs/dev/server-key.pem`。
+
+## 新会话交接（soft Q Option A 执行，2026-11-11，D210，尚未开始写代码）
+
+- 任务：用户选 **A: scoped Q**（D210，原话）。按 D210 列的 6 步执行，停在全门报告后。上一会话已到约 50% 上下文，只做了 D210 记录，没有分类表、没有生产代码。
+- 必读：AGENTS.md（结构收敛门、代码增长门）→ STATUS → DECISIONS D195、D207–D210 → `docs/current/soft-q-design-20261111.md`（事实 F1–F11、§5 Option A、§6 步骤）。
+- 写入点清单：`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/soft-q-20261111/q-writer-sites.txt`（裸 `ledger().quarantined = true`）、`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/soft-q-20261111/q-quiet-sites.txt`（`quarantine_quiet`），共约 60 个。另有 `SessionControl::quarantine_release`（`release.rs:245`）与 `note_flow_unwind`（`transaction.rs:1454`）两个非硬软分支。已知 Session 范围：`reserve_flow` 审计失败与身份耗尽、`slots.put` Err、shutdown 普查（pool/lease/root，`shutdown.rs:103/107/121/353`）、settlement.rs、未知 panic payload、meter Q。已知 Flow 候选：`transaction.rs:1420`（poll_flows 把 flow Q 镜像到会话）、`physical_flow.rs:689/699` 等 mirror/window/permit 单行故障、`Turn::drop` 的软恢复。每条都要逐行核实。
+- 关键接缝：`Turn::qualified`（release.rs:33–51）、`reserve_flow`（transaction.rs:1015）、`SessionControl::state()`（compatibility_runtime.rs:346）、`audit_flows`（transaction.rs:798），以及 `rebuild.rs` 中读 Q 的位置（181/393/417/541）。B560 保护要保留：本 Turn 内新出现的 Q 仍拒绝，并加独立 tracer。
+- RED 集：`transaction::tests::soft_q::soft_session_q_does_not_keep_admitting_flows_it_cannot_release`，以及 `f_flow::isolation::saved_window_failure_closes_only_a_after_real_role_and_provider_retirement`、`f_flow::published_receipt::saved_published_receipt_disagreement_keeps_a_quarantined_and_b_healthy`、`f_flow::published_receipt::saved_window_fault_rejects_original_retained_receipt_and_keeps_b_healthy`。必须保持绿：census ×2（`partial_connect::census::`）、soft-release 单元测试（语义可能需按 D210 更新）、硬 T8/T9、close_tail、nonhard、joint ×2。
+- 另 5 个门外红行（HEAD 与 974367b 都红，与 m-q 无关）：`f_flow::final_owner::host_owned_non_send_…` 与 `…host_quarantine_keeps_…`（final_owner.rs:274）、`f_flow::isolation::saved_f_remote_writer_failure_…`（isolation.rs:488）、`f_flow::panic_failure::saved_published_f_panic_payload_drop_…` 与 `…poll_panic…`（panic_failure.rs:332）。日志：`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/soft-q-20261111/mq/`。归档二进制：HEAD 为 `/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/soft-q-20261111/bisect/bin-head`，HEAD m-q 为 `/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/soft-q-20261111/mq/bin-m-q-head`，974367b 为 `cleanup-20261111/bisect/bin-974367b`。
+- 约束：只用离线 cargo（`--features harness`、`CARGO_INCREMENTAL=0`、`CARGO_TARGET_DIR=target`）；新逻辑放私有子模块；遵守增长门；测试放生产文件之外。不授权：commit/push、外部/TUN/VPS/WAN/sudo/M2、新 key、邮件、开其它会话；`AGENTS.md`、`certs/dev/ca-cert.srl` 不动；不得生成 `certs/dev/server-key.pem`。raw 放 `/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/soft-q-a-20261111/`。
+
+## 新会话交接（soft Q Option A 实施中，2026-11-11，D211–D213）
+
+- 位置：HEAD a518896 之上，**未提交**。分类表已写入 `docs/current/soft-q-design-20261111.md` §8（D211 语义 + 约 60 个写入点逐条 S/F + 理由 + 自审）。
+- 生产改动：新私有模块 `compatibility_runtime/quarantine.rs`（`SessionQ` 私有字段；`quarantined()`=任一作用域、`session_quarantined()`、`flow_q_epoch()`、`release_q_clear(epoch)`；`quarantine_quiet` 移至此处为唯一 Session 入口（Q+stop+≤15s 期限+meter Q），`quarantine_session_locked/owned`、`quarantine_flow`）；`flow_custody/transaction/scoped_q.rs`（`RowQ`/`RootQ` 私有、`register_flow_q`、`audit_flow_q` 双向、`flow_q_rows`、`FLOW_Q_LIMIT=64`、`FlowTransaction::flow_q_registered`）。写入点按表改路由；`poll_flows` 行首登记取代 1420 镜像；release Turn 记录 `flow_q_epoch` 并用 `release_q_clear`；`release_flow` 审计失败/行缺失 ⇒ S；`quarantine_release` 非硬 ⇒ F；停机普查：已登记 Flow-Q 行的 mirror Q 不算不一致，且 `live == flow_q_rows && quarantined()` ⇒ S（有界 Incomplete）。测试读 `ledger().quarantined` 机械改为 `quarantined()`（277 处）。
+- 测试：soft_q.rs 3 个 tracer（stale identity ⇒ S 可见；Flow 作用域；行标记↔根计数双向审计），receipt.rs 新增 `d210_flow_q_before_the_turn_does_not_refuse_release`、`d210_b560_flow_q_raised_inside_the_turn_refuses_release`；release.rs 软释放单测按 D210 更新 + `arm_before_release_query_flow_q`。
+- 结果：RED 集 4 行全绿（soft_q tracer、isolation window_failure、published_receipt ×2）。`flow_custody::transaction::tests::`+`rearm::` 107/107。`f_flow::` 32/37：5 个非绿 = 既有计时行（final_owner ×2 :274、remote_writer :488、panic_failure ×2 :332 间歇）+ `saved_f_root_disposes_original_native_permit_on_reset`（runner.rs:589，HEAD 二进制同样 1/3 通过 ⇒ 既有间歇）。
+- 变异（`soft-q-a-20261111/mut/`）：m-b560 ⇒ b560 tracer 红、prior 行绿。其余（m-f2s、m-s2f、m-audit）见 summary.txt。
+- 下一：(1) 看 mut/summary.txt；(2) 门组加入 `f_flow::` + soft_q/d210 tracer（复制 `cleanup-gate-20261111/runner` 到 `soft-q-a-20261111/runner`，改路径，加 `fflow-in.json`）；(3) 归因 6 个非绿 f_flow 行，需设计则停并给计划；(4) 单快照全门，按组报告，STOP。DECISIONS 记 D211+。
+- 不授权：commit/push、TUN/VPS/WAN/sudo/M2、新 key、邮件、开其它会话；`AGENTS.md`、`certs/dev/ca-cert.srl` 不动；不得生成 `certs/dev/server-key.pem`。
+- **更新（D213–D215）**：四个变异全部变红（mut/summary.txt）。`f_flow::` 已加为门组 fflow。全门单快照（1362 个源文件）全绿；fflow 38/43，5 个红行均为 HEAD 同率的既有行（D214）。剩余：6 个既有 f_flow 行的根因（设计说明 §9 计划）、用户决定是否提交。停止。
+
+## 新会话交接（soft Q Option A 审查修复，2026-11-11，D216，尚未开始）
+
+- 任务：按独立审查 `docs/current/soft-q-review-20261111.md`（结论 FAIL，可修；阻塞项 F1/F2）修复 D211–D215 的 scoped-Q 实现。用户决定的作用域规则为 **"Row-held ⇒ Flow"**（D216，原话），对 D210 的修订见 D216。上一会话已到上下文边界，只记录了 D216，没有改代码。
+- 必读：AGENTS.md → STATUS 第 7 行 → DECISIONS D210–D216 → 审查全文 → 设计说明 §8–§9（`docs/current/soft-q-design-20261111.md`）。
+- 当前代码（未提交）：`compatibility_runtime/quarantine.rs`（SessionQ、`quarantine_quiet`/`_locked`/`_owned`、`quarantine_flow`、`release_q_clear`）、`flow_custody/transaction/scoped_q.rs`（RowQ/RootQ、`register_flow_q`、`audit_flow_q`、`flow_q_rows`、`flow_q_registered`、FLOW_Q_LIMIT 64）、`transaction.rs`（`poll_flows` 行首登记；`audit_flows` 末尾 `&& self.audit_flow_q()`）、`release.rs`（`flow_q_epoch`；206/208 ⇒ S；`quarantine_release` 非硬 ⇒ F）、`rearm/shutdown.rs`（普查接受已登记 Flow-Q 的 mirror；`q_only` ⇒ S）、`physical_flow.rs`/`launch.rs`/`settlement.rs` 写入点按 §8 改路由。测试：`transaction/tests/soft_q.rs`（3 个 tracer）、`partial_connect/receipt.rs` 的 `d210_*` ×2、`release.rs` 的 `arm_before_release_query_flow_q`。
+- 修复清单（D216，按顺序）：(1) §8 逐行补全，含 F1 的隐式写入点与 `physical_flow.rs:631` 汇聚点，每个 Flow 写入点证明行内保留的 custody；(2) 拆分：`:584`（local_reset/inflight/delayed permits ⇒ S）、`:845`（inflight ⇒ S）、`:850`（硬 ⇒ S）、`:993`/`:962`（⇒ S 或把 receipt 留在 mirror）、`note_flow_unwind`（证明 panic-safety 或 ⇒ S），每项一个 tracer；(3) F6 `quarantine_flow` 改为接收行（无行的 Flow 拉起不可表示）；(4) F8 S 点断言收紧为 `session_quarantined() && stopping`，加 S→F 变异（`physical_flow.rs:599`、`:896`、`transaction.rs:1032`）；(5) F5 硬档 tracer：一个 Flow-Q 行不让兄弟行饿预算；(6) F12 `cold.rs:350/371` 加守卫，Closing 不覆盖 Quarantined；(7) F7 文档化线程不变量，F9 简单的话合并审计扫描，F10 修正 D214 计数；(8) 单快照重跑 fflow、nonhard、n4、d153-aligned、governance、joint ×2，报告后 STOP。
+- 工具：门 runner `/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/soft-q-a-20261111/runner/`（gate.sh 改组列表与输出目录；fflow-in.json 已有）；变异脚本 `soft-q-a-20261111/mut/run.py`（按 sha 复原）；HEAD 二进制 `soft-q-20261111/bisect/bin-head`。raw 放新目录 `soft-q-a2-20261111/`。
+- 停止规则：修复测试意外失败，或某写入点按新规则无法归类 ⇒ 停下并给计划。
+- 不授权：commit/push（提交权留在父会话）、TUN/VPS/WAN/sudo/M2、新 key、邮件、开其它会话；`AGENTS.md`、`certs/dev/ca-cert.srl` 不动；不得生成 `certs/dev/server-key.pem`；遵守增长门（transaction.rs 1483 行，硬限 1500）。
+
+## 新会话交接（soft Q D216 修复进行中，2026-11-11，D217）
+
+- 位置：HEAD a518896 之上，未提交。D216 路由已改（D217 列全）：`FlowQRow` 见证（仅 `transaction/scoped_q.rs` 构造，`FlowTransaction::quarantine_flow(owner)`），`quarantine_release(&mut FlowTransaction)`，`drive` 改为 `#[must_use] -> bool`；S 拆分：physical_flow ctx 检查（双 owner/egress-held）、非 ordered 收尾 inflight、硬档 native backing、`discarded_downlink` 溢出与重新 listen、launch 身份与第二 producer、preparing 超期（未 Q 时）、Opening 缺 attempt、`note_flow_unwind` 两档、`Turn::drop` 未复原；`cold.rs` 两处不再覆盖 Quarantined（F12）；`quarantine.rs` 写明线程不变量（F7）。改前副本：`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/soft-q-fix-20261111/pre/`。
+- 测试改动：soft_q.rs 新 `admit_one` 辅助；release.rs `soft_release_…` 改用真实行；receipt.rs 新 `PhysicalFault::EgressHeld` + `d216_egress_held_permit_fault_is_session_scope`；`FlowQRow::unheld_for_test()` 用于 3 个测试钩子。
+- 首跑 `compatibility_runtime::`（`soft-q-fix-20261111/focus/rt1.log`）：新红 drive_panic ×3、factory_panic ×2、`supervision::continuous::…cold_segment_rejects_…`，推测来自 `note_flow_unwind` ⇒ S（旧断言为非硬 Flow 语义）。需逐条看断言：若只是断言"不停/无 deadline"则按 D216 更新；否则停并给计划。
+- 剩余（D216）：(2) 余下 tracer：local_reset ⇒ S、`:845` inflight、硬档 `:850`、`:993/:962`（不可达则写明并只做代码审查证据）、`note_flow_unwind` ⇒ S、preparing 超期 ⇒ S；(4) F8 S 点断言收紧 + S→F 变异（`physical_flow.rs` 身份/epoch 不一致处、`discard_ordered_for_reset` 失败处、`transaction.rs` `reserve_flow` 审计失败处；用 `soft-q-a-20261111/mut/run.py` 模式）；(5) F5 硬档兄弟行预算 tracer；(7) F9 合并扫描（可选）、F10 改 D214 计数（head 7/13、cur 5/13）；§8 表更新；(8) 单快照门（runner `soft-q-a-20261111/runner/`，raw 放 `soft-q-fix-20261111/`）。
+- 约束同上一块（不提交/推送，不动 AGENTS.md 与 ca-cert.srl，离线 cargo，增长门：transaction.rs 1485/1500）。
+- **更新（2026-11-12，D218，STOP）**：全量 `compatibility_runtime::` 已跑完（`soft-q-fix-20261111/focus/rt1.log`），归因见 D218：只有 drive_panic ×3 由本修复引起；factory_panic ×2 已按 D216 改断言并转绿。drive_panic 在 `:626` 级联，属于改写已接受的 B56 合同，按停止规则停下，待父会话/用户在 D218 (a)/(b) 中选择（推荐 (a)）。其余 D217 改动在同一次运行中全绿。下一步按本块"剩余"清单继续。
+
+## 新会话交接（soft Q D216 修复，2026-11-12，D219–D220，上下文边界）
+
+- 位置：HEAD a518896 之上，未提交。D219（用户选 (a)）：panic 保持 Session；`drive_panic.rs` `exercise` 的期限断言改为最早期限（panic 的 Session 期限），drive/factory panic 7/7 绿。D220：tracer（local_reset、reserve_flow 审计、preparing 超期 ⇒ S）+ F8 收紧（receipt 全部 physical fault、admission）37/37 绿；5 个 S→F 变异全部变红（`/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/soft-q-fix-20261111/mut/summary.txt`）；`:846/:962/:994` 不可达，只有代码审查证据；§8 表与 D214 F10 计数已更新。
+- 剩余：(1) F5 硬档兄弟行预算 tracer，草稿与设计问题见 side-session-notes `soft-q-d220-20261112.md`。若 tracer 证明可饿死，按停止规则停下并请用户在"接受上界 / 硬档持预算的 Flow Q ⇒ S"之间选择。(2) 硬档 `:851` tracer（需要硬档 native roles 走到 rearm 的夹具，可参考 `physical_flow/tests/uplink.rs` 和 `supervision/tests/native_start/`）。(3) 单快照门：复制 `soft-q-a-20261111/runner` 到 `/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/soft-q-fix-20261111/runner`，组改为 fflow、nonhard、n4、d153-aligned、governance、joint、joint2，再加 production/diff 组（看 `.guard` exit=0），raw 放 `/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/soft-q-fix-20261111/gate`，记录源快照。按 HEAD 归因：45 个 server-key/cert/cold_segment 行、5 个旧 f_flow 行、joint 拆除 flake。(4) DECISIONS 从 D221 起记，然后 STOP，由父会话核查并提交。
+- 约束不变：不提交/推送；不动 AGENTS.md 与 certs/dev/ca-cert.srl；不生成 server-key.pem；离线 cargo，`--features harness`，`CARGO_INCREMENTAL=0`；macOS 没有 `timeout`。
+
+## 新会话交接（soft Q F5，2026-11-12，D221，STOP 待用户选择）
+
+- F5 tracer 已写并转绿（`rearm/physical_flow/tests/uplink.rs` `flow_q_sibling` + 2 个测试），证明硬档 Flow-Q 行在 Session Running 时一直占着 escrow 预算，兄弟行可被持续 Full 回滚（饿死）。按停止规则停下，等用户在 D221 (i) 接受上界 / (ii) 硬档持预算的 Flow Q ⇒ S 中选择（推荐 (ii)）。
+- 选定后继续：按选择改路由或文档；然后 (2) 硬档 `:851` tracer；(3) 单快照门；(4) D222+、STATUS、HANDOFF，STOP。约束同上一块。
+- **更新（D222–D224，STOP）**：用户选 (ii)。D222 已实现（`scoped_q.rs` `holds_hard_budget`，两个入口 ⇒ S），tracer 2/2 绿，变异变红；`:851` 只有代码审查证据（D223）；单快照门 D224 除 D214 的 6 个 fflow 行外全绿（raw `soft-q-fix-20261111/gate`）。剩余：父会话核查日志后提交/推送。暂缓的后续：硬档 native-roles rearm 夹具（D223）。

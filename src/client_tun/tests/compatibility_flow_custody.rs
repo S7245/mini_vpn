@@ -424,7 +424,7 @@ async fn stop_retained_fixture<F: Future<Output = ()>>(
                 (slot.handle, slot.epoch) == identity
                     && matches!(&slot.phase, OpenPhase::Retained(outcome) if outcome.opened.is_some())
             });
-            let quarantined = fixture.session.control.ledger().quarantined;
+            let quarantined = fixture.session.control.ledger().quarantined();
             let device_settled = fixture
                 .session
                 .control
@@ -449,7 +449,7 @@ async fn stop_retained_fixture<F: Future<Output = ()>>(
             (slot.handle, slot.epoch) == identity
                 && matches!(&slot.phase, OpenPhase::Retained(outcome) if outcome.opened.is_some())
         });
-    let quarantined = fixture.session.control.ledger().quarantined;
+    let quarantined = fixture.session.control.ledger().quarantined();
     let device_settled = fixture
         .session
         .control

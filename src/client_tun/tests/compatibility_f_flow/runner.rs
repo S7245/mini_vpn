@@ -592,7 +592,7 @@ pub(super) async fn run_saved_f(case: CloseCase) {
                     apps.sockets.get::<Socket>(apps.handle).state(), successor_reply,
                     peer.close_reason()));
                 assert_eq!(successor_reply, b"f-root-successor");
-                assert!(!session.control.ledger().quarantined);
+                assert!(!session.control.ledger().quarantined());
             }
             return;
         }
@@ -719,7 +719,7 @@ pub(super) async fn run_saved_f(case: CloseCase) {
         Some(result) => result,
         None => server.take().unwrap().await,
     };
-    let clean = !session.control.ledger().quarantined;
+    let clean = !session.control.ledger().quarantined();
     let connection_alive = peer.close_reason().is_none();
     endpoint.close(0u32.into(), b"F fixture cleanup");
     peer.close(0u32.into(), b"F fixture cleanup");

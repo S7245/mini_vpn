@@ -73,7 +73,7 @@ async fn actual_native_direct_wire_gap_restores_exact_tcp_and_joins_original_roo
     let owner = original_owner(&saved);
     let meter = owner.flow_native_backing_meter().unwrap();
     let baseline = meter.snapshot();
-    assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined);
+    assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined());
     assert!(app.tcp_reply.is_empty());
 
     fault.prefix().unwrap();
@@ -131,7 +131,7 @@ async fn actual_native_direct_wire_gap_restores_exact_tcp_and_joins_original_roo
         meter.snapshot()
     );
     assert_eq!(fault.snapshot().held_pointer, held.held_pointer);
-    assert!(!owner.ledger().quarantined);
+    assert!(!owner.ledger().quarantined());
 
     wire::drive_until(&mut service, until, fault.restore())
         .await
@@ -148,7 +148,7 @@ async fn actual_native_direct_wire_gap_restores_exact_tcp_and_joins_original_roo
     assert_eq!(app.tcp_reply.len(), 1024 + SUFFIX);
     assert_eq!(&app.tcp_reply[..1024], &[0x41; 1024]);
     assert_eq!(&app.tcp_reply[1024..], &vec![0x5a; SUFFIX]);
-    assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined);
+    assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined());
 
     drop(halves.take());
     handle.request_stop();
@@ -289,7 +289,7 @@ async fn actual_native_direct_wire_gap_cap_keeps_aggregate_charge_and_q() {
         halves.as_mut().unwrap().0.finish().unwrap();
         loop {
             let physical = meter.snapshot();
-            if physical.payload_bytes >= baseline.payload_bytes + CAP && owner.ledger().quarantined
+            if physical.payload_bytes >= baseline.payload_bytes + CAP && owner.ledger().quarantined()
             {
                 break;
             }
@@ -311,7 +311,7 @@ async fn actual_native_direct_wire_gap_cap_keeps_aggregate_charge_and_q() {
     assert_eq!(wire.counts.restored, 0);
     assert!(wire.counts.rx_dropped_datagrams > 0);
     assert!(physical.payload_bytes >= baseline.payload_bytes + CAP);
-    assert!(owner.ledger().quarantined);
+    assert!(owner.ledger().quarantined());
     assert!(owner
         .flow_debug()
         .iter()
@@ -343,7 +343,7 @@ async fn actual_native_direct_wire_gap_cap_keeps_aggregate_charge_and_q() {
     .await
     .unwrap();
     assert!(matches!(phase, Phase::Quarantined | Phase::Incomplete));
-    assert!(owner.ledger().quarantined);
+    assert!(owner.ledger().quarantined());
     assert_eq!(parent_deadline(&saved), Some(original_deadline));
     tokio::time::timeout_at(original_deadline, async {
         while owner.flow_observation().unwrap().joined < 4 {
@@ -402,7 +402,7 @@ async fn actual_native_direct_wire_gap_cap_keeps_aggregate_charge_and_q() {
         ),
         (1, 0, 4, 1)
     );
-    assert!(owner.ledger().quarantined);
+    assert!(owner.ledger().quarantined());
     assert!(meter.snapshot().payload_bytes >= baseline.payload_bytes + CAP);
     assert!(service.completion.is_none());
     let terminal_first = {

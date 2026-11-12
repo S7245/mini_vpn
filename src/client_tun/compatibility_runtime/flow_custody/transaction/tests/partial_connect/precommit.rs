@@ -165,7 +165,7 @@ async fn run(fault: Fault) {
                 (0, 0, 0, 0, retry)
             );
             assert_eq!((seen.stopped_producers, seen.settled_providers), (1, 1));
-            assert!(seen.audit && physical.owner.ledger().quarantined);
+            assert!(seen.audit && physical.owner.ledger().quarantined());
             assert_eq!(active_error(&physical.owner), source);
             assert_eq!(physical.owner.ledger().shutdown_deadline, shutdown_deadline);
             let opens = physical.owner.opens();

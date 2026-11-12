@@ -346,8 +346,9 @@ impl Turn {
                 flow.close_reason = reason;
             }
             // close preserves an already fixed deadline; stage still must stop
-            // when the parent supplied that earlier deadline above.
-            flow.stage = FlowStage::Closing;
+            // when the parent supplied that earlier deadline above. A sticky Q
+            // (e.g. preparing overdue) is never overwritten (F12).
+            if flow.stage != FlowStage::Quarantined { flow.stage = FlowStage::Closing; }
             return Restore::Dispose;
         }
         if let Some(request) = self.request.take() {
@@ -368,7 +369,7 @@ impl Turn {
         flow.preparing = false;
         if !unknown && stopping {
             flow.close(("root", "session_stop"));
-            flow.stage = FlowStage::Closing;
+            if flow.stage != FlowStage::Quarantined { flow.stage = FlowStage::Closing; }
         }
         match &mut result.0 {
             ResultState::Ready(_) if flow.stage == FlowStage::Ready => Restore::Ready(Prepared {

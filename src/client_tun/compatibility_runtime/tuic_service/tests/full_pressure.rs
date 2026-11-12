@@ -219,7 +219,7 @@ async fn exercise(case: Case) {
                 .close_reason()
                 .is_none()
         );
-        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined);
+        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined());
         assert!(
             waiting
                 .iter()
@@ -383,7 +383,7 @@ async fn exercise(case: Case) {
                 let ledger = owner.ledger();
                 (
                     ledger.shutdown_deadline,
-                    ledger.quarantined,
+                    ledger.quarantined(),
                     ledger
                         .first_failure
                         .as_ref()

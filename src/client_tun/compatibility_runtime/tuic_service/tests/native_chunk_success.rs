@@ -146,7 +146,7 @@ async fn native_ordered_chunk_delivers_exact_bytes_and_joins_original_root() {
         let owner = service.completion.as_ref().unwrap().control.clone();
         let flow = owner.flow_observation().unwrap();
         assert_eq!((flow.published, flow.joined, flow.released, flow.f), (1, 5, 1, 0));
-        assert!(flow.audit && !owner.ledger().quarantined && owner.ledger().first_failure.is_none());
+        assert!(flow.audit && !owner.ledger().quarantined() && owner.ledger().first_failure.is_none());
         let (messages, bytes, transferred, discarded, _) =
             flow.last_data_disposition.expect("original ordered Chunk physical receipt");
         assert!(messages > 0 && bytes >= 8192);

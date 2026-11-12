@@ -431,7 +431,7 @@ async fn run(at: FaultAt) {
                 if view.joined == 3
                     && view.settled_providers == 1
                     && probe.later_ok.load(Ordering::SeqCst) >= 3
-                    && session.control.ledger().quarantined
+                    && session.control.ledger().quarantined()
                 {
                     break;
                 }
@@ -480,7 +480,7 @@ async fn run(at: FaultAt) {
             (view.running, view.joined, view.settled_providers),
             (0, 3, 1)
         );
-        assert!(view.audit && session.control.ledger().quarantined);
+        assert!(view.audit && session.control.ledger().quarantined());
         // Only the original ordinary error caused the nonzero quarantine.
         // A later different error is now allowed to test first-source retention.
         probe.again.store(true, Ordering::SeqCst);
@@ -607,7 +607,7 @@ async fn saved_direct_dns_egress_fault_without_flow_is_failed_settled() {
             ),
             (0, 0, 0, 0, 0, 0, 0)
         );
-        assert!(view.audit && !session.control.ledger().quarantined);
+        assert!(view.audit && !session.control.ledger().quarantined());
         assert_eq!(upstream.entered.load(Ordering::SeqCst), 0);
         assert!(
             session

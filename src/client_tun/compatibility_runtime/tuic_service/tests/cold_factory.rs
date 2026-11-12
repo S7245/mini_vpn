@@ -47,7 +47,7 @@ async fn source_panic_immediately_inherits_original_parent_stop_deadline() {
     clock.panic();
     assert_eq!(owner.ledger().shutdown_deadline, Some(original));
     assert_eq!(*parent.deadline.lock().unwrap(), Some(original));
-    assert!(owner.ledger().quarantined && budget.quarantined() && budget.used() > 0);
+    assert!(owner.ledger().quarantined() && budget.quarantined() && budget.used() > 0);
 }
 
 #[tokio::test]
@@ -329,7 +329,7 @@ async fn under_cold_hard_is_rejected_before_the_private_factory() {
     let ledger = service.completion.as_ref().unwrap().control.ledger();
     assert_eq!(ledger.first_failure.as_ref().unwrap().facts().io_kind, None);
     assert_eq!(ledger.additional_failures, 0);
-    assert!(!ledger.quarantined);
+    assert!(!ledger.quarantined());
 }
 
 #[tokio::test(start_paused = true)]
@@ -369,7 +369,7 @@ async fn actual_parent_tightening_wakes_already_stopping_native_flush() {
         assert!(flush.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
         tokio::time::advance(Duration::from_secs(2)).await;
         assert!(flush.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
-        assert!(owner.ledger().quarantined);
+        assert!(owner.ledger().quarantined());
         assert_eq!(owner.ledger().shutdown_deadline, Some(earlier));
         assert!(owner.ledger().first_failure.is_none());
     }
@@ -400,7 +400,7 @@ async fn under_cold_preflight_rejection_still_disposes_actual_provided_device() 
     let ledger = service.completion.as_ref().unwrap().control.ledger();
     assert_eq!(ledger.first_failure.as_ref().unwrap().facts().io_kind, None);
     assert_eq!(ledger.additional_failures, 0);
-    assert!(!ledger.quarantined);
+    assert!(!ledger.quarantined());
 }
 
 #[tokio::test(start_paused = true)]
@@ -424,7 +424,7 @@ async fn actual_native_factory_q_refusal_is_not_a_new_source_io() {
     assert_eq!(called.load(Ordering::SeqCst), 1);
     let owner = saved.session.lock().unwrap().as_ref().unwrap().upgrade().unwrap();
     let ledger = owner.ledger();
-    assert!(ledger.quarantined);
+    assert!(ledger.quarantined());
     assert_eq!(ledger.shutdown_deadline, Some(original));
     assert!(ledger.first_failure.is_none());
     assert_eq!((ledger.additional_failures, ledger.egress_failures), (0, 0));

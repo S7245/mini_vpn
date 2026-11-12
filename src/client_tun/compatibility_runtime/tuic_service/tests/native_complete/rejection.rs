@@ -101,7 +101,7 @@ async fn rejection(direct: bool, permit: bool) {
         let owner=saved.session.lock().unwrap().as_ref().unwrap().upgrade().unwrap();
         {
             let ledger=owner.ledger(); let facts=ledger.first_failure.as_ref().unwrap().facts();
-            assert!(!ledger.quarantined); assert_eq!(ledger.additional_failures,0);
+            assert!(!ledger.quarantined()); assert_eq!(ledger.additional_failures,0);
             assert_eq!(facts.origin.phase,FailurePhase::TcpOpen);
             assert_eq!(facts.class,FailureClass::Io);
             assert_eq!(facts.io_kind,Some(std::io::ErrorKind::InvalidInput));
@@ -132,7 +132,7 @@ async fn rejection(direct: bool, permit: bool) {
             (flow.live, flow.w, flow.f, flow.published, flow.joined),
             (0, 0, 0, 0, 0)
         );
-        assert!(flow.audit && !owner.ledger().quarantined);
+        assert!(flow.audit && !owner.ledger().quarantined());
         assert_eq!(*saved.deadline.lock().unwrap(), Some(deadline));
         assert_eq!(owner.ledger().shutdown_deadline, Some(deadline));
         assert_eq!(app_meter.snapshot().physical_bytes, 0);

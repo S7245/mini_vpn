@@ -150,7 +150,7 @@ async fn original_cut_deadline_retains_timeout_and_real_paused_device_until_fina
     business::finish_device(device, None, owner.clone()).await;
     assert!(owner.device_settlement_observed.load(Ordering::Acquire));
     assert_eq!(drops.load(Ordering::Acquire), 1);
-    assert!(!owner.ledger().quarantined);
+    assert!(!owner.ledger().quarantined());
 }
 
 #[tokio::test(start_paused = true)]
@@ -196,7 +196,7 @@ async fn delayed_known_cut_rejection_adopts_original_deadline_and_keeps_original
     business::finish_device(device, None, owner.clone()).await;
     assert!(owner.device_settlement_observed.load(Ordering::Acquire));
     assert_eq!(drops.load(Ordering::Acquire), 1);
-    assert!(!owner.ledger().quarantined);
+    assert!(!owner.ledger().quarantined());
 }
 
 #[tokio::test(start_paused = true)]
@@ -227,7 +227,7 @@ async fn original_cut_io_error_precedes_unknown_future_drop_and_secondary_q() {
             ledger.first_failure.as_ref().unwrap().facts().raw_os_code,
             ledger.additional_failures,
             ledger.unknown_panic_payloads,
-            ledger.quarantined,
+            ledger.quarantined(),
         )
     };
     let receipt_retained = device.receipt.is_some();
@@ -247,6 +247,6 @@ async fn original_cut_io_error_precedes_unknown_future_drop_and_secondary_q() {
     assert_eq!((facts.1, facts.2, facts.3), (2, 1, true));
     assert_eq!(joined.state(), crate::device::DeviceShutdownState::Settled);
     assert_eq!(drops.load(Ordering::Acquire), 1);
-    assert!(owner.ledger().quarantined);
+    assert!(owner.ledger().quarantined());
     assert!(!owner.device_settlement_observed.load(Ordering::Acquire));
 }

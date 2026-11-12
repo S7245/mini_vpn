@@ -8,6 +8,7 @@ thread_local! {
     static FULL_AUDITS: Cell<usize> = const { Cell::new(0) };
     static LAST_AUDITS: Cell<usize> = const { Cell::new(0) };
     static BEFORE_QUERY_Q: Cell<bool> = const { Cell::new(false) };
+    static BEFORE_QUERY_FLOW_Q: Cell<bool> = const { Cell::new(false) };
 }
 pub(in crate::client_tun::compatibility_runtime::flow_custody::transaction) struct Scope;
 pub(in crate::client_tun::compatibility_runtime::flow_custody::transaction) fn expose(receipt: FlowPhysicalReceipt) -> Scope {
@@ -39,7 +40,7 @@ impl SessionControl {
         let flow = opens.flow_mut(receipt.identity()).unwrap();
         assert_eq!(before, (flow.w_held, flow.f_held, flow.reserved, flow.escrow_bytes));
         assert_eq!(flow.stage, FlowStage::Rearming);
-        assert!(!self.ledger().quarantined);
+        assert!(!self.ledger().quarantined());
     }
 }
 impl SessionControl {
@@ -64,7 +65,7 @@ impl SessionControl {
         drop(opens);
         let ledger = self.ledger();
         assert_eq!(ledger.shutdown_deadline, Some(deadline));
-        assert!(ledger.quarantined);
+        assert!(ledger.quarantined());
         assert_eq!(ledger.first_failure.as_ref().unwrap().facts().class, crate::shared::errors::FailureClass::Panic);
         assert_eq!(ledger.additional_failures, 0);
     }
@@ -88,7 +89,7 @@ impl SessionControl {
         assert!(flow.panic.is_none());
         assert_eq!(flow.escrow.len(), flow.escrow_bytes);
         drop(opens);
-        assert!(self.ledger().quarantined);
+        assert!(self.ledger().quarantined());
         assert!(self.ledger().first_failure.is_none());
     }
 }
@@ -107,7 +108,7 @@ impl SessionControl {
         assert_eq!(flow.stop_deadline, Some(deadline.into_std()));
         drop(opens);
         let ledger = self.ledger();
-        assert!(ledger.quarantined && ledger.first_failure.is_none());
+        assert!(ledger.quarantined() && ledger.first_failure.is_none());
         assert_eq!(ledger.shutdown_deadline, Some(deadline));
     }
 }
@@ -129,27 +130,40 @@ impl SessionControl {
         assert!(flow.panic.is_none() && !flow.release_escrow);
         drop(opens);
         let ledger = self.ledger();
-        assert!(ledger.quarantined && ledger.first_failure.is_none());
+        assert!(ledger.quarantined() && ledger.first_failure.is_none());
     }
 }
-#[test]
-fn soft_release_quarantine_preserves_original_session_stop_policy() {
-    let owner = SessionControl::default();
+#[tokio::test]
+async fn soft_release_quarantine_preserves_original_session_stop_policy() {
+    let owner = std::sync::Arc::new(SessionControl::default());
+    let index = super::soft_q::admit_one(&owner).await;
     assert!(owner.app_meter.is_none());
     assert!(!owner.stop.stopping.load(Ordering::Acquire));
     assert!(owner.ledger().shutdown_deadline.is_none());
-    owner.quarantine_release();
-    assert!(owner.ledger().quarantined);
+    {
+        let mut opens = owner.opens();
+        let OpenPhase::Flow(flow) = &mut opens.slots.get_mut(index).unwrap().phase else { panic!("actual Flow") };
+        owner.quarantine_release(flow); // F6: the release fault names its held row.
+        assert_eq!(flow.stage, FlowStage::Quarantined);
+    }
+    // D210: Soft release Q is Flow scope: sticky Q, no Session refusal.
+    assert!(owner.ledger().quarantined() && !owner.ledger().session_quarantined());
+    assert_eq!(owner.state(), crate::client_tun::compatibility_runtime::SessionDeviceState::Running);
     assert!(!owner.stop.stopping.load(Ordering::Acquire), "Soft's original owner marks Q without stopping unrelated work");
     assert!(owner.ledger().shutdown_deadline.is_none(), "Soft Q does not mint a new Session deadline");
 }
 
 pub(in crate::client_tun::compatibility_runtime::flow_custody::transaction) fn before_query(owner: &SessionControl) {
     if BEFORE_QUERY_Q.with(|flag| flag.replace(false)) { owner.quarantine_quiet(); }
+    if BEFORE_QUERY_FLOW_Q.with(|flag| flag.replace(false)) { owner.quarantine_flow(FlowQRow::unheld_for_test()); }
 }
 impl SessionControl {
     pub(in crate::client_tun::compatibility_runtime) fn arm_before_release_query_q(&self) {
         BEFORE_QUERY_Q.with(|flag| assert!(!flag.replace(true)));
+    }
+    /// B560 under D210: a Flow-scope Q raised inside the release Turn.
+    pub(in crate::client_tun::compatibility_runtime) fn arm_before_release_query_flow_q(&self) {
+        BEFORE_QUERY_FLOW_Q.with(|flag| assert!(!flag.replace(true)));
     }
 }
 

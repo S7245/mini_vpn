@@ -38,6 +38,7 @@ use super::legacy_event_loop::RelayEventTestBridge;
 
 mod business;
 mod failure;
+mod quarantine;
 mod relay_lane;
 mod flow_custody;
 mod session_udp;
@@ -96,7 +97,7 @@ struct SessionLedger {
     first_failure: Option<RetainedFailure>,
     additional_failures: u64,
     shutdown_deadline: Option<tokio::time::Instant>,
-    quarantined: bool,
+    q: quarantine::SessionQ,
     unknown_panic_payloads: u64,
 }
 
@@ -285,20 +286,15 @@ impl SessionControl {
         quarantine: bool,
     ) -> Option<PanicCustody> {
         if quarantine {
-            if let Some(meter) = &self.app_meter {
-                meter.quarantine();
-            }
-            self.ledger().quarantined = true;
+            self.quarantine_quiet();
         }
         // Publish opaque first failure before any unknown destructor/reentrancy.
         self.record(RetainedFailure::opaque_panic(Self::origin(phase)));
         if let Err(secondary) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
             {
+                let parent = self.parent_stop_deadline();
                 let mut ledger = self.ledger();
-                ledger.quarantined = true;
-                if let Some(meter) = &self.app_meter {
-                    meter.quarantine();
-                }
+                self.quarantine_session_locked(&mut ledger, parent);
                 ledger.unknown_panic_payloads = ledger.unknown_panic_payloads.saturating_add(1);
                 // Primary is already retained; secondary cannot replace it.
                 ledger.additional_failures = ledger.additional_failures.saturating_add(1);
@@ -351,7 +347,7 @@ impl SessionControl {
             return SessionDeviceState::Running;
         }
         let ledger = self.ledger();
-        if ledger.quarantined {
+        if ledger.quarantined() {
             SessionDeviceState::Incomplete
         } else if device {
             if ledger.first_failure.is_some() {
@@ -492,7 +488,7 @@ impl<F> Drop for ClientTunSession<F> {
                 SessionControl::origin(FailurePhase::SessionLoopDrop),
                 std::io::Error::from(std::io::ErrorKind::Interrupted),
             ));
-            self.control.ledger().quarantined = true;
+            self.control.quarantine_quiet();
             self.control.state_changed.notify_waiters();
         }
     }

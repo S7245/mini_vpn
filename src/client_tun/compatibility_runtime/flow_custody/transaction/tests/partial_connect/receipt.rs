@@ -3,11 +3,14 @@
 //! here. The optional pool mapping tests release custody, not DNS resolution.
 use super::super::super::super::rearm::physical_flow::FlowPhysicalReceipt;
 use super::super::super::super::rearm::physical_flow::tests::ReceiptFault;
+use super::super::super::super::rearm::LocalReset;
 use super::*;
 
 #[derive(Clone, Copy, Debug)]
 enum Case {
     Deferred,
+    PriorFlowQ,
+    TurnFlowQ,
     WrongBytes,
     WrongIdentity,
     Missing,
@@ -29,6 +32,8 @@ enum PhysicalFault {
     ContextEpoch,
     PhysicalFlag,
     RootAudit,
+    EgressHeld,
+    LocalReset,
 }
 
 fn reject_physical_fault(physical: &mut Physical, id: FlowIdentity, fault: PhysicalFault) {
@@ -120,6 +125,34 @@ fn reject_physical_fault(physical: &mut Physical, id: FlowIdentity, fault: Physi
                 smoltcp::socket::tcp::State::Listen
             );
             physical.server.sockets.remove(other);
+            assert!(!accepted);
+        }
+        PhysicalFault::EgressHeld => {
+            // D216 (F2): a faulted ctx with an egress-held permit marker is
+            // shared egress custody ⇒ Session, never a row-contained Flow Q.
+            physical.contexts.get_mut(&id.handle).unwrap().downlink_delay_permit_release_until_egress = true;
+            let accepted = service(physical, id);
+            physical.contexts.get_mut(&id.handle).unwrap().downlink_delay_permit_release_until_egress = false;
+            assert!(!accepted);
+            assert!(physical.owner.ledger().session_quarantined()
+                && physical.owner.stop.stopping.load(std::sync::atomic::Ordering::Acquire),
+                "egress-held permit ⇒ Session scope");
+        }
+        PhysicalFault::LocalReset => {
+            // D216: a local_reset marker is a second physical owner on this
+            // socket ⇒ Session. The marker comes from the original private
+            // prepare on a scratch ctx (epoch exhausted ⇒ no abort), never a
+            // hand-built value.
+            let port = physical.contexts[&id.handle].local_port;
+            let mut scratch = crate::client_tun::SocketCtx::new(port);
+            scratch.conn_epoch = u64::MAX;
+            let socket = physical.server.sockets.get_mut::<TcpSocket>(id.handle);
+            assert!(!LocalReset::prepare_wire_test(&mut scratch, socket));
+            let marker = scratch.local_reset.take();
+            assert!(marker.is_some(), "original prepare retained an invalid marker");
+            physical.contexts.get_mut(&id.handle).unwrap().local_reset = marker;
+            let accepted = service(physical, id);
+            physical.contexts.get_mut(&id.handle).unwrap().local_reset = None;
             assert!(!accepted);
         }
         PhysicalFault::MissingContext => {
@@ -290,7 +323,7 @@ async fn actual_receipt(case: Case) {
         assert!(physical.owner.opens().flow.as_ref().unwrap().defer_receipt.is_none());
         let retry = physical.owner.flow_observation().unwrap().retry;
         retained(&physical, id, &source, retry);
-        assert!(!physical.owner.ledger().quarantined);
+        assert!(!physical.owner.ledger().quarantined());
         assert!(!physical.dispatch.flow_shutdown_complete(&physical.server.sockets, &mut physical.contexts, &physical.pool));
         match case {
             Case::Deferred => {
@@ -306,6 +339,26 @@ async fn actual_receipt(case: Case) {
                     assert_eq!(settled(&physical.owner), source);
                 }
             }
+            Case::PriorFlowQ => {
+                physical.owner.quarantine_flow(FlowQRow::unheld_for_test());
+                assert!(service(&mut physical, id), "D210: a Flow Q raised before this Turn does not refuse it");
+                assert_eq!(physical.owner.opens().live, 0);
+                assert!(!physical.owner.ledger().session_quarantined());
+                assert!(!physical.dispatch.flow_shutdown_complete(&physical.server.sockets, &mut physical.contexts, &physical.pool),
+                    "a Flow Q still ends the session Incomplete");
+                assert!(physical.owner.ledger().session_quarantined(), "bounded Incomplete end at stop");
+            }
+            Case::TurnFlowQ => {
+                physical.owner.arm_before_release_query_flow_q();
+                assert!(!service(&mut physical, id), "B560: a Flow Q raised inside the Turn refuses it");
+                {
+                    let opens = physical.owner.opens();
+                    assert_eq!(opens.live, 1);
+                    assert!(matches!(&opens.slots[id.index].as_ref().unwrap().phase,
+                        OpenPhase::Flow(flow) if flow.stage == FlowStage::Quarantined));
+                }
+                assert!(physical.owner.ledger().quarantined() && !physical.owner.ledger().session_quarantined());
+            }
             Case::WrongBytes | Case::WrongIdentity | Case::Missing | Case::Physical(_) | Case::Field(_) => {
                 match case {
                     Case::Physical(fault) => {
@@ -315,6 +368,11 @@ async fn actual_receipt(case: Case) {
                                 std::sync::atomic::Ordering::Relaxed), 32);
                         }
                         reject_physical_fault(&mut physical, id, fault);
+                        // F8: every physical fault here is root/identity/shared
+                        // custody ⇒ Session scope, never a row-contained Flow Q.
+                        assert!(physical.owner.ledger().session_quarantined()
+                            && physical.owner.stop.stopping.load(std::sync::atomic::Ordering::Acquire),
+                            "{fault:?} must be Session scope");
                     }
                     Case::Field(fault) => {
                         physical.contexts.get_mut(&id.handle).unwrap().flow_mirror.as_mut().unwrap()
@@ -340,9 +398,9 @@ async fn actual_receipt(case: Case) {
                         physical.contexts.get_mut(&id.handle).unwrap()
                             .flow_mirror.as_mut().unwrap().replace_receipt(Some(receipt));
                     }
-                    Case::Deferred => unreachable!(),
+                    Case::Deferred | Case::PriorFlowQ | Case::TurnFlowQ => unreachable!(),
                 }
-                assert!(physical.owner.ledger().quarantined);
+                assert!(physical.owner.ledger().quarantined());
                 retained(&physical, id, &source, retry);
                 let accepted = service(&mut physical, id);
                 let after = physical.owner.flow_observation().unwrap();
@@ -354,7 +412,7 @@ async fn actual_receipt(case: Case) {
                     assert!(!service(&mut physical, id));
                     assert!(!physical.dispatch.flow_shutdown_complete(&physical.server.sockets, &mut physical.contexts, &physical.pool));
                     retained(&physical, id, &source, retry);
-                    assert!(physical.owner.ledger().quarantined);
+                    assert!(physical.owner.ledger().quarantined());
                 }
                 let opens = physical.owner.opens();
                 assert!(matches!(&opens.slots[id.index].as_ref().unwrap().phase,
@@ -380,6 +438,16 @@ async fn actual_receipt(case: Case) {
 #[tokio::test]
 async fn retained_actual_receipt_consumes_once_after_physical_commit() {
     actual_receipt(Case::Deferred).await;
+}
+
+#[tokio::test]
+async fn d210_flow_q_before_the_turn_does_not_refuse_release() {
+    actual_receipt(Case::PriorFlowQ).await;
+}
+
+#[tokio::test]
+async fn d210_b560_flow_q_raised_inside_the_turn_refuses_release() {
+    actual_receipt(Case::TurnFlowQ).await;
 }
 
 #[tokio::test]
@@ -424,6 +492,16 @@ async fn actual_physical_identity_faults_keep_original_custody() {
     ] {
         actual_receipt(Case::Physical(fault)).await;
     }
+}
+
+#[tokio::test]
+async fn d216_egress_held_permit_fault_is_session_scope() {
+    actual_receipt(Case::Physical(PhysicalFault::EgressHeld)).await;
+}
+
+#[tokio::test]
+async fn d216_local_reset_second_owner_is_session_scope() {
+    actual_receipt(Case::Physical(PhysicalFault::LocalReset)).await;
 }
 
 #[tokio::test]

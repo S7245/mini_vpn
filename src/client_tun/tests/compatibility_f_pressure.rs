@@ -136,7 +136,7 @@ async fn f_w128_credit_pressure_preserves_c129_rx_until_real_publication() {
             assert_eq!(held.escrow_bytes, 128);
             assert_eq!((held.published, held.released, held.joined), (0, 0, 0));
             assert_eq!((apps.queued(128), apps.windows[128]), (4096, Some(0)));
-            assert!(held.audit && !session.control.ledger().quarantined);
+            assert!(held.audit && !session.control.ledger().quarantined());
         }
         let peer_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let payload_seen = peer_ready.clone();
@@ -236,7 +236,7 @@ async fn f_w128_credit_pressure_preserves_c129_rx_until_real_publication() {
             (0, 0, 0, 0, 0)
         );
         assert_eq!((done.published, done.released, done.joined), (1, 129, 3));
-        assert!(done.audit && !session.control.ledger().quarantined);
+        assert!(done.audit && !session.control.ledger().quarantined());
         let failure = session.control.retained_provider_failure().unwrap();
         assert_eq!(failure.2, "I/O error: TUIC open Cancelled");
         assert_eq!(failure.1.phase, crate::upstream::TcpOpenPhase::Settled);

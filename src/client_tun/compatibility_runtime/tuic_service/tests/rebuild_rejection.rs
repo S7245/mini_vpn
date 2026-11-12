@@ -167,7 +167,7 @@ async fn resume_secondary_panic_retains_original_paused_device_and_nodes_in_q() 
         assert!(handle.request_rebuild());
         peers.push(peer(&mut service, &server, &cfg).await);
         until(&mut service, || handle.phase() == Phase::Quarantined).await;
-        assert!(original.ledger().quarantined);
+        assert!(original.ledger().quarantined());
         assert_eq!(
             original
                 .ledger()

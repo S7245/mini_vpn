@@ -45,7 +45,7 @@ fn quarantined(owner: &SessionControl, missing: usize) {
         (1, 1, 0, 3, 0)
     );
     assert_eq!(seen.stopped_producers, 1);
-    assert!(seen.audit && owner.ledger().quarantined);
+    assert!(seen.audit && owner.ledger().quarantined());
     let opens = owner.opens();
     let OpenPhase::Flow(flow) = &opens.slots.iter().flatten().next().unwrap().phase else {
         panic!("actual flow")
@@ -145,7 +145,7 @@ async fn partial_start(missing: usize) {
                 let seen = session.control.flow_observation().unwrap();
                 if seen.joined == 3
                     && seen.stopped_producers == 1
-                    && session.control.ledger().quarantined
+                    && session.control.ledger().quarantined()
                 {
                     break;
                 }
@@ -253,7 +253,7 @@ async fn drain_roles<F: Future<Output = ()>>(
             .await;
             let seen = session.control.flow_observation().unwrap();
             if seen.running == 0
-                && (seen.live == 0 || (seen.joined == 3 && session.control.ledger().quarantined))
+                && (seen.live == 0 || (seen.joined == 3 && session.control.ledger().quarantined()))
             {
                 break;
             }

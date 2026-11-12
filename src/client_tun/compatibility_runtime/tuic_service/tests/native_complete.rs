@@ -180,7 +180,7 @@ async fn complete_service_observed(permit: bool, udp: ServiceUdp, ending: termin
         }).await;
         if startup.is_err() {
             let owner = saved.session.lock().unwrap().as_ref().unwrap().upgrade().unwrap();
-            let ledger = { let l = owner.ledger(); (l.quarantined, l.shutdown_deadline, l.additional_failures) };
+            let ledger = { let l = owner.ledger(); (l.quarantined(), l.shutdown_deadline, l.additional_failures) };
             eprintln!("NATIVE-SERVICE-START permit={permit} phase={:?} stream={} sent={} tcp={:?} flow={:?} contracts={:?} first={:?} ledger={:?} budget={} q={} app={:?}",
                 handle.phase(), stream.is_some(), app.sent_tcp,
                 app.sockets.get::<smoltcp::socket::tcp::Socket>(app.tcp).state(),
@@ -357,7 +357,7 @@ async fn complete_service_observed(permit: bool, udp: ServiceUdp, ending: termin
             let owner = saved.session.lock().unwrap().as_ref().unwrap().upgrade().unwrap();
             let original = saved.deadline.lock().unwrap().unwrap();
             tokio::time::timeout(Duration::from_secs(2), async {
-                while !owner.ledger().quarantined {
+                while !owner.ledger().quarantined() {
                     assert!(tokio::time::timeout(Duration::from_millis(5), service.run()).await.is_err());
                 }
             }).await.unwrap();
@@ -555,7 +555,7 @@ async fn complete_service_observed(permit: bool, udp: ServiceUdp, ending: termin
         let owner = service.completion.as_ref().unwrap().control.clone();
         let flow = owner.flow_observation().unwrap();
         assert_eq!((flow.published, flow.joined, flow.released, flow.f), (if source_probe == 20 { 2 } else { 1 }, if source_probe == 20 { 10 } else { 5 }, if matches!(source_probe, 19 | 20) { 2 } else { 1 }, 0));
-        assert!(flow.audit && !owner.ledger().quarantined);
+        assert!(flow.audit && !owner.ledger().quarantined());
         if source_probe == 19 {
             owner.assert_initial_uplink_refusal();
         } else if source_probe == 20 { owner.assert_established_uplink_refusal(); } else { assert!(owner.ledger().first_failure.is_none()); }

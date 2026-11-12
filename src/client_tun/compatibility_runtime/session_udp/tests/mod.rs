@@ -59,7 +59,7 @@ async fn actual_source_eof_waits_for_consuming_original_health_join() {
             .await
             .is_err()
     );
-    assert!(!owner.ledger().quarantined);
+    assert!(!owner.ledger().quarantined());
     task.request_stop();
     assert_eq!(task.join().await, crate::failover::HealthExit::Stopped);
     tokio::time::timeout(Duration::from_millis(2), saved.as_mut())
@@ -92,7 +92,7 @@ async fn stopped_payload_drop_failure_keeps_original_receiver_and_q_after_health
     assert!(!sender.is_closed());
     let first = {
         let ledger = owner.ledger();
-        assert!(ledger.quarantined);
+        assert!(ledger.quarantined());
         assert_eq!(
             ledger.first_failure.as_ref().unwrap().facts().class,
             crate::shared::errors::FailureClass::Panic
@@ -129,7 +129,7 @@ async fn unknown_source_destruction_retains_failure_and_nonzero_session_quaranti
     let owner = SessionControl::default();
     let _custody = settle(UdpDownlinkSource::owned(receiver), receipt, &owner).await;
     assert_eq!(drops.load(Ordering::SeqCst), 1);
-    assert!(owner.ledger().quarantined);
+    assert!(owner.ledger().quarantined());
     assert_eq!(
         owner
             .ledger()
@@ -228,7 +228,7 @@ async fn secondary_panic_payload_never_escapes_or_destroys_the_original_source()
         ),
         (1, 1)
     );
-    assert!(owner.ledger().quarantined);
+    assert!(owner.ledger().quarantined());
     assert_eq!(owner.ledger().additional_failures, 1);
     assert_eq!(owner.ledger().unknown_panic_payloads, 1);
     assert_eq!(terminal.load(Ordering::SeqCst), 0);

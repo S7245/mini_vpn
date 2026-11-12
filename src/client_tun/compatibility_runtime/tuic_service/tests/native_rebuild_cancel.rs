@@ -49,7 +49,7 @@ async fn hard_native_stop_during_held_cut_keeps_original_limit_without_successor
         completion._node.as_ref().unwrap().assert_service_clean_for_test();
         {
             let ledger = old.ledger();
-            assert!(ledger.first_failure.is_none() && !ledger.quarantined);
+            assert!(ledger.first_failure.is_none() && !ledger.quarantined());
         }
         assert!(!rig.handle.request_rebuild());
         assert!(!budget.quarantined());
@@ -159,7 +159,7 @@ async fn stop_before_successor_resume(hold: Hold) {
             "no successor DATA");
         for control in [&old, &completion.control] {
             let ledger = control.ledger();
-            assert!(ledger.first_failure.is_none() && !ledger.quarantined);
+            assert!(ledger.first_failure.is_none() && !ledger.quarantined());
         }
         assert!(!rig.handle.request_rebuild());
         assert!(!budget.quarantined());

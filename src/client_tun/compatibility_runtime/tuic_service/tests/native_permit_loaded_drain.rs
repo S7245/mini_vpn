@@ -303,7 +303,7 @@ async fn native_permit_loaded_data_drains_through_app_before_clean_join() {
         let flow = owner.flow_observation().unwrap();
         assert_eq!((flow.live, flow.published, flow.released, flow.f), (1, 1, 0, 1));
         assert!(flow.audit);
-        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined);
+        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined());
         assert_eq!((queue.snapshot_now().queued_bytes, queue.snapshot_now().leased_bytes), (0, 0));
     }).await;
 
@@ -337,7 +337,7 @@ async fn native_permit_loaded_data_drains_through_app_before_clean_join() {
         );
         assert_eq!(flow.f, 0);
         assert!(flow.audit);
-        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined);
+        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined());
         let queue = original_queue.as_ref().unwrap();
         assert!(queue.physical_zero());
         let audit = queue.permit_release_audit_for_test().unwrap();

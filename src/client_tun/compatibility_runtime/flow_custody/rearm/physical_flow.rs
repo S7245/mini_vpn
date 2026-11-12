@@ -353,7 +353,7 @@ impl OpenDispatch {
         let lease = acquired.ok().flatten();
         let mut opens = owner.opens();
         let Some(flow) = opens.flow_mut(id) else {
-            owner.ledger().quarantined = true;
+            owner.quarantine_quiet();
             return;
         };
         flow.fake_ip = lease.as_ref().map(CheckedFakeIpLease::receipt);
@@ -386,7 +386,7 @@ impl OpenDispatch {
         ctx.pending_open_mode = Some(TcpOwnershipMode::LegacyRelay);
         if failure.is_some() {
             flow.stage = FlowStage::Quarantined;
-            owner.ledger().quarantined = true;
+            owner.quarantine_quiet();
             owner.record(crate::shared::errors::RetainedFailure::from_io(
                 super::super::transaction::open_origin(
                     id.index,
@@ -518,7 +518,7 @@ impl OpenDispatch {
             {
                 mirror.quarantined = true;
             }
-            owner.ledger().quarantined = true;
+            owner.quarantine_quiet();
             return false;
         }
         let Some(flow) = opens.flow_mut(id) else {
@@ -531,7 +531,7 @@ impl OpenDispatch {
         }
         let Some(ctx) = completion.socket_ctxs.get_mut(&id.handle) else {
             flow.stage = FlowStage::Quarantined;
-            owner.ledger().quarantined = true;
+            owner.quarantine_quiet();
             return false;
         };
         if flow.panic.is_some() && flow.roles.is_none()
@@ -565,28 +565,36 @@ impl OpenDispatch {
         };
         // Protocol/native authority remains forbidden. Ordered custody is bound
         // bidirectionally to the same four-role queue before any mutation.
-        if ctx.local_reset.is_some()
+        // D216: a second physical owner on this socket (local_reset or a
+        // resumable authority) or egress-held permits are shared custody ⇒
+        // Session; any other mismatch leaves all custody in the row ⇒ Flow.
+        let two_owners = ctx.local_reset.is_some()
             || ctx.resumable_uplink.is_some()
             || ctx.resumable_sink.is_some()
             || ctx.resumable_half_close.is_some()
             || ctx.resumable_terminal.is_some()
-            || ctx.resumable_action_bridge.is_some()
+            || ctx.resumable_action_bridge.is_some();
+        let egress_held = !ctx.downlink_inflight_permits.is_empty()
+            || ctx.downlink_delay_permit_release_until_egress;
+        if two_owners
             || (ctx.d16_downlink_queue.is_some() && !d16_selected)
             || (flow.stage == FlowStage::Ready
                 && !FlowMirror::validate_ordered_custody(ctx, flow.roles.as_ref(), flow.published))
-            || (!ordered
-                && (!ctx.downlink_inflight_permits.is_empty()
-                    || ctx.downlink_delay_permit_release_until_egress))
+            || (!ordered && egress_held)
             || (ordered
                 && !FlowMirror::validate_ordered_custody(ctx, flow.roles.as_ref(), flow.published))
         {
-            flow.stage = FlowStage::Quarantined;
-            owner.ledger().quarantined = true;
+            if two_owners || egress_held {
+                flow.stage = FlowStage::Quarantined;
+                owner.quarantine_quiet();
+            } else {
+                flow.quarantine_flow(owner);
+            }
             return false;
         }
         let Some(mirror) = &mut ctx.flow_mirror else {
             flow.stage = FlowStage::Quarantined;
-            owner.ledger().quarantined = true;
+            owner.quarantine_quiet();
             return false;
         };
         if mirror.id != id
@@ -596,7 +604,7 @@ impl OpenDispatch {
                 .pending_permits_match(ctx.downlink_pending.len(), &ctx.downlink_pending_permits)
         {
             flow.stage = FlowStage::Quarantined;
-            owner.ledger().quarantined = true;
+            owner.quarantine_quiet();
             return false;
         }
         let window_transferred = mirror.window_transferred_bytes();
@@ -686,17 +694,16 @@ impl OpenDispatch {
             if let Some(roles) = flow.roles.as_mut().filter(|_| flow.panic.is_none()) {
                 roles.stop();
             }
-            owner.ledger().quarantined = true;
+            flow.quarantine_flow(owner); // Funnel: every shared-state writer above raised Session.
             return false;
         }
         if let Some(receipt) = mirror.receipt {
-            if receipt.identity() != id
-                || owner.ledger().first_egress_io.is_some()
-                || mirror.window.as_ref().is_some_and(ReceiveWindow::failed)
-            {
+            let root_fault = receipt.identity() != id || owner.ledger().first_egress_io.is_some();
+            if root_fault || mirror.window.as_ref().is_some_and(ReceiveWindow::failed) {
                 mirror.quarantined = true;
                 flow.stage = FlowStage::Quarantined;
-                owner.ledger().quarantined = true;
+                // Identity or shared device ⇒ Session; the row's own window ⇒ Flow.
+                if root_fault { owner.quarantine_quiet(); } else { flow.quarantine_flow(owner); }
                 return false;
             }
             let retired = flow.roles.as_ref().is_none_or(FlowRoles::settled);
@@ -713,8 +720,7 @@ impl OpenDispatch {
         {
             if !mirror.dispose_pending(&mut ctx.downlink_pending, &mut ctx.downlink_pending_permits)
             {
-                flow.stage = FlowStage::Quarantined;
-                owner.ledger().quarantined = true;
+                flow.quarantine_flow(owner);
                 return false;
             }
         }
@@ -733,8 +739,7 @@ impl OpenDispatch {
                     && roles.join_count() == 3
                     && !mirror.discard_d16_queue_after_joins(roles, flow.close_reason)
                 {
-                    flow.stage = FlowStage::Quarantined;
-                    owner.ledger().quarantined = true;
+                    flow.quarantine_flow(owner);
                     return false;
                 }
                 if d16_selected
@@ -747,8 +752,7 @@ impl OpenDispatch {
                     )
                     && !roles.dispose_d16_reader_after_physical_proof()
                 {
-                    flow.stage = FlowStage::Quarantined;
-                    owner.ledger().quarantined = true;
+                    flow.quarantine_flow(owner);
                     return false;
                 }
             }
@@ -787,8 +791,7 @@ impl OpenDispatch {
                     ));
                 }
                 mirror.quarantined = true;
-                flow.stage = FlowStage::Quarantined;
-                owner.ledger().quarantined = true;
+                flow.quarantine_flow(owner);
                 return false;
             }
         }
@@ -798,7 +801,7 @@ impl OpenDispatch {
         if owner.ledger().first_egress_io.is_some() {
             mirror.quarantined = true;
             flow.stage = FlowStage::Quarantined;
-            owner.ledger().quarantined = true;
+            owner.quarantine_quiet();
             return false;
         }
         let socket = completion.sockets.get_mut::<TcpSocket>(id.handle);
@@ -842,13 +845,24 @@ impl OpenDispatch {
                 || !mirror.permit_physical_zero(flow.roles.as_ref()))
         {
             mirror.quarantined = true;
-            flow.stage = FlowStage::Quarantined;
-            owner.ledger().quarantined = true;
+            // D216: an egress-held permit on a non-ordered row is shared custody.
+            if ctx.downlink_inflight_permits.is_empty() {
+                flow.quarantine_flow(owner);
+            } else {
+                flow.stage = FlowStage::Quarantined;
+                owner.quarantine_quiet();
+            }
             return false;
         }
         if !mirror.native_backing_matches(flow.roles.as_ref()) {
             mirror.quarantined = true;
-            owner.ledger().quarantined = true;
+            // D216: the hard BackingMeter budget is shared ⇒ Session.
+            if owner.app_meter.as_ref().is_some_and(|meter| meter.budget_limit().is_some()) {
+                flow.stage = FlowStage::Quarantined;
+                owner.quarantine_quiet();
+            } else {
+                flow.quarantine_flow(owner);
+            }
             return false;
         }
         let Some(next_epoch) = ctx.conn_epoch.checked_add(1) else {
@@ -857,8 +871,7 @@ impl OpenDispatch {
         };
         let Some(deadline) = *flow.stop_deadline else {
             mirror.quarantined = true;
-            flow.stage = FlowStage::Quarantined;
-            owner.ledger().quarantined = true;
+            flow.quarantine_flow(owner);
             return false;
         };
         if !mirror.prepare_reset(
@@ -869,8 +882,7 @@ impl OpenDispatch {
             tokio::time::Instant::from_std(deadline),
         ) {
             if mirror.quarantined {
-                flow.stage = FlowStage::Quarantined;
-                owner.ledger().quarantined = true;
+                flow.quarantine_flow(owner);
             }
             return true;
         }
@@ -894,7 +906,7 @@ impl OpenDispatch {
             let bytes = ctx.downlink_inflight_permit_bytes();
             if !ctx.discard_ordered_for_reset() {
                 flow.stage = FlowStage::Quarantined;
-                owner.ledger().quarantined = true;
+                owner.quarantine_quiet();
                 return false;
             }
             bytes
@@ -917,7 +929,7 @@ impl OpenDispatch {
         {
             mirror.quarantined = true;
             flow.stage = FlowStage::Quarantined;
-            owner.ledger().quarantined = true;
+            owner.quarantine_quiet();
             return false;
         }
         let d16_receipt = if d16_selected {
@@ -931,8 +943,7 @@ impl OpenDispatch {
                 )
             }) else {
                 mirror.quarantined = true;
-                flow.stage = FlowStage::Quarantined;
-                owner.ledger().quarantined = true;
+                flow.quarantine_flow(owner);
                 return false;
             };
             Some(receipt)
@@ -952,7 +963,7 @@ impl OpenDispatch {
             Ok(release) => release,
             Err(_) => {
                 mirror.quarantined = true;
-                owner.ledger().quarantined = true;
+                owner.quarantine_quiet();
                 return false;
             }
         };
@@ -960,7 +971,10 @@ impl OpenDispatch {
             .abandoned_pending
             .checked_add(ctx.downlink_pending.len())
         else {
+            // D216: after the irreversible ordered discard ⇒ Session.
             mirror.quarantined = true;
+            flow.stage = FlowStage::Quarantined;
+            owner.quarantine_quiet();
             return false;
         };
         let mut receipt = FlowPhysicalReceipt {
@@ -990,8 +1004,10 @@ impl OpenDispatch {
         socket.abort();
         configure_local_tcp_socket(socket);
         if socket.listen(ctx.local_port).is_err() {
+            // D216: abort/discard already ran and the receipt is dropped ⇒ Session.
             mirror.quarantined = true;
-            owner.ledger().quarantined = true;
+            flow.stage = FlowStage::Quarantined;
+            owner.quarantine_quiet();
             return false;
         }
         receipt.fake_release = release.map(|release| release.commit());
@@ -1224,7 +1240,7 @@ impl OpenDispatch {
                     roles.stop();
                 }
 
-                flow.drive(cx);
+                if !flow.drive(cx) { owner.quarantine_quiet(); }
                 if flow.preparing || flow.cold_retained.is_some() { return false; }
                 let roles_settled = flow.roles.as_ref().is_none_or(FlowRoles::settled);
                 let provider_settled = flow.attempt.as_ref().is_none_or(|attempt| {
@@ -1392,7 +1408,7 @@ impl OpenDispatch {
                 if census_complete { bridge.observe_fatal_census(census, in_flight); }
             }
         }
-        owner.ledger().quarantined = true;
+        owner.quarantine_quiet();
         Poll::Ready(FatalStep::Retained)
     }
 }

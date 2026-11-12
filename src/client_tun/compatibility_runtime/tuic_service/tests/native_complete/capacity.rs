@@ -143,7 +143,7 @@ async fn full_capacity(permit: bool) {
             (wire::F as u64, wire::F as u64, 0, 0, 0));
         assert_eq!((full.reserved, full.escrow_bytes), (wire::W * 256 * 1024, wire::W));
         assert!(full.audit && app.c_full());
-        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined);
+        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined());
         sample("F4096-W128-C-full-healthy-TCP-UDP", wire::F);
         attribution::census_delta(&census, "F4096-W128-C-full");
         geometry::sample(&mut service, &owner, "F4096-W128-C-full").await;
@@ -197,7 +197,7 @@ async fn full_capacity(permit: bool) {
         assert_eq!((flow.factory_started, flow.published, flow.released, flow.joined),
             (wire::F as u64, wire::F as u64, wire::TOTAL as u64, (wire::F * 5) as u64));
         assert!(flow.audit && owner.flow_contracts().is_empty());
-        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined);
+        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined());
         service.completion.as_ref().unwrap()._node.as_ref().unwrap().assert_service_clean_for_test();
         assert_eq!((gate.joins.load(Ordering::Acquire), gate.drops.load(Ordering::Acquire)), (1, 1));
         assert_eq!(app_meter.snapshot().physical_bytes, 0);

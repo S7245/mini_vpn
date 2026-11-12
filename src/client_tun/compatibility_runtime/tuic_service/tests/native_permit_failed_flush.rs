@@ -271,7 +271,7 @@ async fn partial_case(hard: bool) {
         let flow = owner.flow_observation().unwrap();
         assert_eq!((flow.published, flow.released, flow.joined, flow.f), (1, 0, 5, 1));
         assert!(flow.last_permit_reset.is_none() && flow.last_data_disposition.is_none());
-        assert!(owner.ledger().quarantined);
+        assert!(owner.ledger().quarantined());
         let owner_ledger = owner.ledger();
         let first = owner_ledger.first_failure.as_ref().unwrap();
         assert_eq!(

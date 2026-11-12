@@ -128,11 +128,11 @@ async fn hard_native_controlled_rebuild_restores_new_tcp_and_udp_on_shared_budge
             let old = completion._retired.as_ref().unwrap();
             old.node.assert_service_clean_for_test();
             assert_eq!(old.control.state(), SessionDeviceState::BusinessSettled);
-            assert!(!old.control.ledger().quarantined);
+            assert!(!old.control.ledger().quarantined());
             let current = &completion.control;
             {
                 let ledger = current.ledger();
-                assert!(ledger.first_failure.is_none() && !ledger.quarantined);
+                assert!(ledger.first_failure.is_none() && !ledger.quarantined());
             }
             assert!(peers[0].close_reason().is_some(), "old generation connection closed");
         }
@@ -235,7 +235,7 @@ async fn hard_native_successor_alpn_rejection_never_publishes_or_builds_third_no
         assert_eq!(retired.control.state(), SessionDeviceState::BusinessSettled);
         {
             let ledger = retired.control.ledger();
-            assert!(ledger.first_failure.is_none() && !ledger.quarantined);
+            assert!(ledger.first_failure.is_none() && !ledger.quarantined());
         }
         assert!(completion
             ._node
@@ -247,7 +247,7 @@ async fn hard_native_successor_alpn_rejection_never_publishes_or_builds_third_no
         assert!(!Arc::ptr_eq(current, old_control.as_ref().unwrap()), "successor session existed");
         {
             let ledger = current.ledger();
-            assert!(ledger.first_failure.is_none() && !ledger.quarantined);
+            assert!(ledger.first_failure.is_none() && !ledger.quarantined());
         }
         assert_eq!(current.flow_observation().map(|flow| flow.published).unwrap_or(0), 0,
             "refused successor never published DATA");
@@ -384,9 +384,9 @@ async fn rebuild_with_successor_cold_gap(gap: usize) -> ColdGap {
     assert_eq!(old.state(), SessionDeviceState::BusinessSettled);
     {
         let ledger = old.ledger();
-        assert!(ledger.first_failure.is_none() && !ledger.quarantined);
+        assert!(ledger.first_failure.is_none() && !ledger.quarantined());
     }
-    assert!(!successor.ledger().quarantined);
+    assert!(!successor.ledger().quarantined());
     ColdGap { report, successor_accepted, held_at_successor_failure, old, successor }
 }
 

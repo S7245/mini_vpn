@@ -489,7 +489,7 @@ async fn exercise(peer: &ReadyPeer, prior_io: bool, site: FaultSite) {
     let inner = facts.inner.load(Ordering::Acquire);
     let original_first = first(&owner);
     let observed = census(&owner).unwrap();
-    let quarantined = owner.ledger().quarantined;
+    let quarantined = owner.ledger().quarantined();
     println!(
         "B56 realdrive site={site:?} stepReturns={step_returns} priorIO={prior_io} before={before:?} after={after:?} originalBox={identity} inner={inner} view={last_view:?} counts={counts:?} drops={} innerDropped={} ownerQ={quarantined} census={observed:?} first={original_first:?}",
         drops.load(Ordering::Acquire),
@@ -588,10 +588,10 @@ async fn exercise(peer: &ReadyPeer, prior_io: bool, site: FaultSite) {
         let ledger = owner.ledger();
         (ledger.additional_failures, ledger.shutdown_deadline)
     };
-    assert_eq!(
-        initial_ledger,
-        (u64::from(prior_io), early_stop.map(|(_, limit)| limit))
-    );
+    // D216: a drive/provider panic is Session scope: bounded deadline (parent min).
+    assert_eq!(initial_ledger.0, u64::from(prior_io));
+    assert!(initial_ledger.1.is_some_and(|deadline| early_stop.is_none_or(|(_, limit)| deadline <= limit)));
+    assert!(owner.ledger().session_quarantined());
     let halves = match prefetched_halves {
         Some(halves) => halves,
         None => peer.prefix().await,
@@ -619,11 +619,23 @@ async fn exercise(peer: &ReadyPeer, prior_io: bool, site: FaultSite) {
             },
         );
     }
-    let (requested_at, deadline) = early_stop.unwrap_or_else(|| {
-        let requested_at = tokio::time::Instant::now();
-        (requested_at, owner.request_stop())
-    });
-    assert!(deadline >= requested_at + Duration::from_secs(15));
+    // D219: the panic's Session deadline is the earliest stop deadline; a
+    // later test stop keeps it (never extends it).
+    let session_deadline = initial_ledger.1.expect("Session-scope panic fixed a deadline");
+    let deadline = match early_stop {
+        Some((requested_at, deadline)) => {
+            assert!(deadline >= requested_at + Duration::from_secs(15));
+            assert_eq!(session_deadline, deadline);
+            deadline
+        }
+        None => {
+            let requested_at = tokio::time::Instant::now();
+            let deadline = owner.request_stop();
+            assert_eq!(deadline, session_deadline);
+            assert!(deadline <= requested_at + Duration::from_secs(15));
+            deadline
+        }
+    };
     assert!(deadline <= tokio::time::Instant::now() + Duration::from_secs(15));
     let mut stopped = None;
     // The original cursor scans 32 rows per turn; never set it or close the row

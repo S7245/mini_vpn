@@ -211,7 +211,7 @@ async fn exercise(case: Case) {
             );
             assert_eq!(deadline(&saved), Some(parent_deadline));
             assert_eq!(owner_limit(&owner), Some(owner_deadline));
-            assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined);
+            assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined());
             let after = owner.flow_contracts();
             let by_index: BTreeMap<_, _> = after.iter().map(|row| (row.id.index, row)).collect();
             for row in &after {
@@ -306,7 +306,7 @@ async fn exercise(case: Case) {
         assert!(settled.audit && owner.flow_contracts().is_empty());
         assert!(owner.business_complete.load(Ordering::Acquire));
         assert!(!owner.driver_complete.load(Ordering::Acquire));
-        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined);
+        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined());
         assert_eq!(owner_limit(&owner), Some(owner_deadline));
         assert_eq!(deadline(&saved), Some(parent_deadline));
         assert_eq!(current.as_ref().unwrap().count(), 0);
@@ -378,7 +378,7 @@ async fn exercise(case: Case) {
             );
             assert!(final_inventory.audit && owner.flow_contracts().is_empty());
         }
-        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined);
+        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined());
         assert_eq!(owner_limit(&owner), Some(owner_deadline));
         assert_eq!(deadline(&saved), Some(parent_deadline));
         assert_eq!(

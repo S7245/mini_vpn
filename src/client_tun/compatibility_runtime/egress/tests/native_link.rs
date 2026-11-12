@@ -83,7 +83,7 @@ async fn native_link_write_io_precedes_waiter_drop_and_keeps_deadline() {
         ledger.egress_failures, 1,
         "Main must not count the already reported original IO again"
     );
-    assert!(ledger.quarantined);
+    assert!(ledger.quarantined());
     assert!(Arc::ptr_eq(
         &source,
         ledger.first_egress_io.as_ref().unwrap()

@@ -188,7 +188,7 @@ async fn budget_case(
                 (2, 2, if budget == 32 { 2 } else { 1 }, if budget == 32 { 2 } else { 1 }));
             assert_eq!(seen.escrow_bytes, b"untouched-rx".len() + 6);
             assert_eq!((seen.published, seen.released, seen.joined), (0, 0, 0));
-            assert!(seen.audit && !owner.ledger().quarantined);
+            assert!(seen.audit && !owner.ledger().quarantined());
             if matches!(case, PreparationCase::CancelPhase) {
                 assert_eq!(seen.factory_started, 1);
                 let current = upstream_ready_connection(&observed_upstream).unwrap();
@@ -254,7 +254,7 @@ async fn budget_case(
             (2, 2, if budget == 1 { 1 } else { 2 }, if budget == 1 { 1 } else { 2 }));
         assert_eq!((seen.published, seen.released, seen.joined), (0, 0, 0));
         assert_eq!(seen.escrow_bytes, b"untouched-rx".len() + 6);
-        assert!(seen.audit && !owner.ledger().quarantined);
+        assert!(seen.audit && !owner.ledger().quarantined());
         {
             let opens = owner.opens();
             for (index, slot) in opens.slots.iter().flatten().enumerate() {
@@ -376,7 +376,7 @@ async fn budget_case(
         (0, 0, 0, 0, 0)
     );
     assert_eq!((done.released, done.published, done.joined), (2, 0, 0));
-    assert!(done.audit && !owner.ledger().quarantined);
+    assert!(done.audit && !owner.ledger().quarantined());
     assert!(client.sockets.iter().all(|(_, socket)| match socket {
         smoltcp::socket::Socket::Tcp(tcp) => tcp.state() == smoltcp::socket::tcp::State::Closed,
         _ => false,

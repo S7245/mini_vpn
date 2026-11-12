@@ -44,7 +44,7 @@ impl SessionControl {
                     .as_ref()
                     .is_some_and(|a| a.identity_fault.is_some())
             {
-                self.ledger().quarantined = true;
+                self.quarantine_quiet();
             }
             return;
         }
@@ -67,7 +67,7 @@ impl SessionControl {
                 .zip(workers)
                 .any(|(announced, workers)| announced.load(Ordering::Acquire) & !workers != 0);
             if actual != opens.live || orphan {
-                self.ledger().quarantined = true;
+                self.quarantine_quiet();
             }
             if actual == 0 {
                 return;
@@ -99,7 +99,7 @@ impl SessionControl {
                         .fetch_and(!(1u64 << (index % 64)), Ordering::Release);
                 }
                 if matches!(&slot.phase, OpenPhase::Retained(outcome) if outcome.opened.is_some()) {
-                    self.ledger().quarantined = true;
+                    self.quarantine_quiet();
                     continue;
                 }
                 let outcome = opens.slots.take(index).and_then(|slot| match slot.phase {

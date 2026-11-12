@@ -66,7 +66,7 @@ async fn device_original_io_alias_waits_then_drops_unlocked_before_clean() {
         assert_eq!(ledger.first_failure.as_ref().unwrap().facts().origin.phase, FailurePhase::DeviceRead);
         assert_eq!(ledger.shutdown_deadline, Some(deadline));
         assert_eq!(ledger.additional_failures, u64::from(panic));
-        assert_eq!(ledger.quarantined, panic);
+        assert_eq!(ledger.quarantined(), panic);
         assert!(ledger.first_ingress_io.is_none());
         drop(ledger);
         assert_eq!(budget.used(), if panic { cold } else { 0 });
@@ -124,7 +124,7 @@ async fn original_io_alias_cannot_outlive_original_session_deadline_without_quie
     assert!(work.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
     tokio::time::advance(std::time::Duration::from_secs(2)).await;
     assert!(work.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
-    assert!(owner.ledger().quarantined, "original deadline must quiet even while actual IO alias survives");
+    assert!(owner.ledger().quarantined(), "original deadline must quiet even while actual IO alias survives");
     assert_eq!(owner.ledger().shutdown_deadline, Some(deadline));
     assert_eq!(owner.ledger().additional_failures, 0);
     assert!(budget.quarantined());
@@ -185,7 +185,7 @@ fn main_device_callback_keeps_original_raw_io_or_panic_and_no_second_fact() {
         assert_eq!(first.class, if panic { crate::shared::errors::FailureClass::Panic } else { crate::shared::errors::FailureClass::Io });
         assert_eq!(first.raw_os_code, if panic { None } else { Some(5) });
         assert_eq!(ledger.additional_failures, 0);
-        assert_eq!(ledger.quarantined, panic);
+        assert_eq!(ledger.quarantined(), panic);
         assert!(ledger.first_egress_io.is_none());
         assert_eq!(Arc::strong_count(&payload), if panic { 2 } else { 1 });
     }
@@ -212,7 +212,7 @@ async fn original_started_rx_readonly_quarantine_has_no_new_io_fact() {
     if let Some(report) = observer.claim() { owner.accept_device_report(report); }
     assert!(owner.ledger().first_failure.is_none(), "existing owner Q is not a new backend IO");
     assert_eq!(owner.ledger().additional_failures, 0);
-    assert!(owner.ledger().quarantined);
+    assert!(owner.ledger().quarantined());
     assert_eq!(owner.ledger().shutdown_deadline, Some(deadline));
     assert_ne!(receipt.state(), crate::device::DeviceShutdownState::PendingCallbacks);
     drop((error, receipt, observer, device, owner));
@@ -248,7 +248,7 @@ async fn actual_native_pump_poll_and_source_drop_panic_reach_main_as_original_pa
     assert_eq!(ledger.first_failure.as_ref().unwrap().facts().class, crate::shared::errors::FailureClass::Panic);
     assert_eq!(ledger.additional_failures, 1, "two original panics, no fabricated IO");
     assert_eq!(ledger.shutdown_deadline, Some(deadline));
-    assert!(ledger.quarantined);
+    assert!(ledger.quarantined());
     drop(ledger);
     assert_eq!(Arc::strong_count(&poll), 2);
     assert_eq!(Arc::strong_count(&disposal), 2);
@@ -270,7 +270,7 @@ async fn empty_original_io_disposal_after_deadline_does_not_create_a_quarantine(
     drop(work);
     let ledger = owner.ledger();
     assert!(!ledger.device_source_disposal);
-    assert!(!ledger.quarantined);
+    assert!(!ledger.quarantined());
     assert_eq!(ledger.shutdown_deadline, Some(deadline));
     assert!(!budget.quarantined());
     assert_eq!(budget.used(), 0);

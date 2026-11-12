@@ -213,10 +213,10 @@ async fn exercise(ending: Ending, hard: bool) {
                     assert!(tokio::time::timeout(Duration::from_millis(10), service.run()).await.is_err());
                     let owner = saved.session.lock().unwrap().as_ref().unwrap().upgrade().unwrap();
                     let flow = owner.flow_observation().unwrap();
-                    if flow.released == 1 || owner.ledger().quarantined {
+                    if flow.released == 1 || owner.ledger().quarantined() {
                         assert_eq!((flow.joined, flow.released, flow.f), (4, 1, 0));
                         assert!(flow.audit);
-                        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined);
+                        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined());
                         let (messages, bytes, transferred, discarded, _) =
                             flow.last_data_disposition.expect("original physical receipt");
                         assert!(messages > 0 && bytes > 0);
@@ -283,7 +283,7 @@ async fn exercise(ending: Ending, hard: bool) {
             let ended = ended.unwrap_or_else(|_| {
                 let ledger = owner.ledger();
                 panic!("neither T7 nor T6 by P+1s: phase={:?} session_q={} first={:?} flow={:?} provider={:?} debug={:?}",
-                    handle.phase(), ledger.quarantined, ledger.first_failure.as_ref().map(|f| f.facts()),
+                    handle.phase(), ledger.quarantined(), ledger.first_failure.as_ref().map(|f| f.facts()),
                     owner.flow_observation(), owner.flow_native_provider_view(), owner.flow_debug())
             });
             eprintln!("[D169-direct-ending] {} at_after_parent={:?} provider_deadline_after_parent={:?}",
@@ -299,7 +299,7 @@ async fn exercise(ending: Ending, hard: bool) {
                 assert!(owner.flow_debug().iter().any(|row| row.starts_with("stage=Quarantined")));
                 assert_eq!(provider.phase, TcpOpenPhase::Retiring);
                 assert!(provider.lease_held && provider.retirement_pending);
-                assert!(owner.ledger().quarantined);
+                assert!(owner.ledger().quarantined());
                 assert!(fault.snapshot().counts.rx_dropped_datagrams > 0);
                 if hard {
                     let budget = saved.backing_budget.as_ref().unwrap();
@@ -329,7 +329,7 @@ async fn exercise(ending: Ending, hard: bool) {
         let owner = saved.session.lock().unwrap().as_ref().unwrap().upgrade().unwrap();
         let flow = owner.flow_observation().unwrap();
         assert_eq!((flow.joined, flow.released, flow.f), (4, 1, 0));
-        assert!(flow.audit && !owner.ledger().quarantined && owner.ledger().first_failure.is_none());
+        assert!(flow.audit && !owner.ledger().quarantined() && owner.ledger().first_failure.is_none());
         if ending == Ending::ParentStopClean {
             let (messages, bytes, transferred, discarded, _) =
                 flow.last_data_disposition.expect("original parent-stop physical receipt");

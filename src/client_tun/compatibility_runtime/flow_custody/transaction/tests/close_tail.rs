@@ -60,7 +60,7 @@ fn drive(
 ) -> (FlowStage, bool, Option<std::time::Instant>) {
     let mut opens = owner.opens();
     let flow = opens.flow_mut(id).unwrap();
-    flow.drive(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+    assert!(flow.drive(&mut std::task::Context::from_waker(std::task::Waker::noop())));
     (flow.stage, flow.tail.aborted(), *flow.stop_deadline)
 }
 

@@ -83,7 +83,7 @@ async fn reset_keeps_identity_and_shutdown_pending_until_actual_dispatch_and_flu
                 .is_some()
         );
         assert!(!dispatch.flow_shutdown_complete(&server.sockets, &mut contexts, &pool));
-        assert!(!owner.ledger().quarantined);
+        assert!(!owner.ledger().quarantined());
     }
     // The real interface now accepts RST. No peer close or session teardown forces it.
     server.iface.poll(
@@ -256,7 +256,7 @@ async fn empty_device_queue_after_flush_error_cannot_erase_reset_or_original_err
     assert_eq!(contexts[&handle].conn_epoch, 0);
     owner.request_stop();
     assert!(!dispatch.flow_shutdown_complete(&server.sockets, &mut contexts, &pool));
-    assert!(owner.ledger().quarantined);
+    assert!(owner.ledger().quarantined());
 }
 
 #[tokio::test(start_paused = true)]
@@ -324,7 +324,7 @@ async fn reset_identity_deadline_and_interrupted_commit_never_restart() {
         }
         owner.request_stop();
         assert!(!dispatch.flow_shutdown_complete(&server.sockets, &mut contexts, &pool));
-        assert!(owner.ledger().quarantined);
+        assert!(owner.ledger().quarantined());
     }
 }
 
@@ -387,7 +387,7 @@ async fn reset_epoch_exhaustion_preserves_both_tuple_shapes_without_physical_mut
         }
         owner.request_stop();
         assert!(!dispatch.flow_shutdown_complete(&server.sockets, &mut contexts, &pool));
-        assert!(owner.ledger().quarantined);
+        assert!(owner.ledger().quarantined());
     }
 }
 
@@ -591,7 +591,7 @@ impl RejectedFlow {
         let seen = self.owner.flow_observation().unwrap();
         assert_eq!((seen.live, seen.w, seen.f, seen.released), (1, 1, 1, 0));
         assert_eq!(seen.escrow_bytes, b"untouched-rx".len());
-        assert!(seen.audit && self.owner.ledger().quarantined);
+        assert!(seen.audit && self.owner.ledger().quarantined());
         self.owner.request_stop();
         assert!(!self.dispatch.flow_shutdown_complete(
             &self.server.sockets,

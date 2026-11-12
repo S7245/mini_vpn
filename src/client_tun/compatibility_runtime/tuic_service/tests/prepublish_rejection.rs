@@ -136,7 +136,7 @@ async fn root_dns_target_case(mode: OpenMode) {
         let owner = saved.session.lock().unwrap().as_ref().unwrap().upgrade().unwrap();
         {
             let ledger = owner.ledger();
-            assert!(!ledger.quarantined);
+            assert!(!ledger.quarantined());
             let first = ledger.first_failure.as_ref().expect("original InvalidTarget retained");
             assert_eq!(first.facts().origin.phase, crate::shared::errors::FailurePhase::TcpOpen);
             assert_eq!(first.facts().class, crate::shared::errors::FailureClass::Io);
@@ -168,7 +168,7 @@ async fn root_dns_target_case(mode: OpenMode) {
             (flow.live, flow.w, flow.f, flow.published, flow.joined),
             (0, 0, 0, 0, 0)
         );
-        assert!(flow.audit && !owner.ledger().quarantined);
+        assert!(flow.audit && !owner.ledger().quarantined());
         assert_eq!(*saved.deadline.lock().unwrap(), Some(original_deadline));
         first_failure_identity(owner).expect("same original first error after shutdown")
     })
@@ -266,7 +266,7 @@ async fn failed_open_case(mode: OpenMode) {
         assert!(owner.flow_d16_backing_meter().is_none());
         assert!(owner.flow_native_backing_meter().is_none());
         let ledger = owner.ledger();
-        assert!(!ledger.quarantined);
+        assert!(!ledger.quarantined());
         let first = ledger.first_failure.as_ref().expect("original failed open retained");
         assert_eq!(first.facts().origin.phase, crate::shared::errors::FailurePhase::TcpOpen);
         assert_eq!(first.facts().class, crate::shared::errors::FailureClass::Io);
@@ -300,7 +300,7 @@ async fn failed_open_case(mode: OpenMode) {
         assert_eq!(owner.retained_provider_failure(), original);
         assert_eq!(*saved.deadline.lock().unwrap(), Some(original_deadline));
         let ledger = owner.ledger();
-        assert!(!ledger.quarantined);
+        assert!(!ledger.quarantined());
         let first = ledger.first_failure.as_ref().unwrap();
         (
             first as *const _ as usize,
@@ -426,7 +426,7 @@ async fn pending_open_case(mode: OpenMode) {
             .expect("cancelled provider retained");
         assert!(provider.2.contains("Cancelled"));
         let ledger = owner.ledger();
-        assert!(!ledger.quarantined);
+        assert!(!ledger.quarantined());
         let first = ledger
             .first_failure
             .as_ref()

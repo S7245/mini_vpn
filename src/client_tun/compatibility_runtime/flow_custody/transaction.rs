@@ -17,9 +17,11 @@ use super::super::super::{
 use super::super::tests as runtime_tests;
 use super::super::{SessionControl, SessionStop};
 mod release;
+mod scoped_q;
 mod slot_table;
 mod stop_deadline;
 pub(in crate::client_tun::compatibility_runtime) use slot_table::SlotTable;
+pub(in crate::client_tun::compatibility_runtime) use scoped_q::FlowQRow;
 pub(in crate::client_tun::compatibility_runtime) mod custody;
 use crate::owned_upstream::OwnedUpstream;
 use crate::shared::errors::{FailureOrigin, FailurePhase, FailureResource, RetainedFailure};
@@ -244,7 +246,7 @@ impl OpenDispatch {
                     deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(20),
                     phase: OpenPhase::Reserved,
                 }).is_err() {
-                    owner.ledger().quarantined = true;
+                    owner.quarantine_quiet();
                     return None;
                 }
                 opens.live += 1;
@@ -295,7 +297,7 @@ impl OpenDispatch {
                         && matches!(slot.phase, OpenPhase::Reserved)
                 })
             else {
-                owner.ledger().quarantined = true;
+                owner.quarantine_quiet();
                 owner.request_stop();
                 return;
             };
@@ -386,7 +388,7 @@ impl OpenDispatch {
                                 }
                             }
                         } else {
-                            owner.ledger().quarantined = true;
+                            owner.quarantine_quiet();
                             owner.request_stop();
                         }
                         continue;
@@ -677,6 +679,7 @@ pub(in crate::client_tun::compatibility_runtime) struct FlowTransaction {
     #[cfg(test)]
     pub(super) missing_start_gate: Option<usize>,
     physical_check: Option<(FlowStage, tokio::time::Instant)>,
+    q_mark: scoped_q::RowQ,
 }
 
 const CLOSE_TAIL: std::time::Duration = std::time::Duration::from_secs(15);
@@ -733,6 +736,7 @@ pub(super) enum FlowRejection {
 
 #[derive(Default)]
 pub(super) struct FlowAccounting {
+    quarantined_rows: scoped_q::RootQ,
     #[cfg(test)]
     pub(super) cold_probe: Option<Arc<super::rearm::physical_flow::tests::cold::Probe>>,
     #[cfg(test)]
@@ -843,6 +847,7 @@ impl OpenCustody {
             && w <= OPEN_LIMIT
             && f <= FLOW_LIMIT
             && bytes <= ESCROW_LIMIT
+            && self.audit_flow_q()
     }
 
     pub(super) fn flow_mut(&mut self, id: FlowIdentity) -> Option<&mut FlowTransaction> {
@@ -890,8 +895,9 @@ impl FlowTransaction {
         );
     }
 
-    pub(super) fn drive(&mut self, cx: &mut std::task::Context<'_>) {
-        if self.panic.is_some() { return; } // Only the original fatal JOIN boundary may proceed.
+    #[must_use] // false ⇒ the caller raises Session scope (D216).
+    pub(super) fn drive(&mut self, cx: &mut std::task::Context<'_>) -> bool {
+        if self.panic.is_some() { return true; } // Only the original fatal JOIN boundary may proceed.
         let now = tokio::time::Instant::now().into_std();
         let provider_wait = std::mem::take(&mut self.tail.provider_wait);
         if self.stop_deadline.is_some_and(|deadline| now >= deadline) {
@@ -920,7 +926,7 @@ impl FlowTransaction {
                 self.stage = FlowStage::Quarantined;
             }
         }
-        if self.preparing || self.cold_retained.is_some() || self.roles.as_ref().is_some_and(FlowRoles::disposition_in_flight) { return; }
+        if self.preparing || self.cold_retained.is_some() || self.roles.as_ref().is_some_and(FlowRoles::disposition_in_flight) { return true; }
         if let Some(roles) = &mut self.roles {
             if self.stage == FlowStage::Quarantined {
                 roles.stop();
@@ -937,12 +943,12 @@ impl FlowTransaction {
             if let Some(roles) = &mut self.roles {
                 roles.stop();
             }
-            return;
+            return true;
         }
         if self.stage == FlowStage::Opening {
             let Some(attempt) = &mut self.attempt else {
                 self.stage = FlowStage::Quarantined;
-                return;
+                return false; // D216: the attempt is not in the row ⇒ Session.
             };
             #[cfg(test)]
             {
@@ -962,12 +968,12 @@ impl FlowTransaction {
             if let Some(roles) = &mut self.roles {
                 roles.stop();
                 if !roles.data_disposed() {
-                    return;
+                    return true;
                 }
             }
             if let Some(attempt) = &mut self.attempt {
                 let Some(deadline) = *self.stop_deadline else {
-                    return;
+                    return true;
                 };
                 // Fixed on first use: the provider bound covers one A1 extension.
                 let deadline = *self
@@ -987,17 +993,18 @@ impl FlowTransaction {
                 let view = attempt.view();
                 if view.phase == TcpOpenPhase::Quarantined {
                     self.stage = FlowStage::Quarantined;
-                    return;
+                    return true;
                 }
                 if view.phase != TcpOpenPhase::Settled || view.lease_held || view.retirement_pending
                 {
                     self.tail.provider_wait = view.phase == TcpOpenPhase::Retiring
                         && (view.lease_held || view.retirement_pending);
-                    return;
+                    return true;
                 }
             }
             self.stage = FlowStage::Rearming;
         }
+        true
     }
 }
 
@@ -1028,7 +1035,7 @@ impl OpenDispatch {
             return None;
         }
         if !opens.audit_flows() {
-            owner.ledger().quarantined = true;
+            owner.quarantine_quiet();
             return None;
         }
         let index = opens.slots.iter().position(Option::is_none)?;
@@ -1055,7 +1062,7 @@ impl OpenDispatch {
                     generation: accounting.generation,
                 }
             });
-            owner.ledger().quarantined = true;
+            owner.quarantine_quiet();
             owner.record(RetainedFailure::from_io(
                 SessionControl::origin(FailurePhase::TcpOpen),
                 std::io::ErrorKind::InvalidData.into(),
@@ -1110,6 +1117,7 @@ impl OpenDispatch {
             #[cfg(test)]
             missing_start_gate: None,
             physical_check: None,
+            q_mark: Default::default(),
         };
         // `index` is a free row of this locked table; Err is unreachable and
         // would retain (never destroy) the uncertain row under sticky Q.
@@ -1120,7 +1128,7 @@ impl OpenDispatch {
             phase: OpenPhase::Flow(Box::new(flow)),
         }) {
             std::mem::forget(row);
-            owner.ledger().quarantined = true;
+            owner.quarantine_quiet();
             return None;
         }
         opens.live += 1;
@@ -1186,7 +1194,7 @@ impl OpenDispatch {
                         |id| !matches!(&slot.phase, OpenPhase::Flow(flow) if flow.id == id),
                     )
                 {
-                    owner.ledger().quarantined = true;
+                    owner.quarantine_quiet();
                     return true;
                 }
                 if let OpenPhase::Flow(flow) = &mut slot.phase {
@@ -1204,8 +1212,7 @@ impl OpenDispatch {
                                     })
                                 }) && ctx.preflight_downlink_clear();
                                 if !prepared {
-                                    flow.stage = FlowStage::Quarantined;
-                                    owner.ledger().quarantined = true;
+                                    flow.quarantine_flow(owner); // Row-held: refused before mutation.
                                     return true;
                                 }
                                 let inflight = ctx.downlink_inflight_permit_bytes();
@@ -1216,7 +1223,7 @@ impl OpenDispatch {
                                     })
                                 {
                                     flow.stage = FlowStage::Quarantined;
-                                    owner.ledger().quarantined = true;
+                                    owner.quarantine_quiet();
                                     return true;
                                 }
                             }
@@ -1233,7 +1240,7 @@ impl OpenDispatch {
             }
         }
         if physical.is_some() {
-            owner.ledger().quarantined = true;
+            owner.quarantine_quiet();
             return true;
         }
         false
@@ -1267,6 +1274,7 @@ impl OpenDispatch {
             }
             opens.cursor = (index + 1) % opens.slots.len();
             wrapped |= opens.cursor == 0;
+            if !opens.register_flow_q(index, owner) { owner.quarantine_quiet(); }
             // Split disjoint fields; no transaction is removed from root custody.
             let OpenCustody {
                 slots,
@@ -1277,7 +1285,7 @@ impl OpenDispatch {
                 continue;
             };
             let OpenPhase::Flow(flow) = &mut slot.phase else {
-                owner.ledger().quarantined = true;
+                owner.quarantine_quiet();
                 continue;
             };
             #[cfg(test)]
@@ -1288,8 +1296,12 @@ impl OpenDispatch {
                 flow.close(("root", "session_stop"));
             }
             if flow.preparing {
-                if flow.stop_deadline.is_some_and(|deadline| tokio::time::Instant::now().into_std() >= deadline) {
+                if flow.stage != FlowStage::Quarantined && flow.stop_deadline
+                    .is_some_and(|deadline| tokio::time::Instant::now().into_std() >= deadline) {
+                    // D216: the carrier is out of the row (preparation) ⇒ Session;
+                    // a Turn-restored row is already Flow Q with its originals.
                     flow.stage = FlowStage::Quarantined;
+                    owner.quarantine_quiet();
                 }
                 continue;
             }
@@ -1349,7 +1361,7 @@ impl OpenDispatch {
                     let before = (flow.stage == FlowStage::Opening)
                         .then(|| flow.attempt.as_ref().map(|a| a.view().phase))
                         .flatten();
-                    flow.drive(cx);
+                    if !flow.drive(cx) { owner.quarantine_quiet(); }
                     let progressed = flow.stage == FlowStage::Opening
                         && matches!(
                             before.zip(flow.attempt.as_ref().map(|a| a.view().phase)),
@@ -1416,9 +1428,6 @@ impl OpenDispatch {
                 }
                 return Poll::Ready(Some(OpenEvent::Yield));
             }
-            if flow.stage == FlowStage::Quarantined {
-                owner.ledger().quarantined = true;
-            }
             if matches!(
                 flow.stage,
                 FlowStage::Ready | FlowStage::Closing | FlowStage::Rearming
@@ -1462,12 +1471,9 @@ impl SessionControl {
             id.epoch,
             FailurePhase::TcpOpen,
         ));
-        if self.app_meter.as_ref().is_some_and(|meter| meter.budget_limit().is_some()) {
-            crate::shared::errors::QuietFailureSink::record_quiet(self, failure);
-        } else {
-            self.record(failure);
-            self.ledger().quarantined = true;
-        }
+        // D216: the panic ran inside provider/drive code that may touch the
+        // shared pool/Node; its panic-safety is unproven ⇒ Session (both profiles).
+        crate::shared::errors::QuietFailureSink::record_quiet(self, failure);
     }
 
     pub(in crate::client_tun::compatibility_runtime) fn flow_mode(&self) -> bool {

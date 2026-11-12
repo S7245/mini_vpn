@@ -108,7 +108,7 @@ async fn hard_native_direct_wire_gap_restores_exact_tcp_and_joins_original_root(
     let original_flow = owner.flow_contracts()[0].id;
     let meter = owner.flow_native_backing_meter().unwrap();
     let baseline = meter.snapshot();
-    assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined);
+    assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined());
     assert!(app.tcp_reply.is_empty());
 
     fault.prefix().unwrap();
@@ -166,7 +166,7 @@ async fn hard_native_direct_wire_gap_restores_exact_tcp_and_joins_original_root(
         meter.snapshot()
     );
     assert_eq!(fault.snapshot().held_pointer, held.held_pointer);
-    assert!(!owner.ledger().quarantined);
+    assert!(!owner.ledger().quarantined());
 
     wire::drive_until(&mut service, until, fault.restore())
         .await
@@ -183,7 +183,7 @@ async fn hard_native_direct_wire_gap_restores_exact_tcp_and_joins_original_root(
     assert_eq!(app.tcp_reply.len(), 1024 + SUFFIX);
     assert_eq!(&app.tcp_reply[..1024], &[0x41; 1024]);
     assert_eq!(&app.tcp_reply[1024..], &vec![0x5a; SUFFIX]);
-    assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined);
+    assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined());
 
     assert!(Arc::ptr_eq(&original_owner(&saved), &owner));
     assert_eq!(owner.flow_contracts()[0].id, original_flow);
@@ -352,7 +352,7 @@ async fn hard_native_direct_wire_gap_cap_keeps_aggregate_charge_and_q() {
         halves.as_mut().unwrap().0.finish().unwrap();
         loop {
             let physical = meter.snapshot();
-            if physical.payload_bytes >= baseline.payload_bytes + CAP && owner.ledger().quarantined
+            if physical.payload_bytes >= baseline.payload_bytes + CAP && owner.ledger().quarantined()
             {
                 break;
             }
@@ -374,7 +374,7 @@ async fn hard_native_direct_wire_gap_cap_keeps_aggregate_charge_and_q() {
     assert_eq!(wire.counts.restored, 0);
     assert!(wire.counts.rx_dropped_datagrams > 0);
     assert!(physical.payload_bytes >= baseline.payload_bytes + CAP);
-    assert!(owner.ledger().quarantined);
+    assert!(owner.ledger().quarantined());
     assert!(owner.stop.stopping.load(std::sync::atomic::Ordering::Acquire), "Source non-panic cap failure publishes original Session quiet before explicit stop");
     let source_deadline = owner.ledger().shutdown_deadline.expect("original Session deadline fixed by Source Q");
     wire::drive_until(&mut service, until, async {
@@ -415,7 +415,7 @@ async fn hard_native_direct_wire_gap_cap_keeps_aggregate_charge_and_q() {
     .await
     .unwrap();
     assert!(matches!(phase, Phase::Quarantined | Phase::Incomplete));
-    assert!(owner.ledger().quarantined);
+    assert!(owner.ledger().quarantined());
     assert_eq!(parent_deadline(&saved), Some(original_deadline));
     tokio::time::timeout_at(original_deadline, async {
         while owner.flow_observation().unwrap().joined < 4 {
@@ -476,7 +476,7 @@ async fn hard_native_direct_wire_gap_cap_keeps_aggregate_charge_and_q() {
         ),
         (1, 0, 4, 1)
     );
-    assert!(owner.ledger().quarantined);
+    assert!(owner.ledger().quarantined());
     assert!(meter.snapshot().payload_bytes >= baseline.payload_bytes + CAP);
     assert!(service.completion.is_none());
     let terminal_first = {

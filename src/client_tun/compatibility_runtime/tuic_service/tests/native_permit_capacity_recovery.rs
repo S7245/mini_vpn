@@ -266,7 +266,7 @@ async fn capacity_case(reply_bytes: usize, expect_peer_block: bool) {
         );
         assert_eq!(flow.f, 0);
         assert!(flow.audit);
-        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined);
+        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined());
         assert!(original_queue.as_ref().unwrap().physical_zero());
         let physical = backing.as_ref().unwrap().snapshot();
         assert_eq!(

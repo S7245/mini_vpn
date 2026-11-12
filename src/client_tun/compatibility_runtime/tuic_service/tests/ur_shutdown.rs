@@ -41,7 +41,7 @@ fn owner_facts(owner: &SessionControl) -> (bool, bool, Option<tokio::time::Insta
     let ledger = owner.ledger();
     (
         ledger.first_failure.is_none(),
-        ledger.quarantined,
+        ledger.quarantined(),
         ledger.shutdown_deadline,
     )
 }

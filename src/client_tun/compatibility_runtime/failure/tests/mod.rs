@@ -53,7 +53,7 @@ fn node_owner_drop_reaches_original_session_first_stop_and_deadline() {
         "live Session must receive the actual Node Drop failure"
     );
     assert_eq!(ledger.shutdown_deadline, Some(deadline));
-    assert!(ledger.quarantined);
+    assert!(ledger.quarantined());
     drop(ledger);
     assert!(owner.stop.stopping.load(Ordering::Acquire));
     assert!(

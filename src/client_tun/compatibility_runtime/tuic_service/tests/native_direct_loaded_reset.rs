@@ -166,7 +166,7 @@ async fn exercise(ending: Ending, hard: bool) {
                     let pending_error = owner.flow_native_pending_reader_error_order();
                     let ledger = owner.ledger();
                     eprintln!("direct loaded RESET first gate: flow={flow:?} source={source:?} provider={provider:?} pending_error={pending_error:?} first={:?} Q={} meter={:?}",
-                        ledger.first_failure.as_ref().map(|first| first.facts()), ledger.quarantined,
+                        ledger.first_failure.as_ref().map(|first| first.facts()), ledger.quarantined(),
                         backing.as_ref().unwrap().snapshot());
                     assert!(source.is_some_and(|bytes| bytes >= 8192));
                     charged_four_join_without_first |= flow.joined == 4 && flow.f == 1
@@ -216,7 +216,7 @@ async fn exercise(ending: Ending, hard: bool) {
             let provider = owner.flow_native_provider_view();
             let ledger = owner.ledger();
             eprintln!("direct loaded RESET deferred: flow={:?} source={:?} provider={:?} first={:?} Q={}",
-                flow, source, provider, ledger.first_failure.as_ref().map(|first| first.facts()), ledger.quarantined);
+                flow, source, provider, ledger.first_failure.as_ref().map(|first| first.facts()), ledger.quarantined());
         }
         observed.unwrap();
         if ending == Ending::AckHeld {
@@ -342,7 +342,7 @@ async fn exercise(ending: Ending, hard: bool) {
                 assert!(Arc::ptr_eq(&original_owner, &owner));
                 let flow = owner.flow_observation().unwrap();
                 assert_eq!((flow.joined, flow.released, flow.f), (4, 1, 0));
-                assert!(flow.audit && !owner.ledger().quarantined);
+                assert!(flow.audit && !owner.ledger().quarantined());
                 assert_eq!(fixture::first_failure_identity(&owner), first_before_release);
                 assert_eq!(backing.as_ref().unwrap().snapshot().physical_bytes, 0);
                 assert_eq!(owner.ledger().shutdown_deadline, original_session_deadline);
@@ -365,14 +365,14 @@ async fn exercise(ending: Ending, hard: bool) {
             eprintln!("direct ACK-held parent: completed={} phase={:?} flow={flow:?} provider={:?} first={:?} Q={} rx_dropped={}",
                 completed.is_ok(), handle.phase(), provider,
                 ledger.first_failure.as_ref().map(|first| first.facts()),
-                ledger.quarantined, fault.snapshot().counts.rx_dropped_datagrams);
+                ledger.quarantined(), fault.snapshot().counts.rx_dropped_datagrams);
             assert!(completed.is_err());
             assert_eq!(handle.phase(), Phase::Quarantined);
             assert_eq!((flow.joined, flow.released, flow.f), (4, 0, 1));
             assert_eq!(flow.last_data_disposition, None);
             assert_eq!(provider.phase, TcpOpenPhase::Retiring);
             assert!(provider.lease_held && provider.retirement_pending);
-            assert!(ledger.quarantined);
+            assert!(ledger.quarantined());
             drop(ledger);
             assert_eq!(fixture::first_failure_identity(&owner), first_before_release);
             if hard {

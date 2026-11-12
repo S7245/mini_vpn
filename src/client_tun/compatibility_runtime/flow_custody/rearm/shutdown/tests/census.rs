@@ -18,7 +18,7 @@ async fn stale_nonzero_live_cannot_hide_empty_original_root() {
     owner.request_stop();
     owner.opens().live = 1;
     assert!(!dispatch.flow_shutdown_complete(&sockets, &mut contexts, &pool));
-    assert!(owner.ledger().quarantined);
+    assert!(owner.ledger().quarantined());
     assert_eq!(owner.opens().live, 1, "uncertain count stays charged");
 }
 
@@ -179,7 +179,7 @@ impl Census {
             let ledger = self.owner.ledger();
             (
                 ledger.shutdown_deadline,
-                ledger.quarantined,
+                ledger.quarantined(),
                 ledger.first_failure.is_none(),
             )
         };
@@ -414,7 +414,7 @@ async fn wrong_slot_capacity_keeps_valid_flow_and_sticky_owner_quarantine() {
                 let ledger = f.owner.ledger();
                 (
                     ledger.shutdown_deadline,
-                    ledger.quarantined,
+                    ledger.quarantined(),
                     ledger.first_failure.is_none(),
                 )
             };
@@ -505,7 +505,7 @@ async fn actual_socket_type_and_reverse_orphans_keep_all_original_custody() {
         }
         for _ in 0..2 {
             assert!(!f.census(), "case {case}");
-            assert!(f.owner.ledger().quarantined);
+            assert!(f.owner.ledger().quarantined());
             assert_eq!(f.owner.ledger().shutdown_deadline, Some(f.stop_deadline));
             assert!(f.owner.ledger().first_failure.is_none());
             if case == 0 { f.assert_owned(f.id, true); }

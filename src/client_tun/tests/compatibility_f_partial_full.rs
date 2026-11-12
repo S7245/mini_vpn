@@ -186,7 +186,7 @@ async fn partial_pressure_case(published: usize) {
                     .filter(|row| !row.starts_with("stage=Published ")).take(128).collect();
                 let (quarantined, stop_deadline) = {
                     let ledger = session.control.ledger();
-                    (ledger.quarantined, ledger.shutdown_deadline)
+                    (ledger.quarantined(), ledger.shutdown_deadline)
                 };
                 eprintln!("FULL_PARTIAL stalled quarantined={} stop_deadline={:?} peer_finished={} rows={rows:?}",
                     quarantined, stop_deadline,
@@ -197,7 +197,7 @@ async fn partial_pressure_case(published: usize) {
             assert_eq!(session.control.published_flow_count(), Some(seen.published));
             assert_eq!((seen.live, seen.f, seen.w, seen.running), (end, end, 0, end * 3));
             assert_eq!((seen.released, seen.joined), (0, 0));
-            assert!(seen.audit && !session.control.ledger().quarantined);
+            assert!(seen.audit && !session.control.ledger().quarantined());
             assert_eq!((links.0.dropped_packets(), links.1.dropped_packets()), (0, 0));
         }
         phase = "partial128";
@@ -258,7 +258,7 @@ async fn partial_pressure_case(published: usize) {
             assert_eq!((seen.escrow_bytes, seen.reserved), (PARTIAL, PARTIAL * crate::client_tun::MAX_UPLINK_BUFFER));
             assert_eq!((seen.released, seen.joined, seen.retry), (0, 0, 0));
             assert_eq!((apps.queued(full), apps.windows[full]), (4096, Some(0)));
-            assert!(seen.audit && !session.control.ledger().quarantined);
+            assert!(seen.audit && !session.control.ledger().quarantined());
         }
         phase = "stop-prefix";
         let started = tokio::time::Instant::now();
@@ -308,7 +308,7 @@ async fn partial_pressure_case(published: usize) {
         assert_eq!((done.live, done.w, done.f, done.escrow_bytes, done.reserved, done.attempts, done.running), (0, 0, 0, 0, 0, 0, 0));
         assert_eq!((done.factory_started, done.published, done.released, done.joined),
             (full as u64, published as u64, full as u64, (published * 3) as u64));
-        assert!(done.audit && !session.control.ledger().quarantined);
+        assert!(done.audit && !session.control.ledger().quarantined());
         assert_eq!(session.control.retained_provider_io_kind(), Some(std::io::ErrorKind::Interrupted));
         let source = session.control.retained_provider_failure().unwrap();
         assert_eq!(source.1.phase, TcpOpenPhase::Settled);

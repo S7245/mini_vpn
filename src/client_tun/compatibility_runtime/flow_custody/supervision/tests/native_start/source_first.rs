@@ -171,7 +171,7 @@ async fn original_disposal(mode: u8) {
         );
         assert_eq!(first.facts().origin.resource_id, id.index as u64);
         assert_eq!(ledger.additional_failures, 0);
-        if mode == 4 { assert!(ledger.quarantined && ledger.shutdown_deadline.is_some()); }
+        if mode == 4 { assert!(ledger.quarantined() && ledger.shutdown_deadline.is_some()); }
         else { assert!(ledger.shutdown_deadline.is_none(), "ordinary flow IO does not stop Session"); }
     }
     if mode == 4 {
@@ -386,7 +386,7 @@ async fn cross_flow_capture_order_precedes_two_original_callback_failures() {
     assert_eq!(facts.raw_os_code, Some(5));
     assert_eq!(ledger.additional_failures, 3);
     assert_eq!(ledger.shutdown_deadline, Some(deadline));
-    assert!(ledger.quarantined && budget.quarantined() && budget.used() > 0);
+    assert!(ledger.quarantined() && budget.quarantined() && budget.used() > 0);
     assert!(wake.downcast_ref::<&str>().is_some());
     assert!(drop_panic.downcast_ref::<&str>().is_some());
 }

@@ -100,11 +100,11 @@ impl OpenDispatch {
             }
             *cursor += 1;
             let smoltcp::socket::Socket::Tcp(socket) = socket else {
-                owner.ledger().quarantined = true;
+                owner.quarantine_quiet();
                 continue;
             };
             let Some(ctx) = contexts.get_mut(&handle) else {
-                owner.ledger().quarantined = true;
+                owner.quarantine_quiet();
                 continue;
             };
             // Release the root lock before entering the existing gateway.
@@ -118,7 +118,7 @@ impl OpenDispatch {
                 if let Some(mirror) = &mut ctx.flow_mirror {
                     mirror.quarantined = true;
                 }
-                owner.ledger().quarantined = true;
+                owner.quarantine_quiet();
                 continue;
             }
             if ctx.flow_mirror.is_none() && (ctx.local_reset.is_some() || physical_work(socket)) {
@@ -227,7 +227,9 @@ impl OpenDispatch {
                     consistent = false;
                 }
                 let valid = row.is_some_and(|flow| {
-                    let valid = epoch_matches && !mirror.quarantined
+                    // D210: a registered Flow-Q row is held custody, not a
+                    // census inconsistency; identity and lease checks still apply.
+                    let valid = epoch_matches && (!mirror.quarantined || flow.flow_q_registered())
                         && (ctx.conn_epoch != flow.id.epoch
                             || flow.fake_ip == mirror.live_lease().map(|lease| lease.receipt()));
                     if !valid { mirror.quarantined = true; }
@@ -349,8 +351,11 @@ impl OpenDispatch {
         } else {
             None
         };
-        if !physical || !root_consistent {
-            owner.ledger().quarantined = true;
+        // D210: at stop, once only registered Flow-Q rows remain (none can
+        // release), any Q becomes Session scope: a bounded Incomplete end.
+        let q_only = opens.live == opens.flow_q_rows() && owner.ledger().quarantined();
+        if !physical || !root_consistent || q_only {
+            owner.quarantine_quiet();
         }
         let complete = opens
             .flow
@@ -360,7 +365,7 @@ impl OpenDispatch {
             && root_consistent
             && !pending
             && opens.live == 0
-            && !owner.ledger().quarantined;
+            && !owner.ledger().quarantined();
         #[cfg(test)]
         {
             drop(opens);

@@ -41,7 +41,7 @@ async fn stale_close_identity_quarantines_without_changing_current_flow() {
         (flow.id, flow.stage)
     };
     assert!(dispatch.request_flow_close(handle, id.epoch.wrapping_add(1), Some(id), None, None,));
-    assert!(owner.ledger().quarantined);
+    assert!(owner.ledger().quarantined());
     let opens = owner.opens();
     let OpenPhase::Flow(flow) = &opens.slots.iter().flatten().next().unwrap().phase else {
         panic!("same flow retained");
@@ -79,7 +79,7 @@ async fn identity_exhaustion_retains_fault_before_recv_without_inventing_flow() 
                 },
             );
             assert!(
-                owner.ledger().quarantined,
+                owner.ledger().quarantined(),
                 "permanent identity exhaustion is not temporary pressure"
             );
             let opens = owner.opens();
@@ -174,7 +174,7 @@ async fn last_generation_admits_once_and_next_exhaustion_preserves_existing_row(
         Some(u64::MAX),
         "reserve room for the real physical receipt"
     );
-    assert!(!owner.ledger().quarantined);
+    assert!(!owner.ledger().quarantined());
     for _ in 0..4 {
         dispatch.begin_turn().await;
         dispatch.admit_flow(
@@ -215,7 +215,7 @@ async fn last_generation_admits_once_and_next_exhaustion_preserves_existing_row(
             b"untouched-rx".len()
         );
         assert_eq!(upstream.0.load(Ordering::SeqCst), 0);
-        assert!(owner.ledger().quarantined);
+        assert!(owner.ledger().quarantined());
         assert_eq!(owner.ledger().additional_failures, 0);
     }
     owner.request_stop();
@@ -278,7 +278,7 @@ async fn ordinary_w_capacity_wait_keeps_identity_and_rx_without_integrity_fault(
             b"untouched-rx".len()
         );
         let ledger = owner.ledger();
-        assert!(!ledger.quarantined && ledger.first_failure.is_none());
+        assert!(!ledger.quarantined() && ledger.first_failure.is_none());
         assert_eq!(upstream.0.load(Ordering::SeqCst), 0);
     }
     assert_eq!(reserved.len(), OPEN_LIMIT);

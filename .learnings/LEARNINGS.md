@@ -1,3 +1,11 @@
+## 2026-11-12 粘性 Flow 作用域 Q 若仍占共享预算，就等于把共享状态的不确定性留给兄弟行：先写饿死 tracer 再定作用域
+
+D221：硬档 Flow-Q 行持有 escrow 时兄弟行被持续 Full 回滚而会话仍报 Running；用户定为 Session（D222，`scoped_q.rs` `holds_hard_budget`）。归因新红行时，先串行重跑，再在关掉改动和 HEAD 二进制上做 A/B 采样（D222 path 行 HEAD 1/5 vs 当前 4/5）。
+
+## 2026-11-11 门组按过滤器挑测试：没被选中的组可能长期红着，"全绿"只对选中的行成立
+
+D207：调查 soft session Q 时，单跑门外的 `f_flow::` 组 37 行，其中 8 行在 HEAD 红，7 行在 974367b 已红，从未进入任何门组。其中 3 行正是 D195 设计缺陷的既有合同（A Q 后 B 应释放），m-q 变异下转绿；另 5 行原因不同。做设计调查时，先在全库搜索同一合同的既有测试并直接跑（`--exact`，归档二进制对比），再写新 tracer；报告门结果时写明哪些组不在门内。
+
 ## 2026-11-11 单次 n4 组 ×5 绿不能证明间歇失败已消失：同一门在负载下仍会复现
 
 D174：M6 在完整 `native_n4_` 组内跑 ×5 都是绿，drain 12.7–13.7s。紧接着全门 n4 组又出现一次 drain 停顿（一流停在 65535B）。间歇失败要按累计频率判断（现在约 2/12），要先给停顿的流做 owner 普查再说是否修好。裁决里要把它写成"开放"，不能写成"接受"。raw `n4-gate3-20261110/gate-n4.log`。
@@ -307,3 +315,5 @@ Current boundaries, counters and next execution are in docs/current/STATUS.md, t
 - 2026-11-07 N1 (D104–D106): audit the public call chain before building "public entry wiring" — the CLI already ran the same saved Service (`serve`→`prepare_factory`→`rebuild::drive`); the real gap was one rejecting device-factory branch plus missing evidence (hard local recovery, late-event isolation). A same-generation "detector" mutation (re-send the old fragment on the new connection) is a cheap way to prove an isolation assertion is discriminating. Gate `n1-n1-gate-20261107`.
 - 2026-11-07 N1 F1: an injected "late" event is evidence only if delivery is proven before the fault — bracket it between two whole controls on the same QUIC connection and wait for the second; `Connection::close` sends nothing queued. Pair every isolation tracer with a mutation of the owning cleanup (here `Fragments::retire_generation`). Check a counter's semantics before asserting zero (`FlowObservation.retry` is credit). (D109)
 - 2026-11-07 D111–D113: a missing dev key is a fixture problem. Use an in-memory rcgen CA→leaf plus a thread-local temp CA guard; don't create persisted keys. Once SynBurst ran again it showed ingress clean (drops 0) but cleanup drain RED. Check which phase failed (scenario vs cleanup) before reusing a historical RED label.
+
+- 2026-11-11 (D210–D215): Scoping a shared Q flag means checking every reader. The stop census treated a quarantined mirror as a physical inconsistency, so one row's Flow Q became Session Q at stop and refused a sibling's release. It was found only by the accepted f_flow contract's cleanup step, so gate the contract rows (now group `fflow`). Keep "any Q" (sticky, Incomplete end) separate from "refusing Q" (Session). A fresh-check epoch keeps B560 without making pre-existing Flow Q refusing.

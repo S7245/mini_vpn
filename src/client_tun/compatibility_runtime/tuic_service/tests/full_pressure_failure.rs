@@ -203,7 +203,7 @@ async fn exercise(case: Case) {
                 .count(),
             128
         );
-        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined);
+        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined());
         println!("actualfullWF beforecontrolledreadfatal {full:?} originalUDPassoc={assoc}");
         gate.read_error.store(true, Ordering::Release);
         app.prepare_health(); // Real original app ingress wakes a pending TunIo read.
@@ -236,7 +236,7 @@ async fn exercise(case: Case) {
         };
         match phase {
             Phase::Incomplete => assert!(tokio::time::Instant::now() >= parent_deadline),
-            Phase::Quarantined => assert!(owner.ledger().quarantined),
+            Phase::Quarantined => assert!(owner.ledger().quarantined()),
             other => panic!("fullfatal falselysettled {other:?}"),
         }
         println!(
@@ -260,7 +260,7 @@ async fn exercise(case: Case) {
             assert_eq!(first_error(&owner), first);
             assert_eq!(owner_limit(&owner), Some(owner_deadline));
             assert_eq!(deadline(&saved), Some(parent_deadline));
-            assert!(owner.ledger().quarantined);
+            assert!(owner.ledger().quarantined());
             assert!(!owner.business_complete.load(Ordering::Acquire));
             assert!(!owner.driver_complete.load(Ordering::Acquire));
             assert!(service.completion.is_none());

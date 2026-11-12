@@ -601,7 +601,7 @@ pub(super) fn census(saved: &Control, budget: &bytes::BackingBudget, peer: &Peer
     };
     if let Some(control) = native_waiting::session(saved) {
         let ledger = control.ledger();
-        (out.q, out.first_failure) = (ledger.quarantined, ledger.first_failure.is_some());
+        (out.q, out.first_failure) = (ledger.quarantined(), ledger.first_failure.is_some());
         drop(ledger);
         if let Some(f) = control.flow_observation() {
             out.live = f.live;

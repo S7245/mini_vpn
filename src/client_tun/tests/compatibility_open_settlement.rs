@@ -324,7 +324,7 @@ async fn open_illegal_orphan_announcement_stays_quarantined_across_shutdown_reen
             (first, after),
             (second, reentered),
             deadline.is_some() && deadline == ledger.shutdown_deadline,
-            ledger.quarantined,
+            ledger.quarantined(),
         )
     })
     .await;
@@ -610,7 +610,7 @@ async fn open_success_stays_retained_while_other_workers_and_device_actually_set
         );
         assert_eq!(after, expected_inventory(1, 0, 1, 0, 128));
         assert_eq!(second, Some(SessionDeviceState::Incomplete));
-        assert!(session.control.ledger().quarantined);
+        assert!(session.control.ledger().quarantined());
         assert!(session.control.ledger().first_failure.is_none());
         assert!(
             session
@@ -728,7 +728,7 @@ async fn open_illegal_inventory_directions_keep_quarantine_and_nonworker_bits() 
             assert!(poll_once(session.run()).await.is_none());
             let empty = inventory(&session.control, &upstream);
             assert_eq!(empty, expected_inventory(0, 0, 0, 0, 0));
-            assert!(!session.control.ledger().quarantined);
+            assert!(!session.control.ledger().quarantined());
             if case == 0 {
                 session.control.opens().live = 1;
             } else {
@@ -781,7 +781,7 @@ async fn open_illegal_inventory_directions_keep_quarantine_and_nonworker_bits() 
             assert_eq!(second, first);
             assert_eq!(inventory(&session.control, &upstream), after);
             let ledger = session.control.ledger();
-            assert!(ledger.quarantined && ledger.first_failure.is_none());
+            assert!(ledger.quarantined() && ledger.first_failure.is_none());
             assert!(deadline.is_some() && deadline == ledger.shutdown_deadline);
         })
         .await;

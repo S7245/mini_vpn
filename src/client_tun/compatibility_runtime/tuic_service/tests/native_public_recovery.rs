@@ -201,7 +201,7 @@ async fn hard_native_primary_loss_recovers_locally_in_same_session() {
         }
         assert!(completion._retired.is_none());
         let ledger = completion.control.ledger();
-        assert!(ledger.first_failure.is_none() && !ledger.quarantined);
+        assert!(ledger.first_failure.is_none() && !ledger.quarantined());
         drop(ledger);
         let flows = completion.control.flow_observation().unwrap();
         assert_eq!((flows.live, flows.running), (0, 0));

@@ -417,7 +417,7 @@ async fn late_device_drop_secondary_keeps_actual_session_and_node_in_quarantine(
         gate.drop_secondary.store(true, Ordering::SeqCst);
         handle.request_stop();
         until(&mut service, Duration::from_secs(3), || {
-            control.ledger().quarantined
+            control.ledger().quarantined()
         })
         .await;
         assert_eq!(

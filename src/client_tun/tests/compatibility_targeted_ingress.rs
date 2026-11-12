@@ -251,7 +251,7 @@ async fn saved_single(mode: u8) {
                     ),
                     facts
                 );
-                assert_eq!(session.control.ledger().quarantined, mode == 1);
+                assert_eq!(session.control.ledger().quarantined(), mode == 1);
                 assert_eq!(
                     session.control.driver_complete.load(Ordering::Acquire),
                     mode == 2

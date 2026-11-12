@@ -119,7 +119,7 @@ async fn native_link_tail_self_wake_then_actual_device_drop_retains_both_without
         assert!(ledger.first_egress_io.is_none());
         assert_eq!(ledger.shutdown_deadline, Some(deadline));
         assert_eq!(ledger.additional_failures, 0);
-        assert!(ledger.quarantined);
+        assert!(ledger.quarantined());
     }
     assert!(budget.quarantined());
     {

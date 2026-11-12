@@ -243,7 +243,7 @@ pub(in crate::client_tun::compatibility_runtime::tuic_service::tests) fn hard_q_
     let retained = {
         let ledger = owner.ledger();
         let first = ledger.first_failure.as_ref()?;
-        assert!(ledger.quarantined && saved.backing_budget.as_ref().unwrap().quarantined());
+        assert!(ledger.quarantined() && saved.backing_budget.as_ref().unwrap().quarantined());
         let facts = first.facts();
         assert_eq!(
             facts.origin.phase,

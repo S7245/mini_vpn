@@ -373,7 +373,7 @@ async fn exercise(fault: Fault) {
             };
             match phase {
                 Phase::Incomplete => assert!(tokio::time::Instant::now() >= parent.unwrap()),
-                Phase::Quarantined => { let q = owner.ledger().quarantined; assert!(q); }
+                Phase::Quarantined => { let q = owner.ledger().quarantined(); assert!(q); }
                 other => panic!("charged original F falsely settled {other:?}"),
             }
             println!("original first15 parent={parent:?} owner={deadline:?}; same observer {phase:?}; no run Report/D/Node cleanup");

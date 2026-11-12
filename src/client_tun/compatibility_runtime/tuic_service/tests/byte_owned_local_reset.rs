@@ -145,7 +145,7 @@ async fn local_abort_case(peer_finishes: bool) {
                     })
                 {
                     assert_eq!((flow.live, flow.f, flow.released), (1, 1, 0));
-                    assert!(!owner.ledger().quarantined);
+                    assert!(!owner.ledger().quarantined());
                     assert!(matches!(
                         flow_queue.snapshot_now().closure.terminal_cause(),
                         Some(cause) if cause.direction == "local_to_remote"
@@ -170,7 +170,7 @@ async fn local_abort_case(peer_finishes: bool) {
                 .first_failure
                 .as_ref()
                 .map(|first| format!("{:?}", first.facts()));
-            let quarantined = ledger.quarantined;
+            let quarantined = ledger.quarantined();
             drop(ledger);
             eprintln!(
                 "D16 App abort settle: flow={:?} debug={:?} physical={:?} first={:?} q={} peer={:?}",
@@ -220,7 +220,7 @@ async fn local_abort_case(peer_finishes: bool) {
             assert_eq!((flow.published, flow.released, flow.joined), (1, 0, 3));
             assert_eq!((flow.live, flow.w, flow.f, flow.running), (1, 0, 1, 0));
             assert!(flow.audit);
-            assert!(owner.ledger().first_failure.is_none() && owner.ledger().quarantined);
+            assert!(owner.ledger().first_failure.is_none() && owner.ledger().quarantined());
             assert_eq!(*saved.deadline.lock().unwrap(), Some(original_deadline));
             let (queue, budget, same) = owner.flow_d16_physical_snapshots().unwrap();
             assert!(same);
@@ -235,7 +235,7 @@ async fn local_abort_case(peer_finishes: bool) {
                 app.turn().await;
                 assert!(tokio::time::timeout(Duration::from_millis(10), service.run()).await.is_err());
                 let owner = saved.session.lock().unwrap().as_ref().unwrap().upgrade().unwrap();
-                if owner.flow_observation().unwrap().released == 1 || owner.ledger().quarantined {
+                if owner.flow_observation().unwrap().released == 1 || owner.ledger().quarantined() {
                     break;
                 }
             }
@@ -252,7 +252,7 @@ async fn local_abort_case(peer_finishes: bool) {
         assert_eq!((flow.published, flow.released, flow.joined), (1, 1, 3));
         assert_eq!((flow.live, flow.w, flow.f, flow.running), (0, 0, 0, 0));
         assert!(flow.audit);
-        assert!(!owner.ledger().quarantined);
+        assert!(!owner.ledger().quarantined());
         let (queued, transferred, discarded) = owner.flow_d16_disposition().unwrap();
         assert!(queued > 0);
         assert_eq!(transferred + discarded, queued);
@@ -295,7 +295,7 @@ async fn local_abort_case(peer_finishes: bool) {
                     .first_failure
                     .as_ref()
                     .map(|first| format!("{:?}", first.facts()));
-                let quarantined = ledger.quarantined;
+                let quarantined = ledger.quarantined();
                 drop(ledger);
                 eprintln!(
                     "D16 App abort parent: flow={:?} physical={:?} first={:?} q={} phase={:?}",

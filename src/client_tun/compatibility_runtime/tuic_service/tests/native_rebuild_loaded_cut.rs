@@ -134,11 +134,11 @@ async fn loaded_original_rebuild(engine: Engine) {
         assert!(!Arc::ptr_eq(&completion.control, &old), "successor owns completion");
         {
             let ledger = old.ledger();
-            assert!(ledger.first_failure.is_none() && !ledger.quarantined);
+            assert!(ledger.first_failure.is_none() && !ledger.quarantined());
         }
         {
             let ledger = completion.control.ledger();
-            assert!(ledger.first_failure.is_none() && !ledger.quarantined);
+            assert!(ledger.first_failure.is_none() && !ledger.quarantined());
         }
     })
     .await;

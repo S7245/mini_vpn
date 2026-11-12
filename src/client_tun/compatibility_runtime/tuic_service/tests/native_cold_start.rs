@@ -150,7 +150,7 @@ async fn observer_fault_commits_original_service_stop_and_q_without_manual_stop(
         .unwrap()
         .upgrade()
         .unwrap();
-    assert!(owner.ledger().quarantined);
+    assert!(owner.ledger().quarantined());
     assert_eq!(gate.drops.load(Ordering::SeqCst), 0);
     assert_eq!(Arc::strong_count(&payload), 2);
     tokio::time::advance(Duration::from_secs(3)).await;

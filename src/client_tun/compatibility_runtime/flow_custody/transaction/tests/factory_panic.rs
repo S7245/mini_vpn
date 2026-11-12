@@ -230,7 +230,7 @@ async fn exercise(prior_io: bool) {
     let after = snapshot(&owner, id).expect("original factory row");
     let observed = owner.flow_observation().unwrap();
     let original_first = first(&owner);
-    let quarantined = owner.ledger().quarantined;
+    let quarantined = owner.ledger().quarantined();
     println!(
         "B53 actualfactory before={before:?} after={after:?} originalPayload={identity} drops={} calls={} ownerQ={quarantined} actualCensus={observed:?} first={original_first:?}",
         drops.load(Ordering::Acquire),
@@ -269,8 +269,9 @@ async fn exercise(prior_io: bool) {
         ),
         (1, 1, 1, 1, 0, 0, 0)
     );
-    let no_shutdown_limit = owner.ledger().shutdown_deadline.is_none();
-    assert!(no_shutdown_limit);
+    // D216: a panic inside the shared provider factory is Session scope.
+    let session_limit = owner.ledger().shutdown_deadline.is_some() && owner.ledger().session_quarantined();
+    assert!(session_limit);
     let original_first = original_first
         .expect("factory unwind must publish original Flow Panic before payload/unknown work");
     if let Some(prior) = prior_first {

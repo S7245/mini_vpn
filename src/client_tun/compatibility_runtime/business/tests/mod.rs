@@ -75,7 +75,7 @@ async fn callback_shutdown_poll_and_drop_keep_original_boxes_and_deadline() {
     assert_eq!(ledger.unknown_panic_payloads, 2);
     assert_eq!(ledger.shutdown_deadline, Some(deadline));
     assert!(ledger.first_egress_io.is_none());
-    assert!(ledger.quarantined);
+    assert!(ledger.quarantined());
     assert_eq!(budget.used(), 1);
 }
 
@@ -113,7 +113,7 @@ async fn callback_shutdown_cancellation_disposes_in_place_without_escaping() {
     assert_eq!(ledger.additional_failures, 0);
     assert_eq!(ledger.unknown_panic_payloads, 1);
     assert_eq!(ledger.shutdown_deadline, Some(deadline));
-    assert!(ledger.quarantined);
+    assert!(ledger.quarantined());
     assert_eq!(budget.used(), 1);
 }
 

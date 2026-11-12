@@ -377,7 +377,7 @@ async fn published_loop_panic(payload_drop_panics: bool, site: usize) {
                 if view.joined == 3
                     && view.settled_providers == 1
                     && probe.peer_stop.load(Ordering::SeqCst)
-                    && session.control.ledger().quarantined
+                    && session.control.ledger().quarantined()
                 {
                     break;
                 }
@@ -406,7 +406,7 @@ async fn published_loop_panic(payload_drop_panics: bool, site: usize) {
             assert_eq!(facts.class, FailureClass::Panic);
             assert_eq!(facts.origin.phase, FailurePhase::SessionLoop);
         }
-        assert!(ledger.quarantined && after.audit);
+        assert!(ledger.quarantined() && after.audit);
         if site == 1 {
             let ([published, transferred, discarded], in_flight) = bridge.fatal_census().unwrap();
             assert_eq!(in_flight, 0);

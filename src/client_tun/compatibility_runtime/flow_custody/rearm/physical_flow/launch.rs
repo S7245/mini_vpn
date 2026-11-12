@@ -50,6 +50,7 @@ impl OpenDispatch {
         let Some(mirror) = &mut ctx.flow_mirror else { return false; };
         if mirror.id != id || !mirror.matches_epoch(ctx.conn_epoch) || mirror.published_bytes.is_some() {
             flow.stage = FlowStage::Quarantined;
+            owner.quarantine_quiet(); // D216: identity/publication disagreement ⇒ Session.
             return false;
         }
         if native_channels.is_none() && !matches!(
@@ -60,8 +61,7 @@ impl OpenDispatch {
                     | OpenedTcpRelay::NativeByteOwned(_)
             ))
         ) {
-            flow.stage = FlowStage::Quarantined;
-            owner.ledger().quarantined = true;
+            flow.quarantine_flow(owner);
             return false;
         }
         let (tx, credit_tx, permit_engine, native, d16) = if let Some((tx, credit_tx)) = native_channels {
@@ -99,8 +99,7 @@ impl OpenDispatch {
                     Ok(queue) => queue,
                     Err(_) => {
                         flow.carrier = Some(OpenedOwnedTcp::Legacy(OpenedTcpRelay::NativeByteOwned(native)));
-                        flow.stage = FlowStage::Quarantined;
-                        owner.ledger().quarantined = true;
+                        flow.quarantine_flow(owner);
                         return false;
                     }
                 };
@@ -120,8 +119,7 @@ impl OpenDispatch {
                         flow.carrier = Some(OpenedOwnedTcp::Legacy(
                             OpenedTcpRelay::NativeByteOwned(request.native),
                         ));
-                        flow.stage = FlowStage::Quarantined;
-                        owner.ledger().quarantined = true;
+                        flow.quarantine_flow(owner);
                         return false;
                     }
                 };
@@ -129,8 +127,7 @@ impl OpenDispatch {
             }
             other => {
                 flow.carrier = other;
-                flow.stage = FlowStage::Quarantined;
-                owner.ledger().quarantined = true;
+                flow.quarantine_flow(owner);
                 return false;
             }
         };
@@ -159,23 +156,19 @@ impl OpenDispatch {
             }
         }
         if roles.quarantined() {
-            flow.stage = FlowStage::Quarantined;
-            owner.ledger().quarantined = true;
+            flow.quarantine_flow(owner);
             return false;
         }
         if !mirror.bind_permit_queue(roles, permit_engine) {
-            flow.stage = FlowStage::Quarantined;
-            owner.ledger().quarantined = true;
+            flow.quarantine_flow(owner);
             return false;
         }
         if d16 && !mirror.bind_d16_queue(roles) {
-            flow.stage = FlowStage::Quarantined;
-            owner.ledger().quarantined = true;
+            flow.quarantine_flow(owner);
             return false;
         }
         if native && !mirror.bind_native_backing(roles) {
-            flow.stage = FlowStage::Quarantined;
-            owner.ledger().quarantined = true;
+            flow.quarantine_flow(owner);
             return false;
         }
         if ctx.uplink_tx.is_some()
@@ -184,6 +177,7 @@ impl OpenDispatch {
             || mirror.published_bytes.is_some()
         {
             flow.stage = FlowStage::Quarantined;
+            owner.quarantine_quiet(); // D216: a second producer on this socket ⇒ Session.
             return false;
         }
         // The fresh channel has a single original producer and closed worker
@@ -201,13 +195,11 @@ impl OpenDispatch {
             }
         }
         if native && !roles.commit_native() {
-            flow.stage = FlowStage::Quarantined;
-            owner.ledger().quarantined = true;
+            flow.quarantine_flow(owner);
             return false;
         }
         if d16 && !roles.commit_d16() {
-            flow.stage = FlowStage::Quarantined;
-            owner.ledger().quarantined = true;
+            flow.quarantine_flow(owner);
             return false;
         }
         #[cfg(test)]

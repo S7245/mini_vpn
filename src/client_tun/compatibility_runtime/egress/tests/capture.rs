@@ -80,7 +80,7 @@ async fn native_main_capture_rejection_reaches_original_session_stop_and_first()
         let (q, observed, after, failures) = {
             let ledger = owner.ledger();
             (
-                ledger.quarantined,
+                ledger.quarantined(),
                 ledger.first_egress_io.clone(),
                 ledger.shutdown_deadline,
                 ledger.additional_failures,
@@ -183,7 +183,7 @@ async fn native_main_admission_q_is_not_a_new_io_and_publishes_each_session_quie
     let mut contexts = std::collections::HashMap::new();
     for control in [&owner, &foreign] {
         assert!(
-            !control.ledger().quarantined,
+            !control.ledger().quarantined(),
             "budget Q is not this Session's quiet"
         );
         for _ in 0..3 {
@@ -212,7 +212,7 @@ async fn native_main_admission_q_is_not_a_new_io_and_publishes_each_session_quie
             ));
             assert_eq!(released.released_inflight_permit_bytes, 0);
             let ledger = control.ledger();
-            assert!(ledger.quarantined && ledger.shutdown_deadline.is_some());
+            assert!(ledger.quarantined() && ledger.shutdown_deadline.is_some());
             assert_eq!((ledger.additional_failures, ledger.egress_failures), (0, 0));
             assert!(ledger.first_egress_io.is_none());
         }

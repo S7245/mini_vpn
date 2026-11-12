@@ -131,14 +131,14 @@ async fn run_remote_reset(loaded: bool) {
             let ledger = owner.ledger();
             eprintln!("D16 RESET stop: flow={:?} physical={:?} first={:?} q={}",
                 owner.flow_observation(), owner.flow_d16_physical_snapshots(),
-                ledger.first_failure.as_ref().map(|first| first.facts()), ledger.quarantined);
+                ledger.first_failure.as_ref().map(|first| first.facts()), ledger.quarantined());
             panic!("D16 RESET disposition: {elapsed}");
         });
         let flow = owner.flow_observation().unwrap();
         assert_eq!((flow.live, flow.released, flow.joined, flow.f), (1, 0, 3, 1));
         assert!(flow.audit);
         let ledger = owner.ledger();
-        assert!(ledger.quarantined);
+        assert!(ledger.quarantined());
         let first = ledger.first_failure.as_ref().expect("D16 reader original IO failure");
         assert_eq!(first.facts().class, crate::shared::errors::FailureClass::Io);
         assert_eq!(first.facts().io_kind, Some(std::io::ErrorKind::Other));
@@ -224,7 +224,7 @@ async fn run_remote_reset(loaded: bool) {
         assert_eq!((flow.published, flow.released, flow.joined), (1, 0, 3));
         assert!(flow.audit);
         let ledger = owner.ledger();
-        assert!(ledger.quarantined);
+        assert!(ledger.quarantined());
         let first = ledger.first_failure.as_ref().unwrap();
         let (queue, budget, same_budget) = owner.flow_d16_physical_snapshots().unwrap();
         assert!(same_budget);

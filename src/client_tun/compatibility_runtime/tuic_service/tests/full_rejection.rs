@@ -246,7 +246,7 @@ async fn exercise(case: Case) {
         }
         assert!(retired.audit && owner.flow_contracts().is_empty());
         assert!(owner.business_complete.load(Ordering::Acquire));
-        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined);
+        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined());
         assert_eq!(owner_limit(&owner), Some(old_deadline));
         assert_eq!(current.as_ref().unwrap().count(), 0);
         assert!(current
@@ -435,7 +435,7 @@ async fn exercise(case: Case) {
                 (0, 0, 0, 0)
             );
             assert!(final_inventory.audit && rejected_owner.flow_contracts().is_empty());
-            assert!(!rejected_owner.ledger().quarantined);
+            assert!(!rejected_owner.ledger().quarantined());
         }
         assert_eq!(owner_limit(&owner), Some(old_deadline));
         assert_eq!(owner_limit(&rejected_owner), Some(new_deadline));

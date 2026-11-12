@@ -22,6 +22,8 @@ struct Turn {
     joined: usize,
     armed: bool,
     audited_revision: std::cell::Cell<Option<u64>>,
+    // D210: Flow Q raised before this Turn does not refuse it; any later one does.
+    flow_q_epoch: u64,
 }
 impl Turn {
     fn matches(&self, flow: &FlowTransaction) -> bool {
@@ -46,7 +48,7 @@ impl Turn {
         opens.slots.get(id.index).and_then(Option::as_ref).is_some_and(|slot| {
             slot.matches_physical(id)
                 && matches!(&slot.phase, OpenPhase::Flow(flow) if self.matches(flow))
-        }) && !self.owner.ledger().quarantined
+        }) && self.owner.ledger().release_q_clear(self.flow_q_epoch)
             && !self.owner.app_meter.as_ref().is_some_and(bytes::BackingMeter::is_quarantined)
     }
     fn current(&self) -> bool { self.qualified(&self.owner.opens()) }
@@ -164,10 +166,10 @@ impl Drop for Turn {
         // under the same full-id qualification; foreign occupants are untouched.
         let id = self.receipt.identity();
         let panicked = self.panic.is_some();
-        self.owner.quarantine_release();
-        let deadline = self.owner.app_meter.as_ref().filter(|meter| meter.budget_limit().is_some())
-            .and_then(|_| crate::shared::errors::QuietFailureSink::deadline_quiet(&*self.owner));
-        {
+        let hard = self.owner.app_meter.as_ref().is_some_and(|meter| meter.budget_limit().is_some());
+        if hard { self.owner.quarantine_quiet(); } // T8/T9: hard release faults stay Session.
+        let deadline = hard.then(|| crate::shared::errors::QuietFailureSink::deadline_quiet(&*self.owner)).flatten();
+        let restored = {
             let mut opens = self.owner.opens();
             let original = opens.slots.get(id.index).and_then(Option::as_ref)
                 .is_some_and(|slot| slot.matches_physical(id));
@@ -183,13 +185,17 @@ impl Drop for Turn {
                     flow.release_escrow = false;
                 }
                 if let Some(payload) = self.panic.take() { flow.retain_unwind(payload); }
-                flow.stage = FlowStage::Quarantined;
+                // D216: the originals are back in the row ⇒ Flow (soft).
+                flow.quarantine_flow(&self.owner);
                 if let Some(deadline) = deadline {
                     flow.stop_deadline.limit(deadline.into_std());
                 }
                 // Keep exclusive qualification after partial actual disposal.
-            }
-        }
+                true
+            } else { false }
+        };
+        // Not restored: the originals are outside every row ⇒ Session.
+        if !restored { self.owner.quarantine_quiet(); }
         if panicked { self.owner.note_flow_unwind(id); }
     }
 }
@@ -203,15 +209,14 @@ impl OpenDispatch {
         if opens.flow_mut(id).is_some_and(|flow| flow.preparing) { return false; }
         if !opens.audit_flows() {
             if let Some(flow) = opens.flow_mut(id) { flow.stage = FlowStage::Quarantined; }
-            drop(opens); owner.quarantine_release(); return false;
+            drop(opens); owner.quarantine_quiet(); return false;
         }
-        let Some(flow) = opens.flow_mut(id) else { drop(opens); owner.quarantine_release(); return false; };
+        let Some(flow) = opens.flow_mut(id) else { drop(opens); owner.quarantine_quiet(); return false; };
         if flow.cold_retained.is_some() || flow.panic.is_some() || flow.release_escrow
             || !receipt.matches_flow(flow) || flow.stage != FlowStage::Rearming
             || !flow.producer_stopped || !flow.physical || flow.carrier.is_some()
             || flow.roles.as_ref().is_some_and(|roles| !roles.settled()) {
-            flow.stage = FlowStage::Quarantined;
-            drop(opens); owner.quarantine_release(); return false;
+            owner.quarantine_release(flow); drop(opens); return false;
         }
         if let Some(roles) = &mut flow.roles {
             if let Some(disposal) = roles.take_original_disposal(owner, id) {
@@ -229,6 +234,7 @@ impl OpenDispatch {
             roles: ManuallyDrop::new(flow.roles.take()),
             escrow: ManuallyDrop::new(None), panic: ManuallyDrop::new(None), armed: true,
             audited_revision: std::cell::Cell::new(None),
+            flow_q_epoch: owner.ledger().flow_q_epoch(),
         };
         // The full audit above survives this own move: identity/counters/escrow
         // are unchanged, and preparing permits upstream to reside in this Turn.
@@ -242,13 +248,16 @@ impl OpenDispatch {
 }
 
 impl SessionControl {
-    pub(super) fn quarantine_release(&self) {
+    /// Release-path fault of one full-id-matched row that still holds its
+    /// originals. Hard keeps its bounded Session contract (T8/T9); Soft is
+    /// Flow scope (D210/D216): the row stays sticky Q without stopping
+    /// unrelated work or minting a deadline.
+    pub(super) fn quarantine_release(&self, flow: &mut FlowTransaction) {
         if self.app_meter.as_ref().is_some_and(|meter| meter.budget_limit().is_some()) {
+            flow.stage = FlowStage::Quarantined;
             self.quarantine_quiet();
         } else {
-            // Original Soft provider catch records Q without widening its
-            // failure into a Session stop or inventing a new deadline.
-            self.ledger().quarantined = true;
+            flow.quarantine_flow(self);
         }
     }
 }

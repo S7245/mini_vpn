@@ -216,10 +216,7 @@ impl<D: TunIo> TunIo for SessionEgress<'_, D> {
             }
             (_, prior) => prior,
         };
-        if let Some(meter) = &self.owner.app_meter {
-            meter.quarantine();
-        }
-        self.owner.ledger().quarantined = true;
+        self.owner.quarantine_quiet();
         let reported_here = prior.as_ref().is_some_and(|error| {
             is_recorded_error(error, self.owner.as_ref())
                 || is_handled_refusal(error, self.owner.as_ref())

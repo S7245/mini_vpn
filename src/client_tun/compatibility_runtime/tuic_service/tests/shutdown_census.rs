@@ -102,12 +102,12 @@ async fn real_driver_rechecks_root_mismatch_between_shutdown_censuses() {
     .await
     .unwrap();
     let before = owner.shutdown_census_runs.load(Ordering::Relaxed);
-    assert!(!owner.ledger().quarantined);
+    assert!(!owner.ledger().quarantined());
     assert_eq!(owner.opens().live, 1);
 
     owner.opens().live += 1;
     assert_eq!(owner.shutdown_census_runs.load(Ordering::Relaxed), before);
-    assert!(!owner.ledger().quarantined);
+    assert!(!owner.ledger().quarantined());
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             assert!(
@@ -122,7 +122,7 @@ async fn real_driver_rechecks_root_mismatch_between_shutdown_censuses() {
     })
     .await
     .unwrap();
-    assert!(owner.ledger().quarantined);
+    assert!(owner.ledger().quarantined());
     assert!(owner.ledger().first_failure.is_none());
     assert_eq!(owner.opens().live, 2, "uncertain total stays charged");
     assert_eq!(
@@ -138,7 +138,7 @@ async fn real_driver_rechecks_root_mismatch_between_shutdown_censuses() {
             .await
             .is_err()
     );
-    assert!(owner.ledger().quarantined);
+    assert!(owner.ledger().quarantined());
 
     drop(held_send);
     if let Some(peer) = peer.take() {

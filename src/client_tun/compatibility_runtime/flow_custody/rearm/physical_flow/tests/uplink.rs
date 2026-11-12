@@ -199,3 +199,62 @@ async fn hard_initial_quarantine_keeps_parent_deadline_without_source_io() {
     assert_eq!(flow.stop_deadline, Some(parent.into_std()));
     // Deliberately unresolved Q: no fake receipt, factory or detached task.
 }
+
+/// F5 (D221/D222): a hard-profile Q row still holding native escrow on the
+/// shared `BackingBudget` is Session scope at both Flow-Q entries
+/// (`quarantine_flow` and root registration), so a sticky row cannot starve
+/// siblings while the Session reports Running (D221 starvation evidence).
+async fn hard_q_row_holding_escrow(via_registration: bool) {
+    let (_client, mut server) = receiving_pair().await;
+    let budget = bytes::BackingBudget::new(1 << 20).unwrap();
+    let meter = bytes::BackingMeter::with_budget(&budget);
+    let mut control = SessionControl::default();
+    control.app_meter = Some(meter.clone());
+    let owner = Arc::new(control);
+    *owner.opens() = OpenCustody::with_flows();
+    let (dispatch, _notices) = OpenDispatch::channel(4, Some(owner.clone()));
+    let upstream = Arc::new(NeverOpen::default());
+    let handle = server.handle;
+    let mut ctx = SocketCtx::new(10000);
+    let mut pool = FakeIpPool::new();
+    dispatch.begin_turn().await;
+    dispatch.admit_flow(upstream.clone(), FlowAdmission {
+        handle, socket: server.sockets.get_mut::<TcpSocket>(handle), ctx: &mut ctx,
+        fake_pool: &mut pool, fake_ip: None,
+        target: TargetAddr::IpPort("10.0.0.2:10000".parse().unwrap()), now: 0,
+    });
+    let a = ctx.flow_mirror.as_ref().unwrap().id;
+    let cost = bytes::BytesMut::metered_copy_layout_for_len(12).unwrap();
+    assert_eq!(budget.used(), cost, "A's native escrow is charged on the shared budget");
+    assert!(!owner.ledger().quarantined());
+    {
+        let mut opens = owner.opens();
+        let flow = opens.flow_mut(a).unwrap();
+        if via_registration { flow.stage = FlowStage::Quarantined; } else { flow.quarantine_flow(&owner); }
+    }
+    dispatch.begin_turn().await;
+    let _ = std::future::poll_fn(|cx| std::task::Poll::Ready(dispatch.poll_flows(cx))).await;
+    {
+        let opens = owner.opens();
+        assert!(opens.audit_flows());
+        assert_eq!(opens.flow_q_rows(), 1, "the row stays root-registered and sticky");
+        assert_eq!(opens.flow.as_ref().unwrap().escrow_bytes, 12);
+    }
+    let ledger = owner.ledger();
+    assert!(ledger.session_quarantined(), "hard row holding budget bytes ⇒ Session scope (D222)");
+    assert!(ledger.shutdown_deadline.is_some());
+    drop(ledger);
+    assert!(owner.stop.stopping.load(Ordering::Acquire));
+    assert_eq!(upstream.0.load(Ordering::SeqCst), 0);
+    // Deliberately unresolved Q: the Session drains under its bounded deadline.
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn d222_hard_quarantine_flow_holding_escrow_is_session_scope() {
+    hard_q_row_holding_escrow(false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn d222_hard_registered_q_row_holding_escrow_is_session_scope() {
+    hard_q_row_holding_escrow(true).await;
+}

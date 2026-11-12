@@ -254,7 +254,7 @@ fn same_live(owner: &SessionControl, expected: Acquisition) {
     };
     assert_eq!((flow.id, flow.fake_ip), (expected.0, Some(expected.1)));
     assert_eq!(flow.stage, FlowStage::Published);
-    assert!(!owner.ledger().quarantined);
+    assert!(!owner.ledger().quarantined());
 }
 
 fn release(
@@ -273,7 +273,7 @@ fn release(
         Some((acquired.0, expected, (1, active)))
     );
     assert_eq!((seen.released, seen.joined), (released, released * 3));
-    assert!(seen.audit && !owner.ledger().quarantined);
+    assert!(seen.audit && !owner.ledger().quarantined());
     let opens = owner.opens();
     assert!(
         opens

@@ -22,7 +22,7 @@ fn snapshot(saved: &Arc<Control>, budget: &bytes::BackingBudget, handle: &Handle
             .flow_observation()
             .map(|f| (f.live, f.running, f.opening_providers, f.waiting));
         let l = c.ledger();
-        let (q, more) = (l.quarantined, l.additional_failures);
+        let (q, more) = (l.quarantined(), l.additional_failures);
         drop(l);
         let first = fixture::first_failure_identity(&c).map(|f| f.1);
         format!("q={q} additional={more} flows={flows:?} first={first:?}")

@@ -66,7 +66,7 @@ async fn rearming_flow_settles_on_periodic_reprobe_after_app_fin_only() {
         assert!(drive(&mut rig, IDLE, |_| None::<()>).await.is_none());
         let flow = owner.flow_observation().expect("flow observation");
         assert_eq!(flow.released, 0, "precondition: release waits on the App FIN: {flow:?}");
-        assert!(!owner.ledger().quarantined);
+        assert!(!owner.ledger().quarantined());
         // The App FIN is the only change; no peer/relay/stop event follows.
         rig.apps.sockets.get_mut::<tcp::Socket>(app).close();
         let started = tokio::time::Instant::now();
@@ -79,7 +79,7 @@ async fn rearming_flow_settles_on_periodic_reprobe_after_app_fin_only() {
         let flow = owner.flow_observation().unwrap();
         assert!(flow.audit && flow.f == 0, "{flow:?}");
         assert_eq!(flow.last_data_disposition.map(|(m, b, t, d, _)| (m, b, t, d)), Some((1, 9, 9, 0)));
-        assert!(!owner.ledger().quarantined && owner.ledger().first_failure.is_none());
+        assert!(!owner.ledger().quarantined() && owner.ledger().first_failure.is_none());
         drop((send, recv));
     })
     .await;
@@ -88,7 +88,7 @@ async fn rearming_flow_settles_on_periodic_reprobe_after_app_fin_only() {
         let report = fixture::window(Duration::from_secs(15), rig.service.run()).await.unwrap();
         assert!(report.device_settled() && !report.device_failed(), "{report:?}");
         assert_eq!(report.node, Some(crate::tuic::NodeShutdown::RunningResourcesSettled));
-        assert!(!rig.service.completion.as_ref().unwrap().control.ledger().quarantined);
+        assert!(!rig.service.completion.as_ref().unwrap().control.ledger().quarantined());
         assert!(!budget.quarantined());
         assert_eq!(budget.used(), 0);
     })

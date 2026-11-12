@@ -244,7 +244,7 @@ async fn exercise(ending: Ending, hard: bool) {
             let owner = service.completion.as_ref().unwrap().control.clone();
             let flow = owner.flow_observation().unwrap();
             assert_eq!((flow.published, flow.joined, flow.released, flow.f), (1, 5, 1, 0));
-            assert!(flow.audit && !owner.ledger().quarantined && owner.ledger().first_failure.is_none());
+            assert!(flow.audit && !owner.ledger().quarantined() && owner.ledger().first_failure.is_none());
             let (messages, bytes, transferred, discarded, _) = flow.last_data_disposition.unwrap();
             assert!(messages > 0 && bytes > 0);
             assert_eq!(bytes, transferred + discarded);
@@ -326,7 +326,7 @@ async fn exercise(ending: Ending, hard: bool) {
         let flow = owner.flow_observation().unwrap();
         assert_eq!(owner.flow_contracts()[0].id, original_id.unwrap());
         assert_eq!((flow.published, flow.released, flow.joined, flow.f), (1, 0, 5, 1));
-        assert!(flow.audit && owner.ledger().quarantined);
+        assert!(flow.audit && owner.ledger().quarantined());
         if !hard { assert!(owner.ledger().first_failure.is_none()); }
         assert_eq!(*saved.deadline.lock().unwrap(), Some(original_deadline));
         let provider = owner.flow_native_provider_view().unwrap();

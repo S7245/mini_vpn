@@ -103,7 +103,7 @@ async fn nonhard_native_remote_reset_before_lane_data_discards_it_without_q() {
             assert!(tokio::time::timeout(Duration::from_millis(5), service.run()).await.is_err());
         }
         assert_eq!(lane.queued_len(), 0, "withheld DATA was not consumed");
-        assert!(!owner.ledger().quarantined, "late DATA after the terminal left the mirror unaccounted");
+        assert!(!owner.ledger().quarantined(), "late DATA after the terminal left the mirror unaccounted");
     }).await;
     if let Some(lane) = &bridge {
         lane.hold_relay_receive(false);
@@ -113,7 +113,7 @@ async fn nonhard_native_remote_reset_before_lane_data_discards_it_without_q() {
         let report = window(Duration::from_secs(15), service.run()).await.unwrap();
         assert!(report.device_settled() && report.device_failed(), "{report:?}");
         let current = &service.completion.as_ref().unwrap().control;
-        assert!(!current.ledger().quarantined);
+        assert!(!current.ledger().quarantined());
         let flow = current.flow_observation().unwrap();
         assert!(flow.audit && flow.released == 1 && flow.f == 0, "{flow:?}");
         let (messages, bytes, transferred, discarded, _) =
@@ -202,7 +202,7 @@ async fn lane_order_case(reset: bool) {
             }
         }).await.expect("reader terminal closes the Flow while its DATA is withheld");
         assert!(apps.tcp_reply.is_empty() && lane.queued_len() >= 1, "precondition: app={} queued={} close={:?} q={}",
-            apps.tcp_reply.len(), lane.queued_len(), owner.flow_close_for_test(), owner.ledger().quarantined);
+            apps.tcp_reply.len(), lane.queued_len(), owner.flow_close_for_test(), owner.ledger().quarantined());
         // Give the Closing seam many original session turns before releasing.
         for _ in 0..10 {
             apps.turn().await;
@@ -219,11 +219,11 @@ async fn lane_order_case(reset: bool) {
         }).await;
         if delivered.is_err() {
             eprintln!("D72 lane-order deferred: held={held:?} app={} flow={:?} q={}",
-                apps.tcp_reply.len(), owner.flow_observation(), owner.ledger().quarantined);
+                apps.tcp_reply.len(), owner.flow_observation(), owner.ledger().quarantined());
         }
         delivered.expect("reply DATA withheld behind remote EOF reaches the App");
         assert_eq!(apps.tcp_reply, b"tcp-reply");
-        assert!(!owner.ledger().quarantined);
+        assert!(!owner.ledger().quarantined());
         assert_eq!(owner.ledger().first_failure.as_ref().map(|first| first.facts().class == crate::shared::errors::FailureClass::Io),
             reset.then_some(true));
     }).await;
@@ -236,7 +236,7 @@ async fn lane_order_case(reset: bool) {
         assert!(report.device_settled() && report.device_failed() == reset, "{report:?}");
         assert_eq!(report.node, Some(crate::tuic::NodeShutdown::RunningResourcesSettled));
         let current = &rig.service.completion.as_ref().unwrap().control;
-        assert!(!current.ledger().quarantined);
+        assert!(!current.ledger().quarantined());
         assert_eq!(current.ledger().first_failure.is_some(), reset);
         let flow = current.flow_observation().unwrap();
         assert!(flow.audit && flow.released == 1 && flow.f == 0, "{flow:?}");

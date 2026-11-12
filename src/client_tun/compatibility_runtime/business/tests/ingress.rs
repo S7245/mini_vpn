@@ -85,7 +85,7 @@ async fn cold_startup_original_io_precedes_ready_observer_drop_panic_and_is_not_
     assert_eq!(ledger.unknown_panic_payloads, 1);
     assert_eq!(ledger.shutdown_deadline, Some(deadline));
     assert!(ledger.first_egress_io.is_none());
-    assert!(ledger.quarantined);
+    assert!(ledger.quarantined());
     drop(ledger);
     drop(device);
     drop(observer);

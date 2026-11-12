@@ -219,7 +219,7 @@ async fn exercise(case: Case) {
                         assert!(state.audit && state.live <= wire::TOTAL && state.f <= wire::F
                             && state.w <= wire::W && state.running <= wire::F * roles);
                         assert!(state.factory_started <= 4097 && state.published <= 4097 && state.released <= 1);
-                        let quarantined = owner.ledger().quarantined;
+                        let quarantined = owner.ledger().quarantined();
                         let parent_limit = *saved.deadline.lock().unwrap();
                         let owner_limit = owner.ledger().shutdown_deadline;
                         assert!(!quarantined);
@@ -346,7 +346,7 @@ async fn exercise(case: Case) {
             resumed.running), (4224, 4096, 128, 128, 4096, wire::F * roles));
         assert_eq!((resumed.factory_started, resumed.published, resumed.released, resumed.joined,
             resumed.retry), (4097, 4097, 1, roles as u64, 0));
-        assert!(resumed.audit && !owner.ledger().quarantined);
+        assert!(resumed.audit && !owner.ledger().quarantined());
         assert_eq!(current.as_ref().unwrap().count(), 4096);
         assert_eq!(metrics.snapshot(0, 0).relays_spawned, 4097);
         if !case.legacy() {

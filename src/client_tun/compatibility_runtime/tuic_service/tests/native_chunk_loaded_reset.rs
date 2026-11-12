@@ -218,7 +218,7 @@ async fn reset_case(hold_ack: bool, hard: bool) {
             eprintln!("ordered Chunk loaded RESET: flow={:?} debug={:?} queue={:?} custody_emitted={} source={:?} meter={:?} first={:?} Q={}",
                 flow, debug, queue.0, queue.1.emitted,
                 source, meter,
-                ledger.first_failure.as_ref().map(|first| first.facts()), ledger.quarantined);
+                ledger.first_failure.as_ref().map(|first| first.facts()), ledger.quarantined());
         }
         joined.unwrap();
         assert!(observed_original_joins);
@@ -342,7 +342,7 @@ async fn reset_case(hold_ack: bool, hard: bool) {
                     eprintln!("[N1-RESET-IO-after] outbound={} highwater={} census_runs={} control_remaining={}", outbound_probe.packets_for_test().len(), outbound_probe.high_water_packets(), original_owner.shutdown_census_runs.load(Ordering::Relaxed), original_owner.control_remaining.load(Ordering::Relaxed));
                     let ledger = original_owner.ledger();
                     eprintln!("[N1-RESET-Q-publication] phase={:?} session_q={} session_deadline={:?} business_complete={} first={:?} budget={:?}",
-                        handle.phase(), ledger.quarantined, ledger.shutdown_deadline,
+                        handle.phase(), ledger.quarantined(), ledger.shutdown_deadline,
                         original_owner.business_complete.load(Ordering::Acquire),
                         ledger.first_failure.as_ref().map(|f| f.facts()),
                         saved.backing_budget.as_ref().map(|b| (b.used(), b.quarantined())));
@@ -387,7 +387,7 @@ async fn reset_case(hold_ack: bool, hard: bool) {
                     eprintln!("[D166-reset-T9] flow={:?} provider={:?} debug={:?}", original_owner.flow_observation(),
                         original_owner.flow_native_provider_view(), original_owner.flow_debug());
                     assert_eq!(handle.phase(), Phase::Quarantined);
-                    assert_eq!(ledger.quarantined, row_present, "T9a ledger Q iff the row is still held");
+                    assert_eq!(ledger.quarantined(), row_present, "T9a ledger Q iff the row is still held");
                     assert_eq!(ledger.shutdown_deadline, original_session_deadline);
                     assert_eq!(*saved.deadline.lock().unwrap(), Some(original_deadline));
                     let budget = saved.backing_budget.as_ref().unwrap();
@@ -441,7 +441,7 @@ async fn reset_case(hold_ack: bool, hard: bool) {
             assert!(flow.last_data_disposition.is_none());
             assert_eq!(provider.phase, TcpOpenPhase::Retiring);
             assert!(provider.lease_held && provider.retirement_pending);
-            assert!(ledger.quarantined);
+            assert!(ledger.quarantined());
             let first = ledger.first_failure.as_ref().unwrap();
             if hard {
                 assert!(Arc::ptr_eq(&owner, &original_owner));
@@ -485,7 +485,7 @@ async fn reset_case(hold_ack: bool, hard: bool) {
             custody.emitted, custody.consumed, custody.discarded_bytes,
             backing.as_ref().unwrap().snapshot());
         let ledger = owner.ledger();
-        assert!(!ledger.quarantined);
+        assert!(!ledger.quarantined());
         let first = ledger.first_failure.as_ref().unwrap();
         if hard {
             assert!(Arc::ptr_eq(&owner, &original_owner));

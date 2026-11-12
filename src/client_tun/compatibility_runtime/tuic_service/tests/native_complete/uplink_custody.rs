@@ -55,7 +55,7 @@ async fn actual_hard_node_ready_before_data_stop_preserves_session_deadline() {
         .unwrap();
     assert_eq!(result, NodeShutdown::StartupResourcesSettled);
     assert_eq!(observer.facts(), (None, 0, false));
-    assert!(!session.ledger().quarantined && !budget.quarantined());
+    assert!(!session.ledger().quarantined() && !budget.quarantined());
     assert_eq!(budget.used(), 0);
     assert_eq!(deadlines, (Some(original), Some(original)));
 }

@@ -38,7 +38,7 @@ async fn actual_device_read_fatal_retains_original_business_and_node_in_quaranti
         }).await.unwrap();
         let control=service.control.session.lock().unwrap().as_ref().unwrap().upgrade().unwrap();
         let ledger=control.ledger();let facts=ledger.first_failure.as_ref().unwrap().facts();
-        assert!(ledger.quarantined);assert_eq!(facts.raw_os_code,Some(5));assert_eq!(facts.origin.phase,FailurePhase::DeviceRead);drop(ledger);
+        assert!(ledger.quarantined());assert_eq!(facts.raw_os_code,Some(5));assert_eq!(facts.origin.phase,FailurePhase::DeviceRead);drop(ledger);
         assert!(!control.driver_complete.load(Ordering::Acquire));
         for _ in 0..2 {
             assert_eq!(handle.observe_shutdown().await,Phase::Quarantined);
@@ -209,7 +209,7 @@ async fn unpublished_device_shutdown_panic_keeps_original_q_without_constructing
     assert_eq!(handle.observe_shutdown().await, Phase::Quarantined);
     assert!(!control.driver_complete.load(Ordering::Acquire));
     let ledger = control.ledger();
-    assert!(ledger.quarantined);
+    assert!(ledger.quarantined());
     assert_eq!(ledger.additional_failures, 1);
     drop(ledger);
     let polls = gate.polls.load(Ordering::SeqCst);

@@ -188,7 +188,7 @@ async fn saved_f_two_native_flows_join_independently_on_one_meter() {
     session.request_stop();
     let state = session.observe_shutdown().await;
     let server_result = server.await;
-    let clean = !session.control.ledger().quarantined;
+    let clean = !session.control.ledger().quarantined();
     let no_first_failure = session.control.ledger().first_failure.is_none();
     endpoint.close(0u32.into(), b"dual fixture cleanup");
     peer.close(0u32.into(), b"dual fixture cleanup");

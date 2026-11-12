@@ -167,7 +167,7 @@ impl Retirement {
             source_early_custody,
             source_custody,
         );
-        if retained.ledger().quarantined {
+        if retained.ledger().quarantined() {
             std::future::pending::<()>().await;
         }
         drop(panic_custody);
@@ -218,12 +218,10 @@ impl ShutdownCustody {
             _payload: std::mem::ManuallyDrop::new(payload),
         });
         retained.record(RetainedFailure::opaque_panic(SessionControl::origin(phase)));
+        let parent = retained.parent_stop_deadline();
         let mut ledger = retained.ledger();
         ledger.unknown_panic_payloads = ledger.unknown_panic_payloads.saturating_add(1);
-        ledger.quarantined = true;
-        if let Some(meter) = &retained.app_meter {
-            meter.quarantine();
-        }
+        retained.quarantine_session_locked(&mut ledger, parent);
     }
 }
 
@@ -391,7 +389,7 @@ pub(super) fn shutdown_device<'a, D: TunIo + 'a>(
 /// Only the original business/source/open tail and physical shutdown together
 /// license this guarded destruction. Unknown custody keeps the actual device.
 pub(super) async fn drop_device<D: TunIo>(device: D, retained: &SessionControl) {
-    if retained.ledger().quarantined {
+    if retained.ledger().quarantined() {
         std::future::pending::<()>().await;
     }
     let device_drop_custody = match catch_unwind(AssertUnwindSafe(|| drop(device))) {
@@ -399,11 +397,11 @@ pub(super) async fn drop_device<D: TunIo>(device: D, retained: &SessionControl) 
         Ok(()) => None,
     };
     // Late destructor failure must not fall through to driver_complete.
-    if retained.ledger().quarantined {
+    if retained.ledger().quarantined() {
         std::future::pending::<()>().await;
     }
     retained.retire_device_sources().await;
-    if retained.ledger().quarantined { std::future::pending::<()>().await; }
+    if retained.ledger().quarantined() { std::future::pending::<()>().await; }
     drop(device_drop_custody);
 }
 

@@ -134,7 +134,7 @@ async fn w128_actual_read_fatal_keeps_original_error_and_unjoined_physical_q() {
                 assert!(!owner.driver_complete.load(Ordering::Acquire));
                 assert_eq!((gate.polls.load(Ordering::Acquire), gate.joins.load(Ordering::Acquire), gate.drops.load(Ordering::Acquire)), (0,0,0));
             }
-            Phase::Quarantined => assert!(owner.ledger().quarantined),
+            Phase::Quarantined => assert!(owner.ledger().quarantined()),
             other => panic!("fatal pressure observer falsely completed {other:?}"),
         }
         println!("fatal original ownerfirst15={deadline:?} parentfirst15={parent:?} observer={phase:?} actual_at={observed_at:?}; no join");
@@ -152,7 +152,7 @@ async fn w128_actual_read_fatal_keeps_original_error_and_unjoined_physical_q() {
             assert_eq!(first_error(&owner), original);
             assert_eq!(owner.ledger().shutdown_deadline, Some(deadline));
             assert_eq!(*saved.deadline.lock().unwrap(), Some(parent));
-            assert!(owner.ledger().quarantined);
+            assert!(owner.ledger().quarantined());
             assert!(!owner.business_complete.load(Ordering::Acquire));
             assert!(!owner.driver_complete.load(Ordering::Acquire));
             let state = owner.flow_observation().unwrap();
@@ -294,7 +294,7 @@ async fn w128_noncooperating_peer_keeps_final_offset_debt_through_original_first
         };
         match observed {
             Phase::Incomplete => assert!(tokio::time::Instant::now() >= parent),
-            Phase::Quarantined => assert!(owner.ledger().quarantined),
+            Phase::Quarantined => assert!(owner.ledger().quarantined()),
             other => panic!("unknown final offset falsely settled {other:?}"),
         }
         // Q can be published before public15. Continue driving the same saved
@@ -313,7 +313,7 @@ async fn w128_noncooperating_peer_keeps_final_offset_debt_through_original_first
         })
         .await;
         assert_eq!(handle.observe_shutdown().await, Phase::Quarantined);
-        assert!(owner.ledger().quarantined);
+        assert!(owner.ledger().quarantined());
         assert!(!owner.business_complete.load(Ordering::Acquire));
         assert!(!owner.driver_complete.load(Ordering::Acquire));
         assert!(service.completion.is_none());

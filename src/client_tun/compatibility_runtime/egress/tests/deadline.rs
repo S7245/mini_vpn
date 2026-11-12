@@ -72,7 +72,7 @@ async fn actual_pending_flush_later_stop_earlier_parent_freezes_without_drop_or_
             .poll(&mut Context::from_waker(Waker::noop()))
             .is_pending()
     );
-    assert!(!owner.ledger().quarantined);
+    assert!(!owner.ledger().quarantined());
     let original = owner.request_stop();
     assert!(
         guarded
@@ -100,7 +100,7 @@ async fn actual_pending_flush_later_stop_earlier_parent_freezes_without_drop_or_
             .poll(&mut Context::from_waker(Waker::noop()))
             .is_pending()
     );
-    assert!(owner.ledger().quarantined && budget.quarantined());
+    assert!(owner.ledger().quarantined() && budget.quarantined());
     assert_eq!(owner.ledger().shutdown_deadline, Some(earlier));
     assert!(owner.ledger().first_failure.is_none());
     assert_eq!(budget.used(), initial_charge);
@@ -172,7 +172,7 @@ async fn actual_io_ready_at_deadline_wins_and_zero_poll_has_real_drop() {
                     .poll(&mut Context::from_waker(Waker::noop())),
                 Poll::Ready(Ok(()))
             ));
-            assert!(!owner.ledger().quarantined);
+            assert!(!owner.ledger().quarantined());
             assert_eq!(&peer.packets_for_test().last().unwrap()[..], b"new");
         }
         drop(guarded);
@@ -265,7 +265,7 @@ async fn actual_flush_drop_and_original_callback_drop_keep_two_original_boxes() 
     release(&owner, native); // Independently dispose the original callback.
     assert_eq!(Arc::strong_count(&second), 2);
     assert_eq!(owner.ledger().shutdown_deadline, original_deadline);
-    assert!(owner.ledger().quarantined && budget.quarantined());
+    assert!(owner.ledger().quarantined() && budget.quarantined());
     std::future::poll_fn(|cx| raw.poll_shutdown(cx)).await;
     drop((raw, owner));
     assert_eq!(budget.used(), layout_bytes());
@@ -291,7 +291,7 @@ async fn actual_cold_slot_poison_refuses_claim_and_preserves_returned_inventory(
                 Err(bytes::MeteredCopyError::Quarantined)
             ));
         }
-        assert!(owner.ledger().quarantined && budget.quarantined());
+        assert!(owner.ledger().quarantined() && budget.quarantined());
         assert_eq!(budget.used(), used);
         assert!(!super::super::deadline::retire(&owner));
         assert!(owner.ledger().first_failure.is_none());
@@ -355,7 +355,7 @@ async fn actual_inflight_callback_keeps_returned_stock_without_false_q_until_exi
     release(&owner, native);
     assert_eq!(budget.used(), before);
     assert!(!super::super::deadline::retire(&owner));
-    assert!(!owner.ledger().quarantined && !budget.quarantined());
+    assert!(!owner.ledger().quarantined() && !budget.quarantined());
     assert!(matches!(
         claim(&owner),
         Err(bytes::MeteredCopyError::BudgetFull)

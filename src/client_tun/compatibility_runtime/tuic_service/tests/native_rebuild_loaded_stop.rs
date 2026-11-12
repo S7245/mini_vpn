@@ -209,14 +209,14 @@ async fn successor_loaded_stop(engine: Engine) {
         assert!(Arc::ptr_eq(&completion.control, &owner), "successor owns completion");
         {
             let ledger = old.ledger();
-            assert!(ledger.first_failure.is_none() && !ledger.quarantined);
+            assert!(ledger.first_failure.is_none() && !ledger.quarantined());
         }
         let flow = owner.flow_observation().unwrap();
         assert_eq!((flow.live, flow.published, flow.joined, flow.released, flow.f), (0, 1, 5, 1, 0));
         assert!(flow.audit);
         {
             let ledger = owner.ledger();
-            assert!(ledger.first_failure.is_none() && !ledger.quarantined);
+            assert!(ledger.first_failure.is_none() && !ledger.quarantined());
         }
         let (messages, bytes, transferred, discarded, _) =
             flow.last_data_disposition.expect("successor real receipt");

@@ -381,7 +381,7 @@ async fn run_isolation(end: IsolationEnd) {
         assert_eq!(&bytes[..B_REPLY.len()], B_REPLY);
         assert_eq!(apps.sockets.get::<Socket>(apps.handle).recv_queue(), 4096);
         assert_eq!(control.flow_observation().unwrap().released, 0);
-        assert!(peer.close_reason().is_none() && !control.ledger().quarantined);
+        assert!(peer.close_reason().is_none() && !control.ledger().quarantined());
         if window_failure {
             step = "A fault and role/provider quarantine";
             control.fail_test_window(apps.handle);
@@ -394,7 +394,7 @@ async fn run_isolation(end: IsolationEnd) {
             finish.take().unwrap().send(()).unwrap();
             until(&mut host, &mut apps, |_| {
                 let seen = control.flow_observation().unwrap();
-                seen.joined == 3 && seen.settled_providers == 1 && control.ledger().quarantined
+                seen.joined == 3 && seen.settled_providers == 1 && control.ledger().quarantined()
             })
             .await;
             let seen = control.flow_observation().unwrap();
@@ -480,7 +480,7 @@ async fn run_isolation(end: IsolationEnd) {
             })
             .await;
             let seen = control.flow_observation().unwrap();
-            assert!(seen.audit && !control.ledger().quarantined);
+            assert!(seen.audit && !control.ledger().quarantined());
             assert_eq!((seen.published, seen.joined, seen.running), (2, 3, 3));
             if end == IsolationEnd::RemoteWriterFailure {
                 assert_eq!((seen.live, seen.f, seen.released), (2, 2, 0));
@@ -578,7 +578,7 @@ async fn run_isolation(end: IsolationEnd) {
                 upstream_ready_connection(&upstream).unwrap().stable_id(),
                 connection.stable_id()
             );
-            assert!(peer.close_reason().is_none() && !control.ledger().quarantined);
+            assert!(peer.close_reason().is_none() && !control.ledger().quarantined());
             if end == IsolationEnd::RemoteWriterFailure {
                 assert_eq!(control.flow_observation().unwrap().released, 0);
                 assert_eq!(apps.sockets.get::<Socket>(apps.handle).recv_queue(), 4096);
@@ -622,7 +622,7 @@ async fn run_isolation(end: IsolationEnd) {
             "isolation failure step={step}, flow={:?}, debug={:?}, Q={}, first={:?}",
             control.flow_observation(),
             control.flow_debug(),
-            ledger.quarantined,
+            ledger.quarantined(),
             ledger.first_failure.as_ref().map(|e| e.facts())
         );
     }

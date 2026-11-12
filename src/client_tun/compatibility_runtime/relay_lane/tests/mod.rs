@@ -89,7 +89,7 @@ async fn actual_typed_rejection_keeps_original_first_deadline_and_physical_quara
             Some(5)
         );
         assert_eq!(ledger.shutdown_deadline, Some(original));
-        assert!(ledger.quarantined);
+        assert!(ledger.quarantined());
         drop(ledger);
         drop((tx, rx, owner));
         assert!(budget.used() > 1);

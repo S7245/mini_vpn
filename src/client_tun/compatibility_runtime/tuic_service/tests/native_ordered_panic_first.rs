@@ -131,7 +131,7 @@ async fn native_ordered_original_pump_unwind_is_root_first_and_keeps_charged_f()
         assert_eq!(handle.phase(), Phase::Quarantined);
         let flow = owner.flow_observation().unwrap();
         assert_eq!((flow.f, flow.released, flow.joined), (1, 0, 5));
-        assert!(owner.ledger().quarantined);
+        assert!(owner.ledger().quarantined());
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         let ledger = owner.ledger();
         let first = ledger.first_failure.as_ref().unwrap();

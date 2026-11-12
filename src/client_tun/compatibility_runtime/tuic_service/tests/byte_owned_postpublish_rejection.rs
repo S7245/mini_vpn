@@ -98,7 +98,7 @@ async fn byte_owned_published_closed_commit_retains_real_quinn_backing() {
         let flow = owner.flow_observation().unwrap();
         assert_eq!((flow.live, flow.published, flow.released, flow.joined, flow.f), (1, 1, 0, 3, 1));
         assert_eq!(owner.flow_d16_close_reason_for_test(), Some(("remote_to_local", "d16_queue_commit_failed")));
-        assert!(flow.audit && owner.ledger().quarantined);
+        assert!(flow.audit && owner.ledger().quarantined());
         assert!(owner.ledger().first_failure.is_none());
         let (physical, budget, same) = owner.flow_d16_physical_snapshots().unwrap();
         assert!(same);
@@ -140,7 +140,7 @@ async fn byte_owned_published_closed_commit_retains_real_quinn_backing() {
         let flow = owner.flow_observation().unwrap();
         assert_eq!((flow.live, flow.w, flow.f, flow.running, flow.joined), (1, 0, 1, 0, 3));
         assert_eq!(owner.flow_d16_close_reason_for_test(), Some(("remote_to_local", "d16_queue_commit_failed")));
-        assert!(flow.audit && owner.ledger().quarantined);
+        assert!(flow.audit && owner.ledger().quarantined());
         assert!(owner.ledger().first_failure.is_none());
         let (physical, budget, same) = owner.flow_d16_physical_snapshots().unwrap();
         assert!(same);

@@ -208,7 +208,7 @@ async fn run(fault: Fault) {
             (seen.escrow_bytes, seen.reserved),
             (2 * PAYLOAD.len(), 2 * MAX_UPLINK_BUFFER)
         );
-        assert!(seen.audit && !physical.owner.ledger().quarantined);
+        assert!(seen.audit && !physical.owner.ledger().quarantined());
         let acquired = [a, b].map(|id| {
             physical.contexts[&id.handle]
                 .flow_mirror
@@ -269,7 +269,7 @@ async fn run(fault: Fault) {
             );
         }
         assert!(!census(&mut physical));
-        assert!(!physical.owner.ledger().quarantined);
+        assert!(!physical.owner.ledger().quarantined());
 
         // Restore the actual capability/count before any original physical ACK.
         match fault {
@@ -304,7 +304,7 @@ async fn run(fault: Fault) {
                 assert!(!completed);
             }
         }
-        assert!(physical.owner.ledger().quarantined);
+        assert!(physical.owner.ledger().quarantined());
         assert_eq!(physical.pool.usage(), (2, 2));
         let b_mirror = physical.contexts[&b.handle].flow_mirror.as_ref().unwrap();
         assert!(!b_mirror.quarantined);
@@ -375,7 +375,7 @@ async fn run(fault: Fault) {
                 (seen.retry, seen.stopped_producers, seen.settled_providers),
                 (retry, 2, 2)
             );
-            assert!(seen.audit && physical.owner.ledger().quarantined);
+            assert!(seen.audit && physical.owner.ledger().quarantined());
             assert_eq!(source(&physical, a), sources[0]);
             assert_eq!(physical.owner.ledger().shutdown_deadline, deadline);
             let mut opens = physical.owner.opens();

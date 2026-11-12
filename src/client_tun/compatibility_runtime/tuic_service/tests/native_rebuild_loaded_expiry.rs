@@ -128,7 +128,7 @@ async fn unretired_original_rebuild(engine: Engine) {
         }
         let flow = old.flow_observation().expect("original flow observation");
         assert_eq!((flow.live, flow.published, flow.joined, flow.released, flow.f), (1, 1, 5, 0, 1));
-        assert!(old.ledger().quarantined, "held flow quarantines the original session");
+        assert!(old.ledger().quarantined(), "held flow quarantines the original session");
         assert!(!old.business_complete.load(Ordering::Acquire));
         assert!(budget.quarantined() && budget.used() != 0, "sticky non-zero Q");
     })

@@ -164,7 +164,7 @@ async fn local_abort_case(peer_finishes: bool, hard: bool) {
                     assert!(physical.owned_bytes() <= physical.capacity_bytes);
                     assert!(matches!(physical.closure.terminal_cause(),
                         Some(cause) if cause.direction == "root" && cause.reason == "custody_disposal"));
-                    assert!(!owner.ledger().quarantined);
+                    assert!(!owner.ledger().quarantined());
                     break;
                 }
             }
@@ -214,7 +214,7 @@ async fn local_abort_case(peer_finishes: bool, hard: bool) {
             assert_eq!((flow.live, flow.published, flow.released, flow.f, flow.joined),
                        (1, 1, 0, 1, 5));
             assert!(flow.audit);
-            assert!(owner.ledger().quarantined);
+            assert!(owner.ledger().quarantined());
             if !hard { assert!(owner.ledger().first_failure.is_none()); }
             assert_eq!(*saved.deadline.lock().unwrap(), Some(original_deadline));
             let provider = owner.flow_native_provider_view().unwrap();
@@ -252,11 +252,11 @@ async fn local_abort_case(peer_finishes: bool, hard: bool) {
                 assert!(tokio::time::timeout(Duration::from_millis(10), service.run()).await.is_err());
                 let owner = saved.session.lock().unwrap().as_ref().unwrap().upgrade().unwrap();
                 let flow = owner.flow_observation().unwrap();
-                if flow.released == 1 || owner.ledger().quarantined {
+                if flow.released == 1 || owner.ledger().quarantined() {
                     flow.assert_permit_reset_balance(queue);
                     assert_eq!((flow.live, flow.published, flow.released, flow.f, flow.joined),
                         (0, 1, 1, 0, 5));
-                    assert!(flow.audit && !owner.ledger().quarantined);
+                    assert!(flow.audit && !owner.ledger().quarantined());
                     assert!(owner.ledger().first_failure.is_none());
                     assert!(queue.physical_zero());
                     assert!(owner.flow_native_provider_view().is_none());
@@ -319,7 +319,7 @@ async fn local_abort_case(peer_finishes: bool, hard: bool) {
             (0, 1, 1, 5)
         );
         assert!(flow.audit);
-        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined);
+        assert!(owner.ledger().first_failure.is_none() && !owner.ledger().quarantined());
         if !hard {
             assert!(original_queue.as_ref().unwrap().physical_zero());
         } else {

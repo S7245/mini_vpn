@@ -416,7 +416,7 @@ async fn ack_rounds(bad: bool) {
                 ),
                 (end, end, 0, end as u64, end * 3)
             );
-            assert!(seen.audit && !host.control.ledger().quarantined);
+            assert!(seen.audit && !host.control.ledger().quarantined());
             assert_eq!(
                 (links.0.dropped_packets(), links.1.dropped_packets()),
                 (0, 0)
@@ -602,7 +602,7 @@ async fn ack_rounds(bad: bool) {
             }
             assert_eq!(started, added);
             assert!(seen.audit);
-            assert_eq!(host.control.ledger().quarantined, bad);
+            assert_eq!(host.control.ledger().quarantined(), bad);
             assert_eq!(
                 apps.sockets.get::<Socket>(apps.handles[0]).recv_queue(),
                 4096

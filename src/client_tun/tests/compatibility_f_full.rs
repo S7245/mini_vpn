@@ -364,7 +364,7 @@ async fn full_f_case(case: FullCase) {
                 (0, 0, 0, 0)
             );
             assert_eq!((seen.joined, seen.released, seen.retry), (0, 0, 0));
-            assert!(seen.audit && !session.control.ledger().quarantined);
+            assert!(seen.audit && !session.control.ledger().quarantined());
             assert_eq!(
                 (links.0.dropped_packets(), links.1.dropped_packets()),
                 (0, 0)
@@ -445,7 +445,7 @@ async fn full_f_case(case: FullCase) {
             );
             assert_eq!((apps.queued(4224), apps.windows[4224]), (4096, Some(0)));
             assert_eq!(accepted.load(Ordering::Acquire), 4096);
-            assert!(seen.audit && !session.control.ledger().quarantined);
+            assert!(seen.audit && !session.control.ledger().quarantined());
         }
         let total_published = match case {
             FullCase::AckRetry | FullCase::SynBurst => {
@@ -481,7 +481,7 @@ async fn full_f_case(case: FullCase) {
                     assert_eq!(seen.escrow_bytes, 128);
                     assert_eq!(accepted.load(Ordering::Acquire), 4096);
                     assert_eq!((apps.queued(4224), apps.windows[4224]), (4096, Some(0)));
-                    assert!(seen.audit && !session.control.ledger().quarantined);
+                    assert!(seen.audit && !session.control.ledger().quarantined());
                 }
                 gate.release();
                 let mut retry_timing = FillTiming::default();
@@ -529,7 +529,7 @@ async fn full_f_case(case: FullCase) {
                     retried.is_ok(),
                     "ACK-only retry: {:?}, quarantine={}, scan(samples/wraps/min/max)={scan:?}, cursor={cursor}, budget={}, release={released_at:?}, restored={restored_at:?}, timing={retry_timing:?}, peer_closed={:?}, peer_stats={:?}, initial_id={initial_id}, current={:?}, transitional={:?}",
                     session.control.flow_observation(),
-                    session.control.ledger().quarantined,
+                    session.control.ledger().quarantined(),
                     session.control.control_remaining.load(Ordering::Relaxed),
                     peer.close_reason(),
                     peer.stats(),
@@ -553,7 +553,7 @@ async fn full_f_case(case: FullCase) {
                 assert_eq!((seen.published, seen.released, seen.retry), (4097, 1, 0));
                 assert_eq!(seen.escrow_bytes, 127 + 4096);
                 assert_eq!(seen.reserved, 128 * crate::client_tun::MAX_UPLINK_BUFFER);
-                assert!(seen.audit && !session.control.ledger().quarantined);
+                assert!(seen.audit && !session.control.ledger().quarantined());
                 eprintln!("F_RETRY_PASSED elapsed={:?} release={released_at:?} restored={restored_at:?} timing={retry_timing:?} current={:?}",
                     retry_start.elapsed(), upstream_ready_connection(&upstream)
                         .map(|connection| (connection.stable_id(), connection.bi_stream_open_snapshot())));
@@ -585,7 +585,7 @@ async fn full_f_case(case: FullCase) {
                     assert_eq!((seen.escrow_bytes, seen.reserved), (128, 128 * crate::client_tun::MAX_UPLINK_BUFFER));
                     assert_eq!((seen.factory_started, seen.published, seen.released, seen.joined), (4096, 4096, 0, 0));
                     assert_eq!((seen.attempts, seen.running, seen.retry), (4096, 12288, 0));
-                    assert!(seen.audit && !session.control.ledger().quarantined);
+                    assert!(seen.audit && !session.control.ledger().quarantined());
                     assert!(session.control.ledger().first_failure.is_none());
                     assert_eq!(accepted.load(Ordering::Acquire), 4096);
                     assert_eq!(apps.sockets.get::<Socket>(apps.handles[0]).state(), smoltcp::socket::tcp::State::Established);
@@ -621,7 +621,7 @@ async fn full_f_case(case: FullCase) {
                 assert_eq!((seen.factory_started, seen.published, seen.released, seen.joined), (4096, 4096, 128, 0));
                 assert_eq!((seen.attempts, seen.running, seen.retry), (4096, 12288, 0));
                 assert_eq!((seen.escrow_bytes, seen.reserved), (4096, crate::client_tun::MAX_UPLINK_BUFFER));
-                assert!(seen.audit && !session.control.ledger().quarantined);
+                assert!(seen.audit && !session.control.ledger().quarantined());
                 assert_eq!(accepted.load(Ordering::Acquire), 4096);
                 let connection = upstream_ready_connection(&upstream).unwrap();
                 assert_eq!(connection.stable_id(), initial_id);
@@ -697,7 +697,7 @@ async fn full_f_case(case: FullCase) {
             (total_published as u64, 4225, total_published as u64 * 3)
         );
         assert_eq!(done.factory_started, total_published as u64);
-        assert!(done.audit && !session.control.ledger().quarantined);
+        assert!(done.audit && !session.control.ledger().quarantined());
         for _ in 0..2 {
             assert_eq!(
                 session.observe_shutdown().await,

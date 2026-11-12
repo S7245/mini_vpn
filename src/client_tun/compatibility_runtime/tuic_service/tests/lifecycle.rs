@@ -54,7 +54,7 @@ async fn rejected_config_owns_device_and_freezes_first_stop_deadline() {
         ledger.first_failure.as_ref().unwrap().facts().class,
         crate::shared::errors::FailureClass::InvalidTarget
     );
-    assert!(!ledger.quarantined);
+    assert!(!ledger.quarantined());
     let mut b = [0; 2048];
     assert_eq!(
         socket.recv_from(&mut b).unwrap_err().kind(),
@@ -320,7 +320,7 @@ async fn actual_one_shot_device_write_error_retains_os_facts_before_node_cleanup
         let failure = ledger.first_failure.as_ref().unwrap().facts();
         assert_eq!(failure.raw_os_code, Some(5));
         assert_eq!(failure.origin.phase, FailurePhase::DeviceWrite);
-        assert!(!ledger.quarantined);
+        assert!(!ledger.quarantined());
         assert_eq!(gate.joins.load(Ordering::SeqCst), 1);
         assert_eq!(gate.drops.load(Ordering::SeqCst), 1);
     })
