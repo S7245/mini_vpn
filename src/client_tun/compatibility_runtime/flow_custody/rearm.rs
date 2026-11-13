@@ -50,6 +50,20 @@ impl<'a> RearmGate<'a> {
         legacy
     }
 
+    /// R1 (D216): shared-state uncertainty found at a loop seam ⇒ Session
+    /// scope. No owner (legacy no-F) has no ledger and no Flow row to raise.
+    pub(in crate::client_tun) fn quarantine_session(self) {
+        match self {
+            #[cfg(test)]
+            Self::LegacyFacade => {}
+            Self::OriginalLoop(dispatch) => {
+                if let Some(owner) = dispatch.owner.as_ref() {
+                    owner.quarantine_quiet();
+                }
+            }
+        }
+    }
+
     fn settle_no_f(self) {
         match self {
             #[cfg(test)]

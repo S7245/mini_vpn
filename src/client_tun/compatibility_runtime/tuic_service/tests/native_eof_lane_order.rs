@@ -368,3 +368,108 @@ async fn lane_order_case(reset: bool) {
     scenario.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     cleanup.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
+
+/// R4: the D72/D232 guard holds a hard Native Flow's producers while its last
+/// DATA is withheld in the lane; a Session stop must bypass that hold at once
+/// (the guard's `!stopping` term), not wait for the CLOSE_TAIL idle expiry.
+#[tokio::test(flavor = "current_thread")]
+async fn hard_native_stop_during_held_lane_data_bypasses_the_guard() {
+    let mut rig = rig(|_| {});
+    let saved = rig.service.control.clone();
+    let mut peers = Vec::new();
+    let mut stream = None;
+    let mut bridge = None;
+    let mut finished = None;
+    let scenario = capture(async {
+        let Rig { server, cfg, service, handle, apps, .. } = &mut rig;
+        let tcp_target = TargetAddr::IpPort(std::net::SocketAddr::from((apps.target, 10000)));
+        window(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = async {
+                    let peer = server.accept().await.unwrap().await.unwrap();
+                    auth(&peer, cfg).await;
+                    peers.push(peer.clone());
+                    let remote_open = async {
+                        let (tx, mut rx) = peer.accept_bi().await.unwrap();
+                        let mut want = encode_connect(&tcp_target);
+                        want.extend_from_slice(b"service-tcp");
+                        let mut actual = vec![0; want.len()];
+                        rx.read_exact(&mut actual).await.unwrap();
+                        assert_eq!(actual, want);
+                        stream = Some((tx, rx));
+                    };
+                    let app_open = async {
+                        loop {
+                            apps.turn().await;
+                            let owner = saved.session.lock().unwrap().as_ref().unwrap().upgrade().unwrap();
+                            if owner.flow_observation().is_some_and(|flow| flow.published == 1) {
+                                bridge = owner.relay_event_test_bridge();
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                    };
+                    tokio::join!(remote_open, app_open);
+                } => {},
+                report = service.run() => panic!("Service ended before publication: {report:?}"),
+            }
+        }).await.expect("publication within 5s");
+        let lane = bridge.clone().expect("harness relay-event bridge");
+        lane.hold_relay_receive(true);
+        window(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = async {
+                    let tx = &mut stream.as_mut().unwrap().0;
+                    tx.write_all(b"tcp-reply").await.unwrap();
+                    tx.finish().unwrap();
+                } => {},
+                report = service.run() => panic!("Service ended before peer DATA/EOF: {report:?}"),
+            }
+        }).await.expect("peer DATA/EOF within 5s");
+        let owner = saved.session.lock().unwrap().as_ref().unwrap().upgrade().unwrap();
+        window(Duration::from_secs(5), async {
+            loop {
+                apps.turn().await;
+                assert!(tokio::time::timeout(Duration::from_millis(5), service.run()).await.is_err());
+                if owner.flow_close_for_test().is_some_and(|(_, reason, _)|
+                    reason == Some(("remote_to_local", "remote_eof"))) {
+                    break;
+                }
+            }
+        }).await.expect("reader EOF closes the Flow while its DATA is withheld");
+        for _ in 0..10 {
+            apps.turn().await;
+            assert!(tokio::time::timeout(Duration::from_millis(5), service.run()).await.is_err());
+        }
+        let held = owner.flow_observation().unwrap();
+        assert!(apps.tcp_reply.is_empty() && lane.queued_len() >= 1, "precondition: DATA withheld");
+        assert_eq!((held.stopped_producers, held.released), (0, 0), "precondition: the guard holds the producers {held:?}");
+        handle.request_stop();
+        window(Duration::from_secs(2), async {
+            loop {
+                apps.turn().await;
+                if let Ok(report) = tokio::time::timeout(Duration::from_millis(5), service.run()).await {
+                    finished = Some(report);
+                    break;
+                }
+                if owner.flow_observation().is_some_and(|flow| flow.stopped_producers == 1 || flow.released == 1) {
+                    break;
+                }
+            }
+        }).await.expect("R4: stop bypasses the D72/D232 guard well before the CLOSE_TAIL expiry");
+    }).await;
+    if let Some(lane) = &bridge {
+        lane.hold_relay_receive(false);
+    }
+    let cleanup = capture(async {
+        rig.handle.request_stop();
+        if finished.is_none() {
+            finished = Some(window(Duration::from_secs(20), rig.service.run()).await.unwrap());
+        }
+        assert!(finished.as_ref().unwrap().device_settled(), "{finished:?}");
+    }).await;
+    drop(stream.take());
+    close(rig.server, peers).await;
+    scenario.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    cleanup.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}

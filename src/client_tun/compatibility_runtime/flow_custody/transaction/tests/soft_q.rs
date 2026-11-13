@@ -198,3 +198,46 @@ async fn d216_preparing_row_past_stop_deadline_is_session_scope() {
     assert!(owner.ledger().session_quarantined() && owner.stop.stopping.load(Ordering::Acquire),
         "preparing past deadline ⇒ Session scope");
 }
+
+/// R2: one actual non-hard Q row registered by the real `poll_flows` pass with
+/// `preset` siblings already counted; returns the Session-scope outcome.
+async fn flow_q_limit_case(preset: usize) -> bool {
+    let (_client, mut server) = receiving_pair().await;
+    let owner = Arc::new(SessionControl::default());
+    *owner.opens() = OpenCustody::with_flows();
+    let (dispatch, _receiver) = OpenDispatch::channel(4, Some(owner.clone()));
+    let (handle, mut ctx, mut pool) = (server.handle, SocketCtx::new(10000), FakeIpPool::new());
+    dispatch.begin_turn().await;
+    dispatch.admit_flow(Arc::new(NeverOpen::default()), FlowAdmission {
+        handle, socket: server.sockets.get_mut::<TcpSocket>(handle), ctx: &mut ctx,
+        fake_pool: &mut pool, fake_ip: None,
+        target: TargetAddr::IpPort("10.0.0.2:10000".parse().unwrap()), now: 0,
+    });
+    {
+        let mut opens = owner.opens();
+        let index = opens.slots.iter().position(Option::is_some).expect("actual admitted flow");
+        let OpenPhase::Flow(flow) = &mut opens.slots.get_mut(index).unwrap().phase else { panic!("actual Flow") };
+        flow.stage = FlowStage::Quarantined;
+        opens.preset_flow_q_rows_for_test(preset);
+    }
+    assert!(!owner.ledger().quarantined(), "precondition: nothing raised yet");
+    dispatch.begin_turn().await;
+    let _ = std::future::poll_fn(|cx| std::task::Poll::Ready(dispatch.poll_flows(cx))).await;
+    assert_eq!(owner.opens().flow_q_rows(), preset + 1, "the actual row is registered once");
+    let ledger = owner.ledger();
+    assert!(ledger.quarantined());
+    let session = ledger.session_quarantined();
+    assert_eq!(session, ledger.shutdown_deadline.is_some());
+    drop(ledger);
+    assert_eq!(session, owner.stop.stopping.load(Ordering::Acquire));
+    session
+}
+
+/// R2 (D211 bound): row `FLOW_Q_LIMIT` (64) stays Flow scope; row 65 escalates
+/// the Session exactly once the root counter exceeds the bound.
+#[tokio::test]
+async fn r2_flow_q_limit_escalates_to_session_exactly_past_the_bound() {
+    use super::super::scoped_q::FLOW_Q_LIMIT;
+    assert!(!flow_q_limit_case(FLOW_Q_LIMIT - 1).await, "row 64 stays Flow scope");
+    assert!(flow_q_limit_case(FLOW_Q_LIMIT).await, "row 65 > FLOW_Q_LIMIT ⇒ Session scope");
+}

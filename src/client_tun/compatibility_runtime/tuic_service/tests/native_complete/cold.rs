@@ -202,3 +202,79 @@ async fn cold_case(mode: u8) {
     scenario.unwrap_or_else(|p| std::panic::resume_unwind(p));
     cleanup.unwrap_or_else(|p| std::panic::resume_unwind(p));
 }
+
+/// R3 (D216): an app-meter Q seen by the original channel reserve at launch is
+/// shared BackingMeter uncertainty ⇒ Session scope at the refusal itself, not
+/// an implicit Flow write left for a later D222 or stop-census escalation.
+#[tokio::test(flavor = "current_thread")]
+async fn r3_hard_native_launch_meter_q_refusal_is_session_scope() {
+    let identity = PublicCa::new();
+    let server =
+        quinn::Endpoint::server(identity.server_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
+    let policy = Arc::new(RelayFamilyPolicy::from_sources(RelayFamilyPolicySources {
+        tuic_native_chunk: Some("1"),
+        ..Default::default()
+    }));
+    let mut cfg = config(server.local_addr().unwrap()).with_relay_policy(policy.clone());
+    cfg.ca_path = identity.path.join("ca.pem").to_str().unwrap().to_owned();
+    let mut runtime = TunRuntimeConfig::from_sources(Some("1"))
+        .unwrap()
+        .with_relay_policy(policy)
+        .with_native_limits(crate::client_tun::compatibility_runtime::tuic_service::tests::fixture::native_hard(32 << 20), 64)
+        .unwrap();
+    runtime.tun_mtu = 1500;
+    let inbound = PacketLink::bounded(64);
+    let outbound = PacketLink::bounded(64);
+    let mut app = Apps::new(outbound.clone(), inbound.clone());
+    app.sent_udp = true;
+    let mut service = prepare_factory(
+        move |meter: Option<bytes::BackingMeter>| async move {
+            Ok::<_, ClientError>(LoopbackTunDevice::native_with_factory(64, 1500, &meter.unwrap(), || Ok((inbound, outbound)))?)
+        },
+        Configuration { tuic: cfg.clone(), composition: () },
+        runtime,
+        Arc::new(Metrics::default()),
+        NoopSink,
+    );
+    let handle = service.take_handle().unwrap();
+    let saved = service.control.clone();
+    let budget = saved.backing_budget.clone().unwrap();
+    let (mut peer, mut observed, mut owner) = (None, None, None);
+    let scenario = capture(async {
+        crate::client_tun::compatibility_runtime::tuic_service::tests::fixture::window(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = async {
+                    let remote = server.accept().await.unwrap().await.unwrap();
+                    auth(&remote, &cfg).await;
+                    peer = Some(remote.clone());
+                    let control = saved.session.lock().unwrap().as_ref().unwrap().upgrade().unwrap();
+                    let probe = control.cold_stop_probe(32, budget.clone());
+                    owner = Some(control.clone());
+                    observed = Some(probe.clone());
+                    while probe.launch_scope().is_none() {
+                        app.turn().await;
+                        tokio::task::yield_now().await;
+                    }
+                } => {},
+                report = service.run() => panic!("Service ended before the launch refusal: {report:?}"),
+            }
+        }).await.unwrap();
+        let probe = observed.as_ref().unwrap();
+        assert_eq!(probe.fired(), 1, "one original launch reserve observed");
+        assert_eq!(probe.launch_scope(), Some(true), "R3: launch meter-Q refusal ⇒ Session scope (D216)");
+        let control = owner.as_ref().unwrap();
+        assert!(control.ledger().session_quarantined());
+        assert!(control.stop.stopping.load(std::sync::atomic::Ordering::Acquire));
+        assert!(budget.quarantined());
+    }).await;
+    handle.request_stop();
+    let deadline = saved.deadline.lock().unwrap().unwrap();
+    let cleanup = capture(async {
+        fixture::observe_failed_native_stop(service.run(), &handle, deadline, None).await;
+    }).await;
+    drop((service, handle, owner, observed, peer));
+    server.close(0u32.into(), b"launch meter q complete");
+    tokio::time::timeout(Duration::from_secs(3), server.wait_idle()).await.unwrap();
+    scenario.unwrap_or_else(|p| std::panic::resume_unwind(p));
+    cleanup.unwrap_or_else(|p| std::panic::resume_unwind(p));
+}

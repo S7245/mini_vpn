@@ -89,7 +89,11 @@ pub(in crate::client_tun) async fn handle_remote_payload_with_gate<D: TunIo>(
                 payload.len()
             );
             // D191: late DATA after the terminal is settled as discarded.
-            let _ = compatibility_runtime::FlowMirror::discard_late_data(ctx, payload.len(), downstream_permit);
+            // R1 (D216): a permit release mismatch leaves shared egress permit
+            // custody uncertain ⇒ Session scope, never the later Flow funnel.
+            if !compatibility_runtime::FlowMirror::discard_late_data(ctx, payload.len(), downstream_permit) {
+                gate.quarantine_session();
+            }
             return Ok(0);
         }
         RemotePayloadDisposition::TerminalNoSend => {

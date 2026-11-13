@@ -1,5 +1,7 @@
 # N1-NATIVE 当前实现入口
 
+> **2026-11-13 D245（最新，先读）**：N4-B1 复审 R1–R8 已闭，代码改动未提交（rearm.rs、launch.rs、remote_payload.rs、scoped_q.rs 测试 seam + 4 tracer）。下一步：父会话核验证据并请用户决定是否接受 N4、是否提交；不要自行标记 N4 ACCEPTED。遗留：`ur_shutdown::gap` ×4 既有红需单独分诊；F8/F9 低优先级。外部/TUN/VPS/WAN/M2 仍未授权。
+
 root唯一Rust Writer；全部runner终态；保dirty/raw，未commit/push。checkout `/Users/liushan/Documents/Personal/Languages/Rust/mini_vpn-recovered-20260918-jIMbzz`，branch codex/knife14d-downlink-reap-open，HEAD bd18abb62a7e82abccc2297f642bf3920cfdd006。用户已授权诊断后自主修复；不重复确认，不调额度/并发/idle/5/15/PTO。
 
 读AGENTS、Rules、[STATUS](docs/current/STATUS.md)、[DECISIONS](docs/current/DECISIONS.md)（R0：自主决策记此处后直接开发）、**[A 出口修订](docs/current/n1-a-exit-amendment-20261104.md)（2026-11-04 用户批准核心，现行 A 合同）**、[唯一计划](docs/current/n1-f1-implementation.md)顶部及[结果顶部](docs/current/n1-resume-20261017-evidence/b560-result.md)。A = A1 自有库存闭合清单 + A2 配置上界/preflight + A3 计数分配器仅测试 + A4 历史 Unknown 不阻塞；旧"完整整链/Direct652/653 归因"出口失效。A全闭才B再C；18/23/37、两guard CLOSED不变。

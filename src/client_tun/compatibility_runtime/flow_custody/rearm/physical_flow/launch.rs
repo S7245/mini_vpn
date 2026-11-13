@@ -46,6 +46,8 @@ impl OpenDispatch {
             cold::Restore::End => return false,
         };
         let cold::Prepared { channels: native_channels } = prepared;
+        #[cfg(test)]
+        let meter_q = tests::cold::meter_q_before_reserve(&opens);
         let Some(flow) = opens.flow_mut(id) else { return false; };
         let Some(mirror) = &mut ctx.flow_mirror else { return false; };
         if mirror.id != id || !mirror.matches_epoch(ctx.conn_epoch) || mirror.published_bytes.is_some() {
@@ -182,6 +184,10 @@ impl OpenDispatch {
         }
         // The fresh channel has a single original producer and closed worker
         // gates. Keep escrow until the synchronous physical ACK is committed.
+        #[cfg(test)]
+        if meter_q.is_some() {
+            if let Some(meter) = owner.app_meter.as_ref() { meter.quarantine(); }
+        }
         match tx.try_reserve() {
             Ok(permit) => permit.send(flow.escrow.clone().into_command()),
             Err(crate::shared::bounded_channel::ReserveError::Capacity) => {
@@ -191,7 +197,13 @@ impl OpenDispatch {
                 flow.close(("native_uplink", "channel_closed")); return false;
             }
             Err(crate::shared::bounded_channel::ReserveError::Quarantined) => {
-                flow.stage = FlowStage::Quarantined; return false;
+                // R3 (D216): the reserve meter is the shared session app meter
+                // (hard BackingMeter) ⇒ Session scope, never implicit Flow.
+                flow.stage = FlowStage::Quarantined;
+                owner.quarantine_quiet();
+                #[cfg(test)]
+                if let Some(probe) = &meter_q { probe.note_launch_scope(owner.ledger().session_quarantined()); }
+                return false;
             }
         }
         if native && !roles.commit_native() {

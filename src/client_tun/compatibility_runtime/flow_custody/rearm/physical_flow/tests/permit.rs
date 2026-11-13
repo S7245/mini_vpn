@@ -195,3 +195,49 @@ async fn same_original_queue_epoch_len_mode_and_foreign_validation_never_refund(
     assert_eq!(permit.as_mut().unwrap().release(4), 4);
     assert!(queue.physical_zero());
 }
+
+/// R1 (D216): a D191 late-DATA permit release mismatch leaves the egress
+/// permit (process-shared D16/egress custody) uncertain ⇒ Session scope at
+/// the original-loop seam, not a later Flow raise through the mirror funnel.
+#[tokio::test]
+async fn r1_late_data_permit_mismatch_is_session_scope() {
+    use crate::client_tun::compatibility_runtime::flow_custody::transaction::OpenCustody;
+    use std::sync::atomic::Ordering;
+    let mut f = Fixture::new().await;
+    let (bytes, mut permit) = f.data(b"abcd").await;
+    let mirror = f.ctx.flow_mirror.as_mut().unwrap();
+    assert!(mirror.validate_data_permit(7, bytes.len(), &permit));
+    assert!(mirror.begin_event(7, Some(bytes.len())));
+    assert_eq!(permit.as_mut().unwrap().release(1), 1, "test-owned partial release forces the mismatch");
+    assert!(f.ctx.uplink_tx.is_none() && !f.ctx.local_fin_sent, "precondition: StaleRelayReset");
+    let owner = Arc::new(SessionControl::default());
+    *owner.opens() = OpenCustody::with_flows();
+    let (dispatch, _notices) = OpenDispatch::channel(4, Some(owner.clone()));
+    let handle = f.server.handle;
+    let mut contexts = HashMap::from([(handle, std::mem::replace(&mut f.ctx, SocketCtx::new(10000)))]);
+    let mut pool = FakeIpPool::new();
+    let mut pacer = DownlinkEgressPacer::new(DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES);
+    let mut debt = DownlinkEgressDropDebt::default();
+    let accepted = crate::client_tun::handle_remote_payload_with_gate(
+        RearmGate::original_loop(&dispatch), handle, 7, &bytes,
+        crate::client_tun::RemotePayloadRequest {
+            sockets: &mut f.server.sockets, socket_ctxs: &mut contexts,
+            iface: &mut f.server.iface, device: &mut f.server.device, fake_pool: &mut pool,
+            now_secs: 0, downlink_flush_max_bytes: DEFAULT_DOWNLINK_FLUSH_MAX_BYTES,
+            downlink_egress_pacer: &mut pacer, downlink_egress_drop_debt: &mut debt,
+            downlink_backpressure: DownlinkBackpressureConfig::default(), tun_mtu: 1500,
+            buffered_downlink_enabled: false, downstream_permit: &mut permit,
+            d3_egress_actor: false, d3_egress_actor_adaptive_credit: false,
+            d3_egress_actor_legacy_credit: false, d5_capacity_backpressure: false,
+        },
+    ).await.unwrap();
+    assert_eq!(accepted, 0);
+    assert!(contexts[&handle].flow_mirror.as_ref().unwrap().quarantined, "mismatch keeps the mirror marker");
+    let ledger = owner.ledger();
+    assert!(ledger.session_quarantined(), "R1: late-DATA permit mismatch ⇒ Session scope (D216)");
+    assert!(ledger.shutdown_deadline.is_some());
+    drop(ledger);
+    assert!(owner.stop.stopping.load(Ordering::Acquire));
+    f.ctx = contexts.remove(&handle).unwrap();
+    f.settle().await;
+}

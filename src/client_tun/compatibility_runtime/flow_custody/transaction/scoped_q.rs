@@ -91,6 +91,13 @@ impl OpenCustody {
         accounting.quarantined_rows.0 <= FLOW_Q_LIMIT && !flow.holds_hard_budget(owner)
     }
 
+    /// R2 test seam: the counter stands for `n` sibling rows already
+    /// registered, so the real bound check is reached with one actual row.
+    #[cfg(test)]
+    pub(in crate::client_tun::compatibility_runtime::flow_custody::transaction) fn preset_flow_q_rows_for_test(&mut self, n: usize) {
+        if let Some(accounting) = &mut self.flow { accounting.quarantined_rows.0 = n; }
+    }
+
     /// Registered Flow-Q rows (root counter).
     pub(in crate::client_tun::compatibility_runtime::flow_custody) fn flow_q_rows(&self) -> usize {
         self.flow.as_ref().map_or(0, |accounting| accounting.quarantined_rows.0)

@@ -35,6 +35,7 @@ pub(in crate::client_tun::compatibility_runtime) struct Probe {
     fired: AtomicUsize,
     dropped: AtomicUsize,
     deadline: std::sync::Mutex<Option<tokio::time::Instant>>,
+    launch_scope: std::sync::Mutex<Option<bool>>,
 }
 impl Probe {
     pub(in crate::client_tun::compatibility_runtime) fn cold_bill(&self) -> usize { self.cold_bill.load(Ordering::Acquire) }
@@ -122,7 +123,7 @@ impl NativeTcpReader for Reader {
                 assert_eq!(tokio::runtime::Handle::current().runtime_flavor(), tokio::runtime::RuntimeFlavor::CurrentThread);
                 *self.probe.cold_before.lock().unwrap() = Some(self.probe.budget.as_ref().unwrap().used());
             }
-            3 | 10..=14 | 16 | 31 => {} // the same cold turn stops only after actual Roles construction
+            3 | 10..=14 | 16 | 31 | 32 => {} // the same cold turn stops only after actual Roles construction
             _ => fire_stop(&owner, self.id, &self.probe),
         }
         result
@@ -601,4 +602,23 @@ pub(super) fn receipt_source_fault(opens: &mut OpenCustody, id: FlowIdentity, co
     assert!(!FlowMirror::validate_ordered_custody(ctx, Some(roles), flow.published));
     *probe.deadline.lock().unwrap() = flow.stop_deadline.map(tokio::time::Instant::from_std);
     probe.fired.store(1, Ordering::Release);
+}
+
+// R3 (D216): stands in for a concurrent app-meter Q (credit lock poison or a
+// relay-lane double prepare) after the cold restore passed and before the
+// original channel reserve. It supplies only the Q, never a result.
+pub(in crate::client_tun::compatibility_runtime::flow_custody::rearm::physical_flow) fn meter_q_before_reserve(
+    opens: &OpenCustody,
+) -> Option<Arc<Probe>> {
+    let probe = opens.flow.as_ref()?.cold_probe.clone().filter(|p| p.mode == 32)?;
+    (probe.fired.fetch_add(1, Ordering::AcqRel) == 0).then_some(probe)
+}
+impl Probe {
+    pub(in crate::client_tun::compatibility_runtime::flow_custody::rearm::physical_flow) fn note_launch_scope(&self, session: bool) {
+        *self.launch_scope.lock().unwrap() = Some(session);
+    }
+    /// Session-scope Q observed synchronously at the launch refusal.
+    pub(in crate::client_tun::compatibility_runtime) fn launch_scope(&self) -> Option<bool> {
+        *self.launch_scope.lock().unwrap()
+    }
 }
