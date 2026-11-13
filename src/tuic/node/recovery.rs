@@ -85,7 +85,35 @@ pub(super) struct State {
         Option<tcp_pool_admission::LeaseReleaseReport>,
     )>,
 }
+/// N5-OBS (D241): value-only recovery census for the observer and the
+/// transition line; never mutates the ledger.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Census {
+    pub(super) pending: usize,
+    pub(super) waiting: usize,
+    pub(super) active: Option<(usize, u64, u64)>,
+    pub(super) waits: u64,
+    pub(super) reprobes: u64,
+    pub(super) waiting_failures: u64,
+}
 impl State {
+    pub(super) fn census(&self) -> Census {
+        Census {
+            pending: self
+                .demands
+                .iter()
+                .flatten()
+                .filter(|demand| demand.outcome == Outcome::Pending)
+                .count(),
+            waiting: self.retries.iter().flatten().filter(|retry| retry.parked()).count(),
+            active: self
+                .active_ticket
+                .map(|t| (t.index, t.identity.generation, t.sequence)),
+            waits: self.waits,
+            reprobes: self.reprobes,
+            waiting_failures: self.waiting_failures,
+        }
+    }
     #[cfg(test)]
     pub(super) fn retries_held(&self) -> (usize, usize) {
         let held = self.retries.iter().flatten();
@@ -682,6 +710,7 @@ async fn run_inner(
     guard: Option<&crate::owned_upstream::generation::callbacks::Guard>,
 ) -> Result<(), ClientError> {
     let changed = owner.state().recovery.changed.clone();
+    let mut transitions = super::observe::Transitions::default();
     loop {
         let notified = changed.notified();
         tokio::pin!(notified);
@@ -689,7 +718,7 @@ async fn run_inner(
         owner.expire_demands();
         owner.reap_stats().await?;
         waiting::release_settled(owner, data).await?;
-        let (old, primary_old, next, due) = {
+        let (old, primary_old, next, due, census) = {
             let mut state = owner.state();
             if state.stopping || state.quarantined {
                 return Err(recorded_failure());
@@ -712,8 +741,13 @@ async fn run_inner(
                 state.recovery.primary_predecessor.is_some(),
                 next,
                 waiting::next_due(&state.recovery),
+                state.recovery.census(),
             )
         };
+        // N5-OBS (D241): one line per observable transition, outside the lock.
+        if let Some(line) = transitions.observe(census) {
+            eprintln!("{line}");
+        }
         let wake = async {
             match due {
                 Some(due) => tokio::time::sleep_until(due).await,

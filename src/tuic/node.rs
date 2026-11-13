@@ -1312,8 +1312,11 @@ impl StartupResources {
         }
     }
 }
+mod observe;
+pub(crate) use observe::{NativeNodeWeakObserver, NodeFacts};
+pub(in crate::tuic) use observe::{OpenClass, OpenClasses};
 #[cfg(test)]
-pub(crate) use tests::{NativeNodeWeakObserver, WaitingSample};
+pub(crate) use tests::WaitingSample;
 #[cfg(test)]
 mod tests;
 

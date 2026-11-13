@@ -603,3 +603,15 @@ Knife: compatibility recovery N2（仅本机 loopback）。P1–P3 已全部本�
 - 证据：新 tracer `native_eof_lane_order::nonhard_native_remote_eof_before_lane_data_delivers_reply_without_q` RED 3/3→GREEN 5/5；其余三条合同行各 5/5；permit_on_reset 单跑 25/25；变异回红 3/3。raw `fflow-fix-20261112/d227-fix/`。
 - D233 单快照门全绿：fflow 57/57、nonhard 9/9、n4 14/14、d153 8/8、governance 27/27、joint 850/850 ×2、production/diff 通过；raw `fflow-fix-20261112/d227-gate/`。
 - 未提交文件：physical_flow.rs、native_eof_lane_order.rs、isolation.rs（D229）、docs。AGENTS.md / ca-cert.srl 的改动非本任务。下一步：父会话核验 → 用户确认提交。
+
+## 新会话交接（N4 验收记录 + N5 准备，2026-11-12，D234–D240，STOP）
+
+- 位置：HEAD `e99e117`，未提交改动只有文档（STATUS 顶部块、DECISIONS D234–D240、指导 §5 N4/N5 行、新 `docs/current/n5-checklist-20261112.md`、本块）。`AGENTS.md`、`certs/dev/ca-cert.srl` 的既有改动不是本任务的。
+- N4：**未接受**。B1 = soft-Q 修复（`c8008bb`，D216–D224）与 D232 守卫（`e99e117`）需独立只读复审（原审查 `soft-q-review-20261111.md` 为 FAIL F1/F2）；B2 已闭（D240：最终树 10 组全绿，raw `/Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n5-prep-20261112/gate/`）。B1 闭合后，在 STATUS 写 "N4 ACCEPTED（本地/loopback）" 并记 DECISIONS。
+- N5：readiness 未满足（D238）。下一可执行门：(1) N4-B1 复审；(2) P1 可观测性（D237，TDD，控制路径观察者行）；(3) 用户回答检查单 §10 Q1–Q5（本开发机只跑本地测试，不担任 N5 端点，D240a）；(4) 吞吐只记录还是先过性能门（D236）。
+- 不授权：commit/push、外部/TUN/VPS/WAN/sudo/M2、SSH、邮件、新 key。
+
+## N5-OBS P1 hand-over (2026-11-13, D241/D243/D244, STOP for parent verification)
+- Code + tests uncommitted (staged.rs, recovery.rs, node/observe.rs, tuic_service.rs/observe.rs/rebuild.rs, flow_custody census accessor + re-exports, tuic.rs net-zero, node_runtime.rs, waiting.rs; tracers node/tests/observe.rs, tuic_service/tests/n5_observe.rs, flow_custody/transaction/tests/census.rs). `AGENTS.md`, `certs/dev/ca-cert.srl` changes are not this task's.
+- Evidence: /Users/liushan/.codex/visualizations/2026/10/26/01a17639-85fe-71e1-8ea8-8af5b0671fb4/n5-obs-20261112/ (mut/, smoke/, gate/, gate/flake/). Gate snapshot differs from the final tree only by the D242→D243 comment renumber (recheck gate/d244-recheck.log).
+- Next: parent verifies the evidence and asks the user about commit; P1 residuals (utun factory needs TUN; cumulative A1 counter would change `FlowTransaction::drive`) carry into N5 preflight/proposal. Not authorized: commit/push, external/TUN/VPS/WAN/sudo/M2, email, keys.

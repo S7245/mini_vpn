@@ -150,6 +150,8 @@ where
         } else {
             None
         };
+        // N5-OBS (D241): replace the CLI observer's weak windows each generation.
+        observe::Watch::replace(&saved.observed, node.as_ref().map(NodeHost::native_observer), &owner);
         #[cfg(test)]
         if rebuilds == 0 {
             *saved

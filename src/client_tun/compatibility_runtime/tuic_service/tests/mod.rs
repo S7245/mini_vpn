@@ -19,6 +19,7 @@ mod dual_path;
 mod faults;
 mod fixture;
 mod observe_window;
+mod n5_observe;
 mod lifecycle;
 mod native_chunk_loaded_reset;
 mod native_chunk_loaded_stop;

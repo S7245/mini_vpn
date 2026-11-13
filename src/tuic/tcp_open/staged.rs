@@ -36,6 +36,7 @@ pub(super) fn create(
         recovery_bound: tokio::time::Instant::now().into_std() + TUIC_OPEN_TIMEOUT,
         interrupted: false,
         quarantined: false,
+        transferred: false,
     })
 }
 
@@ -60,6 +61,28 @@ pub(super) struct Attempt {
     recovery_bound: Instant,
     interrupted: bool,
     quarantined: bool,
+    /// N5-OBS (D241/D243): the carrier reached `Transferred` (Success counted once).
+    transferred: bool,
+}
+
+impl Attempt {
+    /// N5-OBS (D243): count Success at the first transfer, not at flow end.
+    fn note_transferred(&mut self) {
+        if !std::mem::replace(&mut self.transferred, true) {
+            self.runtime.opens.settle(node::OpenClass::Success);
+        }
+    }
+}
+
+impl Drop for Attempt {
+    fn drop(&mut self) {
+        // Observer only: one relaxed add per open on the Node's own counters;
+        // a transferred open was already counted by `note_transferred`.
+        if !self.transferred {
+            let class = node::OpenClass::of(false, self.failure.as_ref());
+            self.runtime.opens.settle(class);
+        }
+    }
 }
 
 enum State {
@@ -937,6 +960,7 @@ impl Attempt {
                 stream.selection.write_pressure.writer(stream_id),
                 metadata.progress,
             ));
+            self.note_transferred();
             self.state = State::Transferred(Custody {
                 lease: Some(stream.selection.lease),
                 witness: Some(stream.witness),
@@ -980,6 +1004,7 @@ impl Attempt {
         let Some(metadata) = stream.metadata else {
             return None;
         };
+        self.note_transferred();
         self.state = State::Transferred(Custody {
             lease: Some(stream.selection.lease),
             witness: Some(stream.witness),

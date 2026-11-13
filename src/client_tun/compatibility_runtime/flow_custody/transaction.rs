@@ -16,12 +16,14 @@ use super::super::super::{
 #[cfg(all(test, feature = "harness"))]
 use super::super::tests as runtime_tests;
 use super::super::{SessionControl, SessionStop};
+mod census;
 mod release;
 mod scoped_q;
 mod slot_table;
 mod stop_deadline;
 pub(in crate::client_tun::compatibility_runtime) use slot_table::SlotTable;
 pub(in crate::client_tun::compatibility_runtime) use scoped_q::FlowQRow;
+pub(in crate::client_tun::compatibility_runtime) use census::FlowCensus;
 pub(in crate::client_tun::compatibility_runtime) mod custody;
 use crate::owned_upstream::OwnedUpstream;
 use crate::shared::errors::{FailureOrigin, FailurePhase, FailureResource, RetainedFailure};

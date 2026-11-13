@@ -39,7 +39,6 @@ pub(super) struct Retry {
 }
 
 impl Retry {
-    #[cfg(test)]
     pub(super) fn parked(&self) -> bool {
         self.due.is_some()
     }

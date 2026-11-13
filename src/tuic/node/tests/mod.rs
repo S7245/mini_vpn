@@ -5,6 +5,7 @@ mod failover_health;
 mod failover_rejection;
 mod failover_staged;
 mod healthy_recovery;
+mod observe;
 mod primary_recovery;
 mod probe_recovery;
 mod recovery;
@@ -109,9 +110,8 @@ impl super::NodeHost {
     }
 }
 
-/// Bounded Native C<=19 read window; owns no startup, DATA or drain authority.
-#[derive(Clone)]
-pub(crate) struct NativeNodeWeakObserver(std::sync::Weak<super::StartupResources>);
+// D241: `NativeNodeWeakObserver` is promoted to `node/observe.rs`.
+use super::NativeNodeWeakObserver;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NativeConnectionSample {
     pub registered_id: Option<usize>,

@@ -21,6 +21,8 @@ pub(super) struct UdpRuntime {
     pub(super) monitor_started: AtomicBool,
     pub(super) owner: std::sync::OnceLock<std::sync::Weak<node::StartupResources>>,
     pub(super) generation: Arc<GenerationControl>,
+    /// N5-OBS (D241): per-open settlement classes, observer-only.
+    pub(super) opens: super::node::OpenClasses,
     native: std::sync::OnceLock<native::Native>,
     state: StdMutex<UdpState>,
     stop: watch::Sender<bool>,
@@ -163,6 +165,7 @@ impl Default for UdpRuntime {
             monitor_started: AtomicBool::new(false),
             owner: std::sync::OnceLock::new(),
             generation: Arc::new(GenerationControl::default()),
+            opens: Default::default(),
             native: std::sync::OnceLock::new(),
             state: StdMutex::new(UdpState::default()),
             stop: watch::channel(false).0,

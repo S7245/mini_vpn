@@ -8,6 +8,7 @@ use crate::shared::ClientError;
 use crate::tuic::{NodeHost, NodeShutdown, NodeStartup};
 
 mod notifications;
+mod observe;
 mod rebuild;
 mod saved;
 
@@ -118,6 +119,8 @@ struct Control {
     phase: Mutex<Phase>,
     changed: Notify,
     notifications: notifications::Notifications,
+    /// N5-OBS (D241): weak read windows for the CLI `📊 Native` line.
+    observed: Mutex<observe::Watch>,
     #[cfg(test)]
     namespace_clocks: Mutex<[Option<std::time::Instant>; 2]>,
     #[cfg(test)]
@@ -460,6 +463,7 @@ fn control_with_budget(
         phase: Mutex::new(Phase::Starting),
         changed: Notify::new(),
         notifications: notifications::Notifications::default(),
+        observed: Mutex::default(),
         #[cfg(test)]
         namespace_clocks: Mutex::new([None; 2]),
         #[cfg(test)]
@@ -741,6 +745,8 @@ pub(super) async fn serve<D: TunIo, F, Fut>(
     Fut: Future<Output = Result<D, ClientError>>,
 {
     let hangup = hangup_rebuild(&runtime);
+    // N5-OBS (D241): hard Native only, on the existing metrics cadence.
+    let observe = hangup.then(|| std::time::Duration::from_secs(runtime.metrics_secs.max(1)));
     match config {
         Startup::Tuic(tuic) => {
             let config = Configuration {
@@ -754,10 +760,10 @@ pub(super) async fn serve<D: TunIo, F, Fut>(
                     runtime,
                     metrics,
                     LoopProfiler::new(),
-                ), hangup)
+                ), hangup, observe)
                 .await;
             } else {
-                serve_with(prepare_factory(factory, config, runtime, metrics, NoopSink), hangup)
+                serve_with(prepare_factory(factory, config, runtime, metrics, NoopSink), hangup, observe)
                     .await;
             }
         }
@@ -770,10 +776,10 @@ pub(super) async fn serve<D: TunIo, F, Fut>(
                     runtime,
                     metrics,
                     LoopProfiler::new(),
-                ), hangup)
+                ), hangup, observe)
                 .await;
             } else {
-                serve_with(prepare_factory(factory, config, runtime, metrics, NoopSink), hangup)
+                serve_with(prepare_factory(factory, config, runtime, metrics, NoopSink), hangup, observe)
                     .await;
             }
         }
@@ -803,7 +809,11 @@ async fn report_verdicts(handle: &Handle, mut sink: impl FnMut(String)) -> std::
 /// CLI control: Ctrl-C requests stop; for hard Native, unix SIGHUP requests the
 /// one explicit same-node session rebuild (D105/D108). Signals only request; the
 /// saved driver decides. Incomplete/Quarantined verdicts are reported (D108).
-async fn serve_with<S: TunService>(mut service: S, hangup_rebuild: bool) {
+async fn serve_with<S: TunService>(
+    mut service: S,
+    hangup_rebuild: bool,
+    observe: Option<std::time::Duration>,
+) {
     let handle = service.take_handle();
     #[cfg(unix)]
     let mut hangup = hangup_rebuild
@@ -822,6 +832,15 @@ async fn serve_with<S: TunService>(mut service: S, hangup_rebuild: bool) {
         }
     };
     let mut verdicts = std::pin::pin!(verdicts);
+    let observer = async {
+        match (handle.as_ref(), observe) {
+            (Some(handle), Some(period)) => {
+                observe::report(handle, period, |line| println!("{line}")).await
+            }
+            _ => std::future::pending().await,
+        }
+    };
+    let mut observer = std::pin::pin!(observer);
     let rebuild = async {
         #[cfg(unix)]
         if let Some(hangup) = hangup.as_mut() {
@@ -837,6 +856,7 @@ async fn serve_with<S: TunService>(mut service: S, hangup_rebuild: bool) {
         tokio::select! {
             report = &mut run => Some(report),
             never = &mut verdicts => match never {},
+            never = &mut observer => match never {},
             () = rebuild => None,
             signal = tokio::signal::ctrl_c() => {
                 if let Err(error) = signal { eprintln!("TUIC stop signal failed: {error}"); }
@@ -852,6 +872,7 @@ async fn serve_with<S: TunService>(mut service: S, hangup_rebuild: bool) {
         None => tokio::select! {
             report = service.run() => report,
             never = &mut verdicts => match never {},
+            never = &mut observer => match never {},
         },
     };
     eprintln!("TUIC service settled: {report:?}");

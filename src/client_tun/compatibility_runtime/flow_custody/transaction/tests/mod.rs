@@ -40,3 +40,6 @@ mod fatal_settle;
 pub(super) mod release;
 
 mod capacity;
+
+#[cfg(feature = "harness")]
+mod census;
