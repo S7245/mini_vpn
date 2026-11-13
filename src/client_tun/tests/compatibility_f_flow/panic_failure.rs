@@ -265,6 +265,11 @@ async fn published_loop_panic(payload_drop_panics: bool, site: usize) {
     let remote_probe = probe.clone();
     let (payload_start, payload_gate) = tokio::sync::oneshot::channel();
     let mut payload_start = Some(payload_start);
+    // Head/tail split (runner.rs pattern): read credit pauses the relay once
+    // pending reaches its bound, so DATA stays queued only for a tail released
+    // after pressure while the original loop is parked.
+    let (payload_tail, tail_gate) = tokio::sync::oneshot::channel::<()>();
+    let mut payload_tail = Some(payload_tail);
     let (finish, gate) = tokio::sync::oneshot::channel::<()>();
     let mut finish = Some(finish);
     let server = tokio::spawn(async move {
@@ -279,7 +284,11 @@ async fn published_loop_panic(payload_drop_panics: bool, site: usize) {
             if payload_gate.await.is_err() {
                 return;
             }
-            send.write_all(&vec![0x63; 2 * 1024 * 1024]).await.unwrap();
+            send.write_all(&vec![0x63; 32_768]).await.unwrap();
+            if tail_gate.await.is_err() {
+                return;
+            }
+            send.write_all(&vec![0x63; 2 * 1024 * 1024 - 32_768]).await.unwrap();
             tokio::select! {
                 result = send.stopped() => {
                     assert!(result.unwrap().is_some(), "actual STOP_SENDING");
@@ -311,6 +320,9 @@ async fn published_loop_panic(payload_drop_panics: bool, site: usize) {
             let bridge = session.control.relay_event_test_bridge().unwrap();
             *probe.bridge.lock().unwrap() = Some(bridge.clone());
             payload_start.take().unwrap().send(()).unwrap();
+            if site != 0 {
+                payload_tail.take().unwrap().send(()).unwrap();
+            }
             while bridge.queued_len() == 0 {
                 tokio::task::yield_now().await;
             }
@@ -320,13 +332,18 @@ async fn published_loop_panic(payload_drop_panics: bool, site: usize) {
                 let _ = poll_once(session.run()).await;
                 if bridge.snapshot().is_some_and(|s| {
                     s.context.is_some_and(|c| c.pending_downlink_bytes >= 16_384)
-                }) && bridge.queued_len() > 0
-                    && apps.sockets.get::<Socket>(apps.handle).recv_queue() == 4096
+                }) && apps.sockets.get::<Socket>(apps.handle).recv_queue() == 4096
                 {
-                    break bridge;
+                    break;
                 }
                 tokio::task::yield_now().await;
             }
+            // Park the original loop; only the relay reader may publish the tail.
+            payload_tail.take().unwrap().send(()).unwrap();
+            while bridge.queued_len() == 0 {
+                tokio::task::yield_now().await;
+            }
+            bridge
         })
         .await
         .expect("real published F must reach queued DATA and physical pressure");
@@ -425,6 +442,7 @@ async fn published_loop_panic(payload_drop_panics: bool, site: usize) {
     // Cleanup is independent of success: keep the original failure, release
     // the real peer, and remove endpoint resources before propagating it.
     drop(payload_start.take());
+    drop(payload_tail.take());
     drop(finish.take());
     let server_result = server.await;
     session.request_stop();

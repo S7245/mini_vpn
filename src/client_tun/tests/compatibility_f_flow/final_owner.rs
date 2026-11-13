@@ -207,6 +207,11 @@ async fn exercise_host(quarantine: bool) {
     let remote = peer.clone();
     let (payload_start, payload_gate) = tokio::sync::oneshot::channel::<()>();
     let mut payload_start = Some(payload_start);
+    // Head/tail split (runner.rs pattern): read credit pauses the relay once
+    // pending reaches its bound, so DATA stays queued only for a tail released
+    // after pressure while the original loop is parked.
+    let (payload_tail, tail_gate) = tokio::sync::oneshot::channel::<()>();
+    let mut payload_tail = Some(payload_tail);
     let (finish, gate) = tokio::sync::oneshot::channel::<()>();
     let mut finish = Some(finish);
     let peer_stop = Arc::new(AtomicBool::new(false));
@@ -223,7 +228,11 @@ async fn exercise_host(quarantine: bool) {
             if payload_gate.await.is_err() {
                 return;
             }
-            send.write_all(&vec![0x63; 2 * 1024 * 1024]).await.unwrap();
+            send.write_all(&vec![0x63; 32_768]).await.unwrap();
+            if tail_gate.await.is_err() {
+                return;
+            }
+            send.write_all(&vec![0x63; 2 * 1024 * 1024 - 32_768]).await.unwrap();
             tokio::select! {
                 result = send.stopped() => {
                     assert!(result.unwrap().is_some(), "real STOP_SENDING");
@@ -262,13 +271,18 @@ async fn exercise_host(quarantine: bool) {
                 let _ = poll_once(host.drive_until_settled()).await;
                 if bridge.snapshot().is_some_and(|s| {
                     s.context.is_some_and(|c| c.pending_downlink_bytes >= 16_384)
-                }) && bridge.queued_len() > 0
-                    && apps.sockets.get::<Socket>(apps.handle).recv_queue() == 4096
+                }) && apps.sockets.get::<Socket>(apps.handle).recv_queue() == 4096
                 {
-                    break bridge;
+                    break;
                 }
                 tokio::task::yield_now().await;
             }
+            // Park the original loop; only the relay reader may publish the tail.
+            payload_tail.take().unwrap().send(()).unwrap();
+            while bridge.queued_len() == 0 {
+                tokio::task::yield_now().await;
+            }
+            bridge
         })
         .await
         .expect("actual published F and zero-window DATA pressure");
@@ -371,6 +385,7 @@ async fn exercise_host(quarantine: bool) {
         }).await.expect("real F/provider/device settlement after last handle Drop");
     }).await;
     drop(payload_start.take());
+    drop(payload_tail.take());
     drop(finish.take());
     drop(handle.take());
     host.request_stop();

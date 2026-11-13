@@ -582,3 +582,9 @@ Knife: compatibility recovery N2（仅本机 loopback）。P1–P3 已全部本�
 - F5 tracer 已写并转绿（`rearm/physical_flow/tests/uplink.rs` `flow_q_sibling` + 2 个测试），证明硬档 Flow-Q 行在 Session Running 时一直占着 escrow 预算，兄弟行可被持续 Full 回滚（饿死）。按停止规则停下，等用户在 D221 (i) 接受上界 / (ii) 硬档持预算的 Flow Q ⇒ S 中选择（推荐 (ii)）。
 - 选定后继续：按选择改路由或文档；然后 (2) 硬档 `:851` tracer；(3) 单快照门；(4) D222+、STATUS、HANDOFF，STOP。约束同上一块。
 - **更新（D222–D224，STOP）**：用户选 (ii)。D222 已实现（`scoped_q.rs` `holds_hard_budget`，两个入口 ⇒ S），tracer 2/2 绿，变异变红；`:851` 只有代码审查证据（D223）；单快照门 D224 除 D214 的 6 个 fflow 行外全绿（raw `soft-q-fix-20261111/gate`）。剩余：父会话核查日志后提交/推送。暂缓的后续：硬档 native-roles rearm 夹具（D223）。
+
+## 新会话交接（D214 f_flow 六行，2026-11-12，D225–D227，STOP）
+
+- 已修（仅测试，未提交）：`compatibility_f_flow/final_owner.rs`、`panic_failure.rs` 改为 head 32 KiB / tail 模式（D225），4 行 RED 0/10 → GREEN 12/12（raw `fflow-fix-20261112/det/summary.txt`）。
+- STOP ×2：(1) D226 isolation remote_writer：选 (a) 合同修订（join 时入账）或 (b) 恢复 ACK 时入账（≥3 处，触发结构收敛门）；(2) D227 native_permit_on_reset：生产 DATA 丢失，下一步在 `relay_events.rs` Native Data 应用路径加 tagged probe，先写 RED tracer。
+- 单快照门（D228）：fflow 56/1（仅 D226 行红；permit 本次过，仍 flaky），nonhard 9/9、n4 14/14、d153 8/8、governance 27/27、joint 849/849 ×2、production/diff 通过；raw `fflow-fix-20261112/gate`。未提交。
