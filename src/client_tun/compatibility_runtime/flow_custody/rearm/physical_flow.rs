@@ -649,12 +649,15 @@ impl OpenDispatch {
         // DATA message, the exact witness Rearming uses below. This waits on the
         // App draining (D147 close tail: progress re-arms, idle expiry aborts
         // the tail and discards it below); stop bypasses.
+        // D232: a non-hard Native clean EOF (peer FIN) loses no data either, so
+        // it takes the same wait; its RESET stays a D191 late-DATA discard.
         if flow.stage == FlowStage::Closing
             && !flow.producer_stopped
             && !flow.tail.aborted()
             && matches!(flow.close_reason, ("remote_to_local", "remote_eof" | "remote_read_failed"))
             && !owner.stop.stopping.load(std::sync::atomic::Ordering::Acquire)
-            && flow.roles.as_ref().is_some_and(|roles| roles.hard_source_producers()
+            && flow.roles.as_ref().is_some_and(|roles| (roles.hard_source_producers()
+                    || (roles.is_native() && flow.close_reason.1 == "remote_eof"))
                 && roles.published().is_none_or(|sent| mirror.data_messages < sent.messages))
         {
             let unbegun = flow

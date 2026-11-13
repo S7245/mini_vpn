@@ -485,7 +485,14 @@ async fn run_isolation(end: IsolationEnd) {
             if end == IsolationEnd::RemoteWriterFailure {
                 assert_eq!((seen.live, seen.f, seen.released), (2, 2, 0));
                 assert_eq!(apps.sockets.get::<Socket>(apps.handle).recv_queue(), 4096);
-                assert!(control.ledger().first_failure.is_none(), "original roles retain error until physical ACK");
+                // D229: the original role's writer Io is recorded once all roles join
+                // (a9e7f2f record-at-join), before the physical ACK; it stays non-Q.
+                let ledger = control.ledger();
+                let facts = ledger.first_failure.as_ref().expect("writer Io recorded at join").facts();
+                assert_eq!(facts.origin.phase, crate::shared::errors::FailurePhase::TcpOpen);
+                assert_eq!(facts.class, crate::shared::errors::FailureClass::Io);
+                assert_eq!(ledger.additional_failures, 0);
+                drop(ledger);
             } else {
                 assert_eq!((seen.live, seen.f, seen.released), (1, 1, 1));
             }

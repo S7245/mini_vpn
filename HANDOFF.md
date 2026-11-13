@@ -588,3 +588,18 @@ Knife: compatibility recovery N2（仅本机 loopback）。P1–P3 已全部本�
 - 已修（仅测试，未提交）：`compatibility_f_flow/final_owner.rs`、`panic_failure.rs` 改为 head 32 KiB / tail 模式（D225），4 行 RED 0/10 → GREEN 12/12（raw `fflow-fix-20261112/det/summary.txt`）。
 - STOP ×2：(1) D226 isolation remote_writer：选 (a) 合同修订（join 时入账）或 (b) 恢复 ACK 时入账（≥3 处，触发结构收敛门）；(2) D227 native_permit_on_reset：生产 DATA 丢失，下一步在 `relay_events.rs` Native Data 应用路径加 tagged probe，先写 RED tracer。
 - 单快照门（D228）：fflow 56/1（仅 D226 行红；permit 本次过，仍 flaky），nonhard 9/9、n4 14/14、d153 8/8、governance 27/27、joint 849/849 ×2、production/diff 通过；raw `fflow-fix-20261112/gate`。未提交。
+
+## 新会话交接（D227 Native DATA 丢失，2026-11-12，D229–D230，上下文边界）
+
+- D229 已做（用户选 (a)）：`isolation.rs:488` 断言改为 first_failure = TcpOpen/Io、additional_failures 0，12/12；未提交。
+- D227 根因已定位（D230）：后继流的 Native reader 带外 EOF（`roles/native/reader.rs:501`）让流进入 Closing，`rearm/physical_flow.rs:731-733` 清掉 `ctx.uplink_tx`，此时同流 16 B DATA 仍在 relay 通道里；随后 `relay_allows_remote_payload` 为假，判 `StaleRelayReset`，D191 `discard_late_data` 丢弃，FIN 先发。
+- 下一步：(1) 读 `tuic_service/tests/native_eof_lane_order.rs` 合同，在 (A) physical_flow Closing 延后清 uplink / (B) reader EOF 走有序通道 之间选一个 owner；超出一个 owner 或改合同则 STOP；(2) 先写确定性 RED tracer（`hold_relay_receive(true)` 保持 DATA 排队、驱动到 Closing、放开、断言 app 先收 16 B 再收 FIN）；(3) 修复后该行单跑 ≥20/20；(4) 单快照门（runner `fflow-fix-20261112/runner`，先清空 `gate/`）；(5) D231+、STATUS、HANDOFF，STOP。
+- 约束：offline、`--features harness`、`CARGO_INCREMENTAL=0`、`CARGO_TARGET_DIR=target`；不碰 AGENTS.md / certs；不提交；无外部运行。
+- 单快照门（D231）：fflow 56/1（仅 D227 行红），nonhard 9/9、n4 14/14、d153 8/8、governance 27/27、joint 849/849 ×2、production/diff 通过；raw `fflow-fix-20261112/gate`。
+
+## 新会话交接（D227 已修，2026-11-12，D232–D233，STOP 待提交确认）
+
+- D232：选 (A)，单 owner `rearm/physical_flow.rs`。探针显示后继流 Native 但 `hard_source_producers()=false`，D72/D75 守卫跳过 ⇒ Closing 清 uplink_tx ⇒ D191 丢 16 B。守卫谓词改为 `hard || (is_native && remote_eof)`；非 hard RESET 仍 D191 丢弃（合同不变）。(B) 拒绝：会改 lane-order 合同且跨 owner。
+- 证据：新 tracer `native_eof_lane_order::nonhard_native_remote_eof_before_lane_data_delivers_reply_without_q` RED 3/3→GREEN 5/5；其余三条合同行各 5/5；permit_on_reset 单跑 25/25；变异回红 3/3。raw `fflow-fix-20261112/d227-fix/`。
+- D233 单快照门全绿：fflow 57/57、nonhard 9/9、n4 14/14、d153 8/8、governance 27/27、joint 850/850 ×2、production/diff 通过；raw `fflow-fix-20261112/d227-gate/`。
+- 未提交文件：physical_flow.rs、native_eof_lane_order.rs、isolation.rs（D229）、docs。AGENTS.md / ca-cert.srl 的改动非本任务。下一步：父会话核验 → 用户确认提交。
